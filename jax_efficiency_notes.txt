@@ -1,0 +1,33 @@
+
+General jax efficiency tips:
+1. Donating buffers, in order to reduce the memory overhead due to functional programming restrictions we can use 
+    train_step_donated = jax.jit(
+        train_step,
+        static_argnames="num_minibatches",
+        donate_argnames=(
+            "state",
+            "metrics",
+        ),
+    )
+to reuse the input memory for the output values
+
+2. Scanning layers for faster compilation
+
+
+
+
+
+
+
+Parallel computation:
+- Data parallelism (share batch across devices and then accumulate gradients)
+- Pipeline parallelism (splits the model across layers):
+    https://uvadlc-notebooks.readthedocs.io/en/latest/tutorial_notebooks/scaling/JAX/pipeline_parallel_simple.html
+    Each device get a portion of the model and wait for the previous device to finish (pipeline bubble problem== idle time).
+    This can be mitigated by using micro-batching, smaller batches==less idle time(tradeoff bubble problem, communication overhead and max device utilization time)
+    Further improvement using looping pipelines
+- Tensor parallelism (splits the model across feature dimensions)
+
+1. flax.jax_utils.prefetch_to_device to place the initial data on the devices (contrary to shard map which put all the data on one device then transfer it)
+
+
