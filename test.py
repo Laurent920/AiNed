@@ -1,159 +1,148 @@
-import os
-
-USE_CPU_ONLY = True
-flags = os.environ.get("XLA_FLAGS", "")
-if USE_CPU_ONLY:
-    flags += " --xla_force_host_platform_device_count=8"
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
-
-import jax 
+from mpi4py import MPI
+import jax
 import jax.numpy as jnp
-from jax import vmap, grad, jit
-from jax.scipy.special import logsumexp
-import matplotlib.pyplot as plt
-from functools import partial
-import dataclasses
-from typing import Generic, Any, Union, TypeVar, Tuple
-import tree_math
 import numpy as np
-from jax import config 
+import mpi4jax
+from mpi4jax import send, recv, bcast
 
-config.update("jax_debug_nans", True)
-print("Using jax", jax.__version__)
-print(jax.devices())
+import tree_math
+import dataclasses
 
-a = jnp.array([[5, 4, 2, 3, 1],
-              [4.8870957e-03, 6.7979717e-03, 5.1129041e-03, 3.2020281e-03, 4.9999999e-03]])
+from mnist_helper import torch_loader, one_hot
 
-print(jnp.arange(a.shape[0])[:, None])
-sort_idx = jnp.argsort(a, axis=-1)
-print(sort_idx)
-input = a[jnp.arange(a.shape[0])[:, None], sort_idx]
-print(input)
 
-print(input.devices())
-print(input.sharding)
-jax.debug.visualize_array_sharding(input)
+# Initialize MPI
+comm = MPI.COMM_WORLD
+rank = comm.Get_rank()
+size = comm.Get_size()
 
-layer_sizes = [784, 512, 512, 10]
-step_size = 0.01
-num_epochs = 8
-batch_size = 128
-n_targets = 10
 
+@dataclasses.dataclass
+class Neuron_states:
+    values: jnp.ndarray
+    threshold: jnp.float32
+    
+    
+# Define layer computation with threshold and surrogate gradient
+def layer_computation(input_data, weights, neuron_states):
+    print(f"Rank {rank}: Shapes in activation: {jnp.shape(input_data)}, {jnp.shape(weights)}")
+    
+    activations = jnp.dot(input_data, weights) + neuron_states.values 
+    jax.debug.print("activation values: {a}", a=activations)
+    
+    activated_output = jnp.where(activations > neuron_states.threshold, activations, 0.0)
+    surrogate_grad = jax.nn.sigmoid(activations) * (1 - jax.nn.sigmoid(activations))
+    print(f"Rank {rank}: Shapes in activation: {jnp.shape(activated_output)}")
+
+    # Update the neuron states (old values - activated values) #TODO change the logic if output is different than the activation value
+    new_neuron_states = Neuron_states(values=neuron_states.values-activated_output, threshold=neuron_states.threshold)
+    return activated_output, surrogate_grad, new_neuron_states
+
+# Define the loss function
+def loss_fn(output, target):
+    return jnp.mean((output - target) ** 2)
+
+
+# Train the network
+def train(key, layer_sizes, thresholds, num_epochs, learning_rate, batch_size):
+    # Initialize parameters (input data for rank 0 and weights for other ranks)
+    key, subkey = jax.random.split(key) 
+    if rank == 0:
+        input_data = init_params(subkey)
+    else:
+        weights, neuron_states = init_params(subkey)
+        target_output = jnp.array([1.0, 0.0], dtype=jnp.float32)  # Example target
+        
+        token = jax.lax.create_token()
+        
+    # Simulate a layer running on a separate MPI rank
+    if rank == 0:
+        # Forward pass (Send input data to Layer 1)
+        token = send(input_data, dest=1, comm=comm)
+        print(jnp.shape(input_data))
+    elif rank == 1:
+        # Layer 1: Receive input, compute, and send output
+        activations, token = recv(jnp.zeros((layer_sizes[rank-1], )), source=0, comm=comm, token=token)  
+        output, surrogate_grad , neuron_states= layer_computation(activations, weights, neuron_states)
+        token = send(output, dest=2, comm=comm)  # Send output to Layer 2
+        print(f"Output layer {rank}: {(jnp.shape(output))} \n{output}")
+        
+    elif rank == 2:
+        # Layer 2: Receive input and compute final output
+        activations, token = recv(jnp.zeros((layer_sizes[rank-1], )), source=1, comm=comm, token=token)  
+        output, surrogate_grad, neuron_states = layer_computation(activations, weights, neuron_states)
+        print(f"Final Output layer {rank}: {(jnp.shape(output))}, {output}")
+        
+
+    # Synchronize all ranks before starting the backward pass
+    token = mpi4jax.barrier(comm=comm, token=token)
+
+    if rank == 2:
+      # Compute loss and gradients 
+        loss, grad_wrt_output = jax.value_and_grad(loss_fn)(output, target_output)
+        grad_output = grad_wrt_output * surrogate_grad  # Apply surrogate gradient
+        print(f"loss: {loss}, output grad: {(grad_output)}")
+
+        # Compute gradients with respect to inputs and weights
+        def layer_loss(input_data, weights):
+            output, _, _ = layer_computation(input_data, weights, neuron_states)
+            return loss_fn(output, grad_output)
+
+        # Compute gradients using jax.grad
+        # grad_weights = jax.grad(layer_loss, 1)(activations, weights)
+        # print(f"auto grad: {grad_weights}")
+
+        grad_weights = jnp.outer(activations, grad_output)
+        print(f"manual grad: {grad_weights}")
+        
+        # Update weights (gradient descent)
+        weights -= learning_rate * grad_weights
+        
+        # Backward pass: Send gradient to Layer 1
+        token = send(grad_output, dest=1, comm=comm, token=token)
+        
+    # Backward pass for Layer 1
+    if rank == 1:
+        # Receive gradients from Layer 2
+        grad_output, token = recv(jnp.zeros((layer_sizes[rank], )), source=2, comm=comm, token=token)
+
+        # Compute gradients with respect to inputs and weights
+        def layer_loss(input_data, weights):
+            output, _, _ = layer_computation(input_data, weights, neuron_states)
+            return loss_fn(output, grad_output)
+
+        # Compute gradients using jax.grad
+        grad_input, grad_weights = jax.grad(layer_loss, argnums=(0, 1))(activations, weights)
+
+        # Update weights (gradient descent)
+        weights -= learning_rate * grad_weights
+
+# Initialize network parameters
 def random_layer_params(m, n, key, scale=1e-2):
   w_key, b_key = jax.random.split(key)
-  return scale * jax.random.normal(w_key, (n, m)), scale * jax.random.normal(b_key, (n,))
+  return scale * jax.random.normal(w_key, (n, m))#, scale * jax.random.normal(b_key, (n,))
 
-# Initialize all layers for a fully-connected neural network with sizes "sizes"
-def init_network_params(sizes, key):
-  keys = jax.random.split(key, len(sizes))
-  return [random_layer_params(m, n, k) for m, n, k in zip(sizes[:-1], sizes[1:], keys)]
-
-params = init_network_params(layer_sizes, jax.random.key(0))
-[print(len(w), len(b)) for w, b in params[:]]
-
-def relu(x):
-  return jnp.maximum(0, x)
-
-def predict(params, image):
-  # per-example predictions
-  activations = image
-  for w, b in params[:-1]:
-    outputs = jnp.dot(w, activations) + b
-    activations = relu(outputs)
+def init_params(key):# Initialize weights for each layer
+    keys = jax.random.split(key, len(layer_sizes))
     
-  final_w, final_b = params[-1]
-  logits = jnp.dot(final_w, activations) + final_b
-  return logits - logsumexp(logits)
+    if rank == 0:
+        
+        input_data = jax.random.normal(keys[0], layer_sizes[0])
+        return input_data
+    else:
+        weights = random_layer_params(layer_sizes[rank], layer_sizes[rank-1], keys[rank])
+        print(jnp.shape(weights))
+        
+        neuron_states = Neuron_states(values=jnp.zeros(layer_sizes[rank]), threshold=thresholds[rank-1])
+        return weights, neuron_states
 
-# This works on single examples
-random_flattened_image = jax.random.normal(jax.random.key(1), (28 * 28,))
-preds = predict(params, random_flattened_image)
-print(preds.shape)
-
-# Make a batched version of the `predict` function
-batched_predict = vmap(predict, in_axes=(None, 0))
-
-# `batched_predict` has the same call signature as `predict`
-random_flattened_images = jax.random.normal(jax.random.key(1), (10, 28 * 28))
-batched_preds = batched_predict(params, random_flattened_images)
-print(batched_preds.shape)
-
-def one_hot(x, k, dtype=jnp.float32):
-  """Create a one-hot encoding of x of size k."""
-  return jnp.array(x[:, None] == jnp.arange(k), dtype)
-
-def accuracy(params, images, targets):
-  target_class = jnp.argmax(targets, axis=1)
-  predicted_class = jnp.argmax(batched_predict(params, images), axis=1)
-  return jnp.mean(predicted_class == target_class)
-
-def loss(params, images, targets):
-  preds = batched_predict(params, images)
-  return -jnp.mean(preds * targets)
-
-@jit
-def update(params, x, y):
-  grads = grad(loss)(params, x, y)
-  return [(w - step_size * dw, b - step_size * db)
-          for (w, b), (dw, db) in zip(params, grads)]
-  
-from jax.tree_util import tree_map
-from torch.utils import data
-from torchvision.datasets import MNIST
-
-def numpy_collate(batch):
-  return tree_map(np.asarray, data.default_collate(batch))
-
-class NumpyLoader(data.DataLoader):
-  def __init__(self, dataset, batch_size=1,
-                shuffle=False, sampler=None,
-                batch_sampler=None, num_workers=0,
-                pin_memory=False, drop_last=False,
-                timeout=0, worker_init_fn=None):
-    super(self.__class__, self).__init__(dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        collate_fn=numpy_collate,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        timeout=timeout,
-        worker_init_fn=worker_init_fn)
-
-class FlattenAndCast(object):
-  def __call__(self, pic):
-    return np.ravel(np.array(pic, dtype=jnp.float32))
-
-# Define our dataset, using torch datasets
-mnist_dataset = MNIST('/tmp/mnist/', download=True, transform=FlattenAndCast())
-training_generator = NumpyLoader(mnist_dataset, batch_size=batch_size, num_workers=0)
-
-# Get the full train dataset (for checking accuracy while training)
-train_images = np.array(mnist_dataset.train_data).reshape(len(mnist_dataset.train_data), -1)
-train_labels = one_hot(np.array(mnist_dataset.train_labels), n_targets)
-
-# Get full test dataset
-mnist_dataset_test = MNIST('/tmp/mnist/', download=True, train=False)
-test_images = jnp.array(mnist_dataset_test.test_data.numpy().reshape(len(mnist_dataset_test.test_data), -1), dtype=jnp.float32)
-test_labels = one_hot(np.array(mnist_dataset_test.test_labels), n_targets)
-
-import time
-
-for epoch in range(num_epochs):
-  start_time = time.time()
-  for x, y in training_generator:
-    y = one_hot(y, n_targets)
-    params = update(params, x, y)
-  epoch_time = time.time() - start_time
-
-  train_acc = accuracy(params, train_images, train_labels)
-  test_acc = accuracy(params, test_images, test_labels)
-  print("Epoch {} in {:0.2f} sec".format(epoch, epoch_time))
-  print("Training set accuracy {}".format(train_acc))
-  print("Test set accuracy {}".format(test_acc))
+if __name__ == "__main__":
+    key = jax.random.key(42)
+    # Network structure and parameters
+    layer_sizes = [28, 10, 2] 
+    thresholds = [0.1, 0.1]   
+    num_epochs = 1
+    learning_rate = 0.01       
+    batch_size = 10
+    
+    train(key, layer_sizes, thresholds, num_epochs, learning_rate, batch_size)
