@@ -23,16 +23,20 @@ def torch_loader(batch_size=1):
             end_idx = min(start_idx + batch_size, num_samples)
             batch_indices = indices[start_idx:end_idx]
             yield data[batch_indices], labels[batch_indices]
-    train_batches = create_batches(X_train, y_train, batch_size=batch_size, shuffle=True)
-    return train_batches
+    train_batches = create_batches(X_train, y_train, batch_size=batch_size, shuffle=False)
+    total_batches = (len(X_train) + batch_size - 1) // batch_size
+
+    return train_batches, (X_train, y_train), (X_test, y_test), total_batches
 
 
 if __name__ == "__main__":
-    batch_size = 16
-    train_loader = torch_loader(batch_size)
+    batch_size = 1
+    train_loader, train, test, total_batches = torch_loader(batch_size)
+    print(total_batches)
     # Example: Iterate through the DataLoader
     for batch_x, batch_y in train_loader:
-        print("Batch X:", batch_x, type(batch_x))
+        
+        print("Batch X:", batch_x, type(batch_x), batch_x[0].shape)
         print("Batch y:", batch_y, type(batch_y))
         for x in batch_x:
             print(x, type(x))

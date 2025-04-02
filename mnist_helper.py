@@ -729,7 +729,7 @@ def torch_loader(batch_size=1, n_targets=10):
     test_images = jnp.array(mnist_dataset_test.test_data.numpy().reshape(len(mnist_dataset_test.test_data), -1), dtype=jnp.float32)
     test_labels = one_hot(np.array(mnist_dataset_test.test_labels), n_targets)
     
-    return training_generator#, (train_images, train_labels), (test_images, test_labels)
+    return training_generator, (train_images, train_labels), (test_images, test_labels)
     
 def torch_train(training_generator, train, test, params):
     train_images, train_labels = train
@@ -738,8 +738,6 @@ def torch_train(training_generator, train, test, params):
     for epoch in range(num_epochs):
         start_time = time.time()
         for x, y in training_generator:
-            # print(np.shape(x))
-            # print(np.shape(y), y[0])
             y = one_hot(y, n_targets)
             params = update(params, x, y)
         epoch_time = time.time() - start_time
@@ -764,7 +762,7 @@ if __name__ == "__main__":
 
         batched_predict = vmap(predict, in_axes=(None, 0))
 
-        training_generator = torch_loader(batch_size, n_targets)
+        training_generator, train, test = torch_loader(batch_size, n_targets)
         
         for x, y in training_generator:
             print(f"Batch x: {x},{type(x)}")
