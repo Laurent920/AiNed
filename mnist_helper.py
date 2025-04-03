@@ -11,47 +11,37 @@ from abc import ABC, abstractmethod
 def train_validate_split(data_y, val_ratio=0.2):
     """
     Splits a dataset into training and validation sets based on the specified ratio
-    for each class to maintain class distribution balance across both sets.
-
-    The function ensures that each class is represented in the validation set
-    proportionally to the specified validation ratio. This stratified approach helps in
-    maintaining a consistent class distribution between the training and validation datasets.
+    for each class to maintain class distribution balance across both sets,
+    without shuffling the original data order.
 
     Parameters:
     data_y (numpy.ndarray): An array or list containing class labels for each sample in the dataset.
-    val_ratio (float, optional): The proportion of the dataset to include in the validation split. This value should be
-                                 a float between 0 and 1 indicating the percentage of data to be used as validation.
-                                 Defaults to 0.2 (20% of the data).
+    val_ratio (float, optional): The proportion of the dataset to include in the validation split.
+                                Defaults to 0.2 (20% of the data).
 
     Returns:
     tuple of lists: A tuple containing two lists:
-                     - train_indices (list): Indices of the samples designated for the training set.
-                     - val_indices (list): Indices of the samples designated for the validation set.
+                   - train_indices (list): Indices of the samples designated for the training set.
+                   - val_indices (list): Indices of the samples designated for the validation set.
     """
     def samples_per_class(data_y, indices):
         """
         Calculate the number of samples for each class in a specified subset of a dataset.
-
-        Parameters:
-        data_y (numpy.ndarray): An array containing class labels for each sample in the dataset.
-        indices (list): An array or list of indices specifying which samples to consider for the count.
-
-        Return:
-        list: A list of integers where each index corresponds to a class label (0 through 9), and the value at each index
-            indicates the number of samples of that class present in the specified subset of `data_y`.
         """
         class_count = [0]*10
         for i in indices:
             class_count[data_y[i]] += 1 
         return class_count 
+    
     sample_num = len(data_y)
-    overall_indices = [num for num in range(sample_num)]
+    overall_indices = list(range(sample_num))  # Ordered indices
     overall_class_num = samples_per_class(data_y, overall_indices)
     val_class_num = [int(num*val_ratio) for num in overall_class_num]
-    tmp_val_class_num = [0 for num in range(10)]
-    shuffle(overall_indices)
+    tmp_val_class_num = [0]*10
+    
     train_indices = []
     val_indices = []
+    
     for idx in overall_indices:
         tmp_label = data_y[idx]
         if tmp_val_class_num[tmp_label] < val_class_num[tmp_label]:
@@ -59,6 +49,7 @@ def train_validate_split(data_y, val_ratio=0.2):
             tmp_val_class_num[tmp_label] += 1
         else:
             train_indices.append(idx)
+    
     return train_indices, val_indices
 
 class DataLoader:
@@ -144,6 +135,7 @@ class DataLoader:
             return batch
         else:
             raise StopIteration
+        
 class Tensor:
     """
     Represents a tensor object that is used in automatic differentiation.
@@ -626,6 +618,36 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
 
     return validation_acc
 
+def torch_loader_manual(batch_size):
+    mnist_data = pd.read_csv('train.csv')
+    # Extract the image data from the data
+    mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
+    # Extract the labels from the data
+    mnist_data_y = mnist_data.iloc[:, 0].values
+    
+    train_indices, val_indices = train_validate_split(mnist_data_y, val_ratio=0.2)
+
+    # Calculate total batches for training data
+    total_train_samples = len(train_indices)
+    total_batches = (total_train_samples + batch_size - 1) // batch_size  # Ceiling division
+
+    # Define training set dataloader object
+    train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=False)    
+    val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=False)
+    
+    # Read all MNIST training data from the file
+    mnist_data = pd.read_csv('test.csv')
+    # Extract the image data from the data
+    mnist_data_x_test = mnist_data.iloc[:, 0:].values.astype('float')
+    # Extract the labels from the data
+    mnist_data_y_test = mnist_data.iloc[:, 0].values
+    test_indices, _ = train_validate_split(mnist_data_y_test, val_ratio=0)
+
+    # Define training set dataloader object
+    test_set_dataloader = DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
+
+    return train_dataloader, (mnist_data_x, mnist_data_y), (mnist_data_x_test, mnist_data_y_test), total_batches
+
 # region TORCH LOADER
 import os
 
@@ -719,6 +741,11 @@ def torch_loader(batch_size=1, n_targets=10):
     
     # Define our dataset, using torch datasets
     mnist_dataset = MNIST('/tmp/mnist/', download=True, transform=FlattenAndCast())
+    
+    # Calculate total number of batches
+    total_samples = len(mnist_dataset)
+    total_batches = (total_samples + batch_size - 1) // batch_size
+    
     training_generator = NumpyLoader(mnist_dataset, batch_size=batch_size, num_workers=0)
     # Get the full train dataset (for checking accuracy while training)
     train_images = np.array(mnist_dataset.train_data).reshape(len(mnist_dataset.train_data), -1)
@@ -729,7 +756,7 @@ def torch_loader(batch_size=1, n_targets=10):
     test_images = jnp.array(mnist_dataset_test.test_data.numpy().reshape(len(mnist_dataset_test.test_data), -1), dtype=jnp.float32)
     test_labels = one_hot(np.array(mnist_dataset_test.test_labels), n_targets)
     
-    return training_generator, (train_images, train_labels), (test_images, test_labels)
+    return training_generator, (train_images, train_labels), (test_images, test_labels), total_batches
     
 def torch_train(training_generator, train, test, params):
     train_images, train_labels = train
@@ -762,8 +789,8 @@ if __name__ == "__main__":
 
         batched_predict = vmap(predict, in_axes=(None, 0))
 
-        training_generator, train, test = torch_loader(batch_size, n_targets)
-        
+        training_generator, train, test, total_batches = torch_loader(batch_size, n_targets)
+        print(total_batches)
         for x, y in training_generator:
             print(f"Batch x: {x},{type(x)}")
             print(f"Batch y: {y}, {type(y)}")
