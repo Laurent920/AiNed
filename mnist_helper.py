@@ -2,13 +2,14 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
-from random import shuffle, randint
+import random
 from PIL import Image
 import math
 from abc import ABC, abstractmethod
 
 # region MANUAL LOADER
-def train_validate_split(data_y, val_ratio=0.2):
+USE_BIAS = False
+def train_validate_split(data_y, val_ratio=0.2, shuffle=True):
     """
     Splits a dataset into training and validation sets based on the specified ratio
     for each class to maintain class distribution balance across both sets,
@@ -38,6 +39,9 @@ def train_validate_split(data_y, val_ratio=0.2):
     overall_class_num = samples_per_class(data_y, overall_indices)
     val_class_num = [int(num*val_ratio) for num in overall_class_num]
     tmp_val_class_num = [0]*10
+    
+    if shuffle:
+        random.shuffle(overall_indices)
     
     train_indices = []
     val_indices = []
@@ -347,7 +351,10 @@ class LinearLayer:
         limit = 1 / np.sqrt(input_dim)
         self.weights = Tensor(np.random.uniform(-limit, limit, (input_dim, output_dim)))
         self.bias = Tensor(np.random.uniform(-limit, limit, (1, output_dim)))
-        self.param = [self.weights, self.bias]
+        if USE_BIAS:
+            self.param = [self.weights, self.bias]
+        else:
+            self.param = [self.weights]
 
         # Initializing operations for matrix multiplication and addition.
         self.matmul = MatMul()
@@ -368,8 +375,11 @@ class LinearLayer:
             Tensor: The output tensor after applying the linear transformation and activation function.
         """         
         A =  self.matmul(x, self.weights)
-        Z = self.add(A, self.bias)
-        
+        if USE_BIAS:
+            Z = self.add(A, self.bias)
+        else:
+            Z = A
+            
         if self.activation:
             return self.activation(Z)
         else:
@@ -618,22 +628,22 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
 
     return validation_acc
 
-def torch_loader_manual(batch_size):
+def torch_loader_manual(batch_size, shuffle=True):
     mnist_data = pd.read_csv('train.csv')
     # Extract the image data from the data
     mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
     # Extract the labels from the data
     mnist_data_y = mnist_data.iloc[:, 0].values
     
-    train_indices, val_indices = train_validate_split(mnist_data_y, val_ratio=0.2)
+    train_indices, val_indices = train_validate_split(mnist_data_y, val_ratio=0.2, shuffle=shuffle)
 
     # Calculate total batches for training data
     total_train_samples = len(train_indices)
     total_batches = (total_train_samples + batch_size - 1) // batch_size  # Ceiling division
 
     # Define training set dataloader object
-    train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=False)    
-    val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=False)
+    train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=shuffle)    
+    val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=shuffle)
     
     # Read all MNIST training data from the file
     mnist_data = pd.read_csv('test.csv')
@@ -646,7 +656,7 @@ def torch_loader_manual(batch_size):
     # Define training set dataloader object
     test_set_dataloader = DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
 
-    return train_dataloader, (mnist_data_x, mnist_data_y), (mnist_data_x_test, mnist_data_y_test), total_batches
+    return train_dataloader, val_dataloader, (mnist_data_x_test, mnist_data_y_test), total_batches
 
 # region TORCH LOADER
 import os
@@ -777,7 +787,7 @@ def torch_train(training_generator, train, test, params):
     
     
 if __name__ == "__main__":
-    torch_load = True
+    torch_load = False
     if torch_load:
         layer_sizes = [784, 512, 512, 10]
         step_size = 0.01
@@ -797,20 +807,10 @@ if __name__ == "__main__":
             break
         # torch_train(training_generator, train, test, params)
     else:    
-        # Read all MNIST training data from the file
-        mnist_data = pd.read_csv('train.csv')
-        # Extract the image data from the data
-        mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
-        # Extract the labels from the data
-        mnist_data_y = mnist_data.iloc[:, 0].values
-        
-        train_indices, val_indices = train_validate_split(mnist_data_y, val_ratio=0.2)
-
         batch_size = 64
-        # Define training set dataloader object
-        train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices)
-        # Define validation set dataloader object
-        val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices)
+
+        train_dataloader, val_dataloader, (mnist_data_x_test, mnist_data_y_test), total_batches = torch_loader_manual(batch_size, shuffle=False)
+
         # Define neural network
         network = MLP(28*28, 128, 10)
         # Define optimizer
@@ -826,3 +826,12 @@ if __name__ == "__main__":
         plt.ylabel('Validation Accuracy')  # Label for the y-axis
         plt.grid(True)  # Enable grid for easier visualization of the plot lines
         plt.savefig("mnist training accuracy")
+        
+        print(network.param[0].data.shape)
+        
+        tensor_data = [tensor.data for i, tensor in enumerate(network.param)]
+        
+        np.savez("tensor_data.npz", *tensor_data)
+        
+        data = np.load("tensor_data.npz")
+        print(data)

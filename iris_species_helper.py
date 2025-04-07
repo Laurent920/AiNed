@@ -4,7 +4,7 @@ from sklearn.model_selection import train_test_split
 from itertools import cycle
 
 
-def torch_loader(batch_size=1):
+def torch_loader(batch_size=1, shuffle=False):
     # Load the Iris dataset
     iris = load_iris()
     X = iris.data  # Features (sepal length, sepal width, petal length, petal width)
@@ -25,7 +25,7 @@ def torch_loader(batch_size=1):
             end_idx = min(start_idx + batch_size, num_samples)
             batch_indices = indices[start_idx:end_idx]
             yield data[batch_indices], labels[batch_indices]
-    train_batches = cycle(create_batches(X_train, y_train, batch_size=batch_size, shuffle=False))
+    train_batches = cycle(create_batches(X_train, y_train, batch_size=batch_size, shuffle=shuffle))
     total_batches = (len(X_train) + batch_size - 1) // batch_size
 
     return train_batches, (X_train, y_train), (X_test, y_test), total_batches
