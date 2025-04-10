@@ -3,12 +3,14 @@ from mnist_helper import one_hot, one_hot_encode
 from mpi4py import MPI
 import jax
 import jax.numpy as jnp
-from jax import custom_jvp
+from jax import custom_jvp, jit
 from jax.tree_util import Partial
 from jax import jacfwd, jacrev
 import time
 
-
+import json
+import os
+import sys
 import numpy as np
 import mpi4jax
 from mpi4jax import send, recv, bcast
@@ -30,6 +32,7 @@ size = comm.Get_size()
 class Neuron_states:
     values: jnp.ndarray
     threshold: jnp.float32
+    residuals: jnp.ndarray
     
 @dataclasses.dataclass
 @tree_math.struct
@@ -60,7 +63,7 @@ def activation_func_jvp(primals, tangents, k=1.0):
     ans_dot = jnp.where(activations > neuron_states.threshold, activations, 0.0)
     return ans, ans_dot
     
-@jax.jit
+@jit
 def layer_computation(neuron_idx, layer_input, weights, neuron_states):    
     activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
     #TODO being able to compute multiple incoming index neurons
@@ -79,42 +82,50 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states):
     
     return jax.lax.cond(rank == size-1, last_layer_case, hidden_layer_case, None)
 
-@jax.jit
+
 def predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
     #region JAX loop
-    @jax.jit
     def input_layer(args):
         token, neuron_states, x = args
         # Forward pass (Send input data to Layer 1)
-        def send_input(input_neuron_idx, token):
-            data = x[input_neuron_idx]
-            return jax.lax.cond( # Only send non null data points
-                data != 0, # TODO better processing of input data
-                lambda t: send(jnp.array([input_neuron_idx, data]), dest=1, tag=0, comm=comm, token=t),
-                lambda t: t,
+        def send_input(i, carry):
+            token, count = carry
+            data = x[i]
+
+            def send_data(t):
+                return send(jnp.array([i, data]), dest=1, tag=0, comm=comm, token=t), count + 1
+
+            def skip_data(t):
+                return t, count
+
+            token, count = jax.lax.cond(
+                data != 0,
+                send_data,
+                skip_data,
                 operand=token
             )
-        
-        # Loop over the input data
-        token = jax.lax.fori_loop(0, x.shape[0], send_input, token) 
-        
-        # Send -1 to signal all the data has been sent  
-        token = send(jnp.array([-1.0, 0.0]), dest=1, tag=0, comm=comm)
+            return token, count
 
-        return token, jnp.zeros(()), neuron_states
+        # Initial carry: (token, iteration=0)
+        token, iteration = jax.lax.fori_loop(0, x.shape[0], send_input, (token, 0))
+
+        # Send end signal
+        token = send(jnp.array([-1.0, 0.0]), dest=1, tag=0, comm=comm, token=token)
+
+        return token, jnp.zeros(()), neuron_states, iteration+1
     
-    @jax.jit
     def other_layers(args):
         token, neuron_states, _ = args
         def cond(state): # end of input has been reached -> break the while loop
-            _, _, _, neuron_idx= state            
+            _, _, _, neuron_idx, _= state            
             return neuron_idx != -1
         
         def forward_pass(state):
-            token, layer_input, neuron_states, neuron_idx = state
+            token, layer_input, neuron_states, neuron_idx, iteration = state
             
             def hidden_layers(input): # Send activation to the next layers
                 token, activated_output = input
+
                 def send_activation(i, token):
                     out_val = activated_output[i]
                     return jax.lax.cond(
@@ -140,14 +151,14 @@ def predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
             # jax.debug.print("Rank {} received data {} at neuron idx: {}", rank, layer_input, neuron_idx)
             neuron_states = new_neuron_states
             token = jax.lax.cond(rank==size-1, lambda input: input[0], hidden_layers, (token, activated_output))
-            return token, layer_input, neuron_states, neuron_idx
+            return token, layer_input, neuron_states, neuron_idx, iteration+1
         
         neuron_idx = 0
         layer_input = jnp.zeros(())
-        initial_state = (token, layer_input, neuron_states, neuron_idx)
+        initial_state = (token, layer_input, neuron_states, neuron_idx, 0)
         
         # Loop until the rank receives a -1 neuron_idx
-        token, layer_input, neuron_states, neuron_idx = jax.lax.while_loop(cond, forward_pass, initial_state)
+        token, layer_input, neuron_states, neuron_idx, iteration = jax.lax.while_loop(cond, forward_pass, initial_state)
         # jax.debug.print("rank {} exited the while loop with neuron_idx: {} and neuron state {}", rank, neuron_idx, neuron_states)
         
         # Send -1 to the next rank when all incoming data has been processed
@@ -157,30 +168,27 @@ def predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
             lambda t: t,
             operand=token
         )
-        return token, layer_input, neuron_states
-            
+        return token, layer_input, neuron_states, iteration
+    
     def loop_over_batches(token, x):
         neuron_states = empty_neuron_states  
-        token, layer_input, new_neuron_states = jax.lax.cond(rank==0, input_layer, other_layers, (token, neuron_states, x))
+        token, layer_input, new_neuron_states, iterations = jax.lax.cond(rank==0, input_layer, other_layers, (token, neuron_states, x))
         
-        # Only return meaningful output on last rank
-        output = jax.lax.cond(
-            rank == size-1,
-            lambda _: new_neuron_states.values,
-            lambda _: jnp.zeros_like(new_neuron_states.values),
-            operand=None,
-        )
-        return token, new_neuron_states.values
+        return token, (new_neuron_states.values, iterations)
     
     # Loop over batches, accumulate output values and return them
-    token, all_outputs = jax.lax.scan(loop_over_batches, token, batch_data)
+    token, (all_outputs, all_iterations) = jax.lax.scan(loop_over_batches, token, batch_data)
 
     # Synchronize all ranks before starting the backward pass
     token = mpi4jax.barrier(comm=comm, token=token)
 
     # jax.block_until_ready(all_outputs)
     # jax.debug.print("rank {} finished computing and waiting at the barrier after scanning over {} elements", rank, all_outputs.shape)
-    return token, all_outputs, all_outputs[-1]
+    return token, all_outputs, all_iterations
+
+
+# def predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
+
 
 #region Python loop      
 def python_predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
@@ -318,20 +326,27 @@ def random_layer_params(m, n, key, scale=1e-2):
     return scale * jax.random.normal(w_key, (n, m))#, scale * jax.random.normal(b_key, (n,))
     # return jnp.full((n, m), 0.1)
 
-def init_params(key, load_file=False):# Initialize weights for each layer
+def init_params(key, load_file=False, best=False):
+    # Initialize weights for each layer
     keys = jax.random.split(key, len(layer_sizes))
     
     if rank != 0:
-        neuron_states = Neuron_states(values=jnp.zeros(layer_sizes[rank]), threshold=thresholds[rank-1])
+        neuron_states = Neuron_states(values=jnp.zeros(layer_sizes[rank]), threshold=thresholds[rank-1], residuals=np.zeros((layer_sizes[rank-1], layer_sizes[rank])))
 
         if load_file:
-            w_data = np.load("tensor_data.npz")
+            # 
+            filename = f"tensor_data_{'_'.join(map(str, layer_sizes))}.npz"
+            if best:
+                filename = "best_" + filename
+            filepath = os.path.join("tensor_data", filename)
+            w_data = np.load(filepath)
             for i, k in enumerate(w_data.files):
                 if i == rank-1:
                     weights = jnp.array(w_data[k])
                     print(weights.shape)
                     return weights, neuron_states                
-                
+        
+        # Random initializatoin of the weights       
         weights = random_layer_params(layer_sizes[rank], layer_sizes[rank-1], keys[rank])        
         return weights, neuron_states
 
@@ -376,11 +391,13 @@ def pad_batch(batch_x, batch_y, batch_size):
 if __name__ == "__main__":
     key = jax.random.key(42)
     # Network structure and parameters
+    layer_sizes = [28*28, 128, 64, 10]
     layer_sizes = [28*28, 128, 10]
+    best = False
     load_file = True
     # layer_sizes = [4, 5, 3] 
     # load_file = False
-    thresholds = [0, 0]  
+    thresholds = [0, 0 ,0]  
     num_epochs = 1
     learning_rate = 0.01
     batch_size = 128
@@ -392,6 +409,10 @@ if __name__ == "__main__":
         learning_rate=learning_rate, 
         batch_size=batch_size
     )
+    
+    if len(layer_sizes) != size:
+        print(f"Error: layer_sizes ({len(layer_sizes)}) must match number of MPI ranks ({size})")
+        sys.exit(1)
 
     if rank == size-1:
         correct_predictions = 0
@@ -402,7 +423,7 @@ if __name__ == "__main__":
     # Initialize parameters (input data for rank 0 and weights for other ranks)
     key, subkey = jax.random.split(key) 
     if rank != 0:
-        weights, neuron_states = init_params(subkey, load_file=load_file)
+        weights, neuron_states = init_params(subkey, load_file=load_file, best=best)
         total_batches = 0
         batch_iterator = None
     if rank == 0:
@@ -425,31 +446,34 @@ if __name__ == "__main__":
     token = mpi4jax.barrier(comm=comm, token=token)
     start_time = time.time()
 
-    empty_neuron_states = Neuron_states(values=jnp.zeros((layer_sizes[rank])), threshold=thresholds[(rank-1)%len(thresholds)])    
+    empty_neuron_states = Neuron_states(values=jnp.zeros((layer_sizes[rank])), threshold=thresholds[(rank-1)%len(thresholds)], residuals=np.zeros((layer_sizes[rank-1], layer_sizes[rank])))    
     for epoch in range(num_epochs):
         if rank == size-1:
             epoch_correct = 0
             epoch_total = 0
+            
+        all_iterations = []
         
         for i in range(total_batches):
-            # if i < 261:
-            #     if rank==0:
-            #         _, _ = next(batch_iterator)
-            #     continue
-            
             neuron_states = empty_neuron_states
             if rank == 0:
                 batch_x, batch_y = next(batch_iterator)
                 batch_y = jnp.array(batch_y, dtype=jnp.float32)
-                print(f"Batch_x: {batch_x.shape}, {batch_y.dtype}")
+                # print(f"Batch_x: {batch_x.shape}, {batch_y.dtype}")
                 
                 batch_x, batch_y = pad_batch(batch_x, batch_y, batch_size)
                 
-                token, layer_input, last_output_value = predict(weights, neuron_states, token, batch_data=jnp.array(batch_x))
+                token, outputs, iterations = jit(predict)(weights, neuron_states, token, batch_data=jnp.array(batch_x))
+                
+                all_iterations.append(iterations)
 
                 token = send(batch_y, dest=size-1, tag=10,comm=comm, token=token)
+                
+                token = send(jnp.mean(jnp.array(all_iterations).flatten()), dest=size-1, tag=20,comm=comm, token=token)
             else:
-                token, outputs, last_output_value = predict(weights, neuron_states, token, jnp.zeros((batch_size, layer_sizes[0])))
+                token, outputs, iterations = jit(predict)(weights, neuron_states, token, jnp.zeros((batch_size, layer_sizes[0])))
+                all_iterations.append(iterations)
+
                 if rank == size-1:
 
                     y, token = recv(jnp.zeros((batch_size,)), source=0, tag=10, comm=comm, token=token)                    
@@ -466,12 +490,14 @@ if __name__ == "__main__":
                     epoch_total += valid_y.shape[0]
 
                     
-                    jax.debug.print("Batch {}: Predictions: {}, True: {}, Correct: {}/{}, last network output: {}",
-                                i, valid_predictions, valid_y, batch_correct, valid_y.shape[0], last_output_value)
-
-        jax.debug.print("Rank {} finished all batches", rank)
-            # if i > 200:
-            #     break
+                    jax.debug.print("Batch {}: Predictions: {}, True: {}, Iterations avg: {}, Correct: {}/{}, last network output: {}",
+                                i, valid_predictions, valid_y, jnp.mean(iterations), batch_correct, valid_y.shape[0], outputs[-1])
+                else:
+                    token = send(jnp.mean(jnp.array(all_iterations).flatten()), dest=size-1, tag=20,comm=comm, token=token)
+        all_iterations = jnp.array(all_iterations).flatten()
+        
+        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, jnp.mean(all_iterations), all_iterations.shape[0])
+        
         # Calculate epoch accuracy
         if rank == size-1:
             epoch_accuracy = epoch_correct / epoch_total
@@ -481,17 +507,49 @@ if __name__ == "__main__":
             
             jax.debug.print("Epoch {} Accuracy: {:.2f}%", epoch, epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
+            
+            all_iteration_mean = []
+            for i in range(size-1):
+                mean, token = recv(jnp.zeros(()), source=i, tag=20, comm=comm, token=token)                    
+                all_iteration_mean.append(mean)
+            all_iteration_mean.append(jnp.mean(all_iterations))
 
-    # Final accuracy
-    if rank == size-1:
-        total_accuracy = correct_predictions / total_samples
-        jax.debug.print("Final Accuracy: {:.2f}%", total_accuracy * 100)
-        
     jax.block_until_ready(token)
 
     # Synchronize all MPI processes again
     token = mpi4jax.barrier(comm=comm, token=token)
     end_time = time.time()
 
-    if rank == 0:
-        print(f"Execution Time: {end_time - start_time:.6f} seconds")
+    if rank == size-1:            
+        # Final accuracy
+        total_accuracy = correct_predictions / total_samples
+        jax.debug.print("Final Accuracy: {:.2f}%", total_accuracy * 100)
+        
+        # Execution time
+        execution_time = end_time - start_time
+        print(f"Execution Time: {execution_time:.6f} seconds")
+        
+        # Set up file path
+        filename = "_".join(map(str, layer_sizes)) + ".json"
+        if best:
+            filename = "best_" + filename
+        result_dir = os.path.join("network_results", "mnist")
+        os.makedirs(result_dir, exist_ok=True)
+        result_path = os.path.join(result_dir, filename)
+
+        # Store the results
+        result_data = {
+            "time": float(execution_time),
+            "processes": size,
+            "accuracy": float(total_accuracy),
+            "iterations mean": [float(mean) for mean in all_iteration_mean[1:]],
+            "layer_sizes": layer_sizes,#[layer for layer in layer_sizes],
+            "batch_size": batch_size,
+            "thresholds": thresholds
+        }
+
+
+        with open(result_path, "w") as f:
+            json.dump(result_data, f, indent=4)
+
+        print(f"Results saved to {result_path}")

@@ -388,46 +388,47 @@ class LinearLayer:
         
 class MLP:
     """
-    Represents a simple Multi-Layer Perceptron (MLP) with two fully-connected layers.
-
-    This class defines a neural network with one hidden layer and one output layer,
-    both fully connected. The hidden layer includes an activation function (ReLU),
-    while the output layer doesn't have an activation, making it suitable for classification.
+    Represents a flexible Multi-Layer Perceptron (MLP) with any number of hidden layers.
 
     Attributes:
-        hidden_layer (LinearLayer): The hidden layer of the MLP.
-        output_layer (LinearLayer): The output layer of the MLP.
-        param (list): Aggregated list of parameters from both layers for training purposes.
+        layers (list): A list of LinearLayer objects forming the MLP.
+        param (list): Aggregated list of parameters from all layers for training.
     """
 
-    # Your code: implement the function
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, layer_dims):
         """
-        Initializes the MLP with specified dimensions for each layer.
+        Initializes the MLP with the given architecture.
 
         Args:
-            input_dim (int): The size of the input feature vector.
-            hidden_dim (int): The number of neurons in the hidden layer.
-            output_dim (int): The number of neurons in the output layer.
+            layer_dims (tuple or list of int): Sizes of each layer including input and output.
+                                               Example: (784, 128, 64, 10)
         """
-        self.hidden_layer = LinearLayer(input_dim, hidden_dim)
-        self.output_layer = LinearLayer(hidden_dim, output_dim, activation="")
-        self.param = np.array([self.hidden_layer.param, self.output_layer.param]).flatten()
+        self.layers = []
 
-    # Your code: implement the function
+        for in_dim, out_dim in zip(layer_dims[:-2], layer_dims[1:-1]):
+            self.layers.append(LinearLayer(in_dim, out_dim))  # Hidden layers with activation
+
+        # Add final output layer with no activation
+        self.layers.append(LinearLayer(layer_dims[-2], layer_dims[-1], activation=""))
+
+        # Flatten all parameters into a single list
+        self.param = np.array([layer.param for layer in self.layers]).flatten()
+
+
     def forward(self, x):
         """
-        Computes the forward pass of the MLP.
+        Computes the forward pass through the MLP.
 
         Args:
-            x (Tensor): Input tensor to the neural network.
+            x (Tensor): Input tensor.
 
         Returns:
-            Tensor: Output tensor after processing through both layers of the MLP.
+            Tensor: The network's output.
         """
-        hidden = self.hidden_layer.forward(x)  
+        for layer in self.layers:
+            x = layer.forward(x)
+        return x
 
-        return self.output_layer.forward(hidden)  
     
 class SGDOptimizer:
     """
@@ -812,7 +813,13 @@ if __name__ == "__main__":
         train_dataloader, val_dataloader, (mnist_data_x_test, mnist_data_y_test), total_batches = torch_loader_manual(batch_size, shuffle=False)
 
         # Define neural network
-        network = MLP(28*28, 128, 10)
+        layer_dims = (784, 128, 10)
+        network = MLP(layer_dims)
+        
+        filename = f"tensor_data_{'_'.join(map(str, layer_dims))}"
+        output_dir = "tensor_data"
+        os.makedirs(output_dir, exist_ok=True)
+
         # Define optimizer
         optimizer = SGDOptimizer(network.param, lr=0.001)
         # Define loss function
@@ -825,13 +832,16 @@ if __name__ == "__main__":
         plt.xlabel('Epoch')  # Label for the x-axis
         plt.ylabel('Validation Accuracy')  # Label for the y-axis
         plt.grid(True)  # Enable grid for easier visualization of the plot lines
-        plt.savefig("mnist training accuracy")
         
+        final_accuracy = val_accuracy_list[-1]
+        plt.title(f"Final Validation Accuracy: {final_accuracy:.4f}")
+        plt.savefig(os.path.join(output_dir, f"{filename}.png"))
+
         print(network.param[0].data.shape)
+
+        # Save parameters to .npz in the same folder
+        tensor_data = [tensor.data for tensor in network.param]
+        np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
         
-        tensor_data = [tensor.data for i, tensor in enumerate(network.param)]
-        
-        np.savez("tensor_data.npz", *tensor_data)
-        
-        data = np.load("tensor_data.npz")
+        data = np.load(os.path.join(output_dir, f"{filename}.npz"))
         print(data)

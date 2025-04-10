@@ -51,11 +51,85 @@ def receive_data():
     return final_state[0]  # Return received data
 
 
-if __name__ == "__main__":
-    if rank == 0:
-        send_data()  # JAX-compiled send function
+@jax.custom_vjp
+def test_custom_vjp(input, weight):
+    return jnp.dot(input, weight)
 
-    if rank == size-1:
-        data0, data1 = receive_data()  # JAX-compiled receive function
-        print(f"data0: {data0}")
-        print(f"data1: {data1}")
+# Forward pass: returns output and residuals needed for backward
+def test_custom_vjp_fwd(input, weight):
+    if rank == 0:
+        input_prev = input
+        output = test_custom_vjp(input, weight)
+        token = mpi4jax.send(output, dest=rank+1, tag=1, comm=comm)
+    else:
+        input_prev, token = mpi4jax.recv(jnp.zeros(()), source=rank-1, tag=1, comm=comm)
+        output = test_custom_vjp(input_prev, weight)
+    
+    return output, (input_prev, weight)  # these are saved for use in the backward
+
+# Backward pass: receives residuals and the cotangent (gradient from next layer)
+def test_custom_vjp_bwd(residuals, g):
+    input, weight = residuals
+    print(f"Rank {rank} backward received gradient: {g}")
+
+    grad_input = g * weight  # d(output)/d(input) = weight
+    grad_weight = g * input  # d(output)/d(weight) = input
+    
+    print(f"Rank {rank} grad_input: {grad_input}, grad_weight: {grad_weight}")
+
+    return grad_input, grad_weight
+
+# Register the custom VJP
+test_custom_vjp.defvjp(test_custom_vjp_fwd, test_custom_vjp_bwd)
+
+def loss_fn(input, weight, target):
+    output = test_custom_vjp(input, weight)
+    jax.debug.print("Rank {}, output: {}", rank, output)
+    l = jnp.mean((output - target) ** 2)
+    jax.debug.print("loss: {}", l)
+    return l
+
+def other_layers(input, weight):
+    # Call the forward function to get residuals
+    output, residuals = test_custom_vjp_fwd(input, weight)
+    jax.debug.print("Rank {}, output: {}", rank, output)
+
+    # Receive gradient from next layer
+    next_grad, token = mpi4jax.recv(jnp.zeros(()), source=rank + 1, tag=0, comm=comm)
+    jax.debug.print("Rank {}, received gradient: {}", rank, next_grad)
+
+    # Backward pass using saved residuals and received gradient
+    grad_input, grad_weight = test_custom_vjp_bwd(residuals, next_grad)
+    
+    # Send gradient to the previous layer (if not input layer)
+    if rank > 0:
+        token = mpi4jax.send(grad_input, dest=rank - 1, tag=0, comm=comm, token=token)
+
+    return grad_input, grad_weight
+
+if __name__ == "__main__":
+    input = 1.0
+    target = 1.0
+    weight = 0.5
+    lr = 0.001
+
+    for i in range(10):
+        if rank == size-1:
+            # Differentiate w.r.t. weight
+            gradient = jax.grad(loss_fn, argnums=(0, 1))(input, weight, target)
+            print("Gradient wrt input and weight:", gradient)
+            weight -= gradient[1] * lr
+            token = mpi4jax.send(jnp.array(gradient[0]), dest=rank-1, tag=0, comm=comm)
+        else:
+            gradient = other_layers(input, weight)    
+            print("Gradient wrt input and weight:", gradient)
+            weight -= gradient[1] * lr
+
+
+    # if rank == 0:
+    #     send_data()  # JAX-compiled send function
+
+    # if rank == size-1:
+    #     data0, data1 = receive_data()  # JAX-compiled receive function
+    #     print(f"data0: {data0}")
+    #     print(f"data1: {data1}")
