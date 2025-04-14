@@ -73,11 +73,12 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states):
     
     # Handle final layer condition using `jax.lax.cond`
     def last_layer_case(_):
-        return jnp.zeros_like(activations), Neuron_states(values=activations, threshold=neuron_states.threshold)
+        new_residuals = neuron_states.residuals.at[neuron_idx].add(layer_input)
+        return jnp.zeros_like(activations), Neuron_states(values=activations, threshold=neuron_states.threshold, residuals=new_residuals)
     
     def hidden_layer_case(_):
         activated_output = activation_func(neuron_states, activations)
-        new_neuron_states = Neuron_states(values=activations - activated_output, threshold=neuron_states.threshold)
+        new_neuron_states = Neuron_states(values=activations - activated_output, threshold=neuron_states.threshold, residuals=neuron_states.residuals)
         return activated_output, new_neuron_states
     
     return jax.lax.cond(rank == size-1, last_layer_case, hidden_layer_case, None)
