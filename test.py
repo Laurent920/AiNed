@@ -53,17 +53,17 @@ def receive_data():
 
 @jax.custom_vjp
 def test_custom_vjp(input, weight):
-    return jnp.dot(input, weight)
+    return jnp.zeros(jnp.dot(input, weight))
 
 # Forward pass: returns output and residuals needed for backward
 def test_custom_vjp_fwd(input, weight):
     if rank == 0:
         input_prev = input
-        output = test_custom_vjp(input, weight)
+        output = jnp.dot(input, weight)
         token = mpi4jax.send(output, dest=rank+1, tag=1, comm=comm)
     else:
         input_prev, token = mpi4jax.recv(jnp.zeros(()), source=rank-1, tag=1, comm=comm)
-        output = test_custom_vjp(input_prev, weight)
+        output = jnp.dot(input_prev, weight)
     
     return output, (input_prev, weight)  # these are saved for use in the backward
 
@@ -82,12 +82,39 @@ def test_custom_vjp_bwd(residuals, g):
 # Register the custom VJP
 test_custom_vjp.defvjp(test_custom_vjp_fwd, test_custom_vjp_bwd)
 
+@jax.custom_vjp
 def loss_fn(input, weight, target):
-    output = test_custom_vjp(input, weight)
+    output, residuals = test_custom_vjp_fwd(input, weight)
+    # Loss function: Mean Squared Error (MSE)
+    return jnp.mean((output - target) ** 2)
+
+# Define the forward pass for the custom JVP
+def loss_fn_fwd(input, weight, target):
+    output, residuals = test_custom_vjp_fwd(input, weight)
     jax.debug.print("Rank {}, output: {}", rank, output)
     l = jnp.mean((output - target) ** 2)
     jax.debug.print("loss: {}", l)
-    return l
+    return l, (output, residuals)
+
+# Define the backward pass for the custom JVP
+def loss_fn_bwd(residuals, g):
+    (output, (input, weight)) = residuals
+    jax.debug.print("{}",output)
+    N = output.size  # Number of elements in output
+    # Gradient of the loss with respect to the output
+    grad_output = g * (2 / N) * (output - target)
+    return grad_output*weight, grad_output*input, None  # Gradient for 'output' and None for 'target' (no gradient wrt target)
+
+# Register the custom JVP with the forward and backward functions
+loss_fn.defvjp(loss_fn_fwd, loss_fn_bwd)
+
+
+# def loss_fn(input, weight, target):
+#     output, residuals = test_custom_vjp_fwd(input, weight)
+#     jax.debug.print("Rank {}, output: {}", rank, output)
+#     l = jnp.mean((output - target) ** 2)
+#     jax.debug.print("loss: {}", l)
+#     return l
 
 def other_layers(input, weight):
     # Call the forward function to get residuals
@@ -113,10 +140,11 @@ if __name__ == "__main__":
     weight = 0.5
     lr = 0.001
 
-    for i in range(10):
+    for i in range(1):
         if rank == size-1:
             # Differentiate w.r.t. weight
-            gradient = jax.grad(loss_fn, argnums=(0, 1))(input, weight, target)
+            output, gradient = jax.value_and_grad(loss_fn, argnums=(0, 1))(input, weight, target)
+            jax.debug.print("Rank {}, output: {}", rank, output)
             print("Gradient wrt input and weight:", gradient)
             weight -= gradient[1] * lr
             token = mpi4jax.send(jnp.array(gradient[0]), dest=rank-1, tag=0, comm=comm)

@@ -32,7 +32,7 @@ def torch_loader(batch_size=1, shuffle=False):
 
 
 if __name__ == "__main__":
-    batch_size = 1
+    batch_size = 2
     train_loader, train, test, total_batches = torch_loader(batch_size)
     print(total_batches)
     # Example: Iterate through the DataLoader

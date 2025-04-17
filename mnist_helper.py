@@ -608,6 +608,7 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
     for epoch in range(epoch_num):
         i = 0
         for x, y in train_dataloader:
+            # print(x.shape, y.shape)
             # (x-np.mean(x))/np.sqrt(np.std(x)**2)
             output = network.forward(Tensor(x))
 
@@ -629,6 +630,23 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
 
     return validation_acc
 
+class InfiniteDataLoader:
+    def __init__(self, data_loader):
+        self.data_loader = data_loader
+        self.iterator = iter(data_loader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            batch = next(self.iterator)
+        except StopIteration:
+            self.iterator = iter(self.data_loader)
+            batch = next(self.iterator)
+        return batch
+
+
 def torch_loader_manual(batch_size, shuffle=True):
     mnist_data = pd.read_csv('train.csv')
     # Extract the image data from the data
@@ -645,6 +663,9 @@ def torch_loader_manual(batch_size, shuffle=True):
     # Define training set dataloader object
     train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=shuffle)    
     val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=shuffle)
+    
+    train_dataloader = InfiniteDataLoader(train_dataloader)
+    val_dataloader = InfiniteDataLoader(val_dataloader)
     
     # Read all MNIST training data from the file
     mnist_data = pd.read_csv('test.csv')

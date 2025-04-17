@@ -1,0 +1,20 @@
+{
+    "time": 1.4026787281036377,
+    "processes": 3,
+    "accuracy": 0.32499998807907104,
+    "iterations mean": [
+        4.0,
+        5.366666793823242
+    ],
+    "layer_sizes": [
+        4,
+        5,
+        3
+    ],
+    "batch_size": 1,
+    "thresholds": [
+        0,
+        0,
+        0
+    ]
+}
