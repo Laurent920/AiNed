@@ -605,17 +605,16 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
         np.array: An array of validation accuracies for each training epoch.
     """
     validation_acc = []
+    training_acc = []
     for epoch in range(epoch_num):
         i = 0
         for x, y in train_dataloader:
-            # print(x.shape, y.shape)
-            # (x-np.mean(x))/np.sqrt(np.std(x)**2)
             output = network.forward(Tensor(x))
 
             labels = Tensor(one_hot_encode(y, num_classes=10))
             loss = loss_func.forward(output, labels)
             if np.isnan(loss.data):
-                # print(i)
+                print("skipping loss {}", loss)
                 pass
             i += 1
             loss_func.backward(loss)
@@ -623,12 +622,17 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
             
             optimizer.step()
             optimizer.zero_grad()
-            
+        
         with no_grad():
-            accuracy, correct_num, total_num = validation_func(network, val_dataloader)
-            validation_acc.append(accuracy)
+            train_accuracy, _, _ = validation_func(network, train_dataloader)
+            training_acc.append(train_accuracy)
+            
+            val_accuracy, correct_num, total_num = validation_func(network, val_dataloader)
+            validation_acc.append(val_accuracy)
+            print(f"epoch {epoch} with training accuracy: {train_accuracy} and validation accuracy: {val_accuracy}")
 
-    return validation_acc
+
+    return training_acc, validation_acc
 
 class InfiniteDataLoader:
     def __init__(self, data_loader):
@@ -658,14 +662,17 @@ def torch_loader_manual(batch_size, shuffle=True):
 
     # Calculate total batches for training data
     total_train_samples = len(train_indices)
-    total_batches = (total_train_samples + batch_size - 1) // batch_size  # Ceiling division
+    total_train_batches = (total_train_samples + batch_size - 1) // batch_size  # Ceiling division
+    
+    total_val_samples = len(val_indices)
+    total_val_batches = (total_val_samples + batch_size - 1) // batch_size
 
     # Define training set dataloader object
     train_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=shuffle)    
     val_dataloader = DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=shuffle)
     
-    train_dataloader = InfiniteDataLoader(train_dataloader)
-    val_dataloader = InfiniteDataLoader(val_dataloader)
+    # train_dataloader = InfiniteDataLoader(train_dataloader)
+    # val_dataloader = InfiniteDataLoader(val_dataloader)
     
     # Read all MNIST training data from the file
     mnist_data = pd.read_csv('test.csv')
@@ -678,7 +685,7 @@ def torch_loader_manual(batch_size, shuffle=True):
     # Define training set dataloader object
     test_set_dataloader = DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
 
-    return train_dataloader, val_dataloader, (mnist_data_x_test, mnist_data_y_test), total_batches
+    return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test)
 
 # region TORCH LOADER
 import os
@@ -831,7 +838,7 @@ if __name__ == "__main__":
     else:    
         batch_size = 64
 
-        train_dataloader, val_dataloader, (mnist_data_x_test, mnist_data_y_test), total_batches = torch_loader_manual(batch_size, shuffle=False)
+        (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test) = torch_loader_manual(batch_size, shuffle=False)
 
         # Define neural network
         layer_dims = (784, 128, 10)
@@ -846,17 +853,22 @@ if __name__ == "__main__":
         # Define loss function
         loss_func = SoftmaxCrossEntropy()
 
-        epoch_num = 30
-        val_accuracy_list = train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num)
-        plt.figure()
-        plt.plot([i+1 for i in range(epoch_num)], val_accuracy_list, 'o-')
-        plt.xlabel('Epoch')  # Label for the x-axis
-        plt.ylabel('Validation Accuracy')  # Label for the y-axis
-        plt.grid(True)  # Enable grid for easier visualization of the plot lines
-        
-        final_accuracy = val_accuracy_list[-1]
-        plt.title(f"Final Validation Accuracy: {final_accuracy:.4f}")
+        epoch_num = 20
+        train_accuracy_list, val_accuracy_list = train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num)
+        plt.figure(figsize=(8, 5))
+        epochs = [i + 1 for i in range(epoch_num)]
+
+        plt.plot(epochs, train_accuracy_list, 'o-', label='Training Accuracy')
+        plt.plot(epochs, val_accuracy_list, 's-', label='Validation Accuracy')
+
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f}")
+        plt.legend()
+        plt.grid(True)
+
         plt.savefig(os.path.join(output_dir, f"{filename}.png"))
+        plt.close()
 
         print(network.param[0].data.shape)
 

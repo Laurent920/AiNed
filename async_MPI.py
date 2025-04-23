@@ -464,16 +464,13 @@ def predict_bwd(batch_data, weights, empty_neuron_states, token):
     
     # Expand the dimensions of next_grad_transposed to match the shape of all_neuron_states.weight_residuals["values"]
     next_grad_expanded = jnp.expand_dims(next_grad, axis=1)  # Shape: (1, 1, 5)
+    
     weight_res = all_neuron_states.weight_residuals
-
-    # weight_res = weight_res_complete(all_neuron_states.weight_residuals)
-    # weight_res = jnp.expand_dims(weight_res_complete(all_neuron_states.weight_residuals), axis=0)
-    # jax.debug.print("weight residuals {}, {}", weight_res["values"].shape, weight_res["activity"].shape)
-
     weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(weight_res["activity"], weight_res["values"])
 
-    # jax.debug.print("weight residuals {}, {}", weight_res.shape, weight_res)
-
+    
+    # weight_res = weight_res["values"] # incorrect residual but faster for testing
+    
     # Perform element-wise multiplication
     z_grad = jax.vmap(z_gradient, in_axes=(0, 0))(weight_res, next_grad_expanded)
     
@@ -581,13 +578,15 @@ def train(token, params: Params, weights):
     tag 0:  forward computation, data format: (previous_layer_neuron_index, neuron_value)
             end of input is encoded with the index -1
     tag 2: backward computation, last layer gradient shape: (layer_sizes[-1], 1)
-    tag 10: data labels
+    tag 5: weights
+    tag 10: data labels(y)
     tag 20: iteration values
     """   
     if rank == size-1:
         correct_predictions = 0
         total_samples = 0 
         all_epoch_accuracies = []
+        all_validation_accuracies = []
         
     token = mpi4jax.barrier(comm=comm, token=token)
     start_time = time.time()
@@ -603,8 +602,10 @@ def train(token, params: Params, weights):
             epoch_total = 0
             
         all_iterations = []
+        if rank == 0:
+            batch_iterator = iter(training_generator)
         
-        for i in range(total_batches):
+        for i in range(total_train_batches):
             neuron_states = empty_neuron_states
             if rank == 0:
                 batch_x, batch_y = next(batch_iterator)
@@ -651,27 +652,36 @@ def train(token, params: Params, weights):
         all_iterations = jnp.array(all_iterations).flatten()
         mean = jnp.mean(all_iterations)
 
-        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, all_iterations.shape[0])
+        if rank != 0:
+            jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, all_iterations.shape[0])
         
+        val_accuracy, val_mean = batch_predict(token, weights, "val", save=False, debug=False)
+
         # Calculate epoch accuracy
         if rank != size-1:
             # jax.debug.print("rank {} send tag 20: i:{}", rank, i)                 
             token = send(mean, dest=size-1, tag=20,comm=comm, token=token)
+            token = send(weights, dest=size-1, tag=5,comm=comm, token=token)
         else:
             epoch_accuracy = epoch_correct / epoch_total
             all_epoch_accuracies.append(epoch_accuracy)
+            all_validation_accuracies.append(val_accuracy)
             correct_predictions += epoch_correct
             total_samples += epoch_total
             
-            jax.debug.print("Epoch {} Accuracy: {:.2f}%", epoch, epoch_accuracy * 100)
+            jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, average val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, val_mean)
             jax.debug.print("----------------------------\n")
             
             all_iteration_mean = []
+            weights_dict = {}
             for i in range(size-1):
-                mean, token = recv(jnp.zeros(()), source=i, tag=20, comm=comm, token=token)   
-                             
-                all_iteration_mean.append(mean)
-            all_iteration_mean.append(jnp.mean(all_iterations))
+                mean_rcved, token = recv(jnp.zeros(()), source=i, tag=20, comm=comm, token=token)   
+                w, token = recv(jnp.zeros((layer_sizes[i-1], layer_sizes[i])), source=i, tag=5, comm=comm, token=token)   
+                weights_dict[f"layer_{i}"] = w.tolist()
+                
+                all_iteration_mean.append(mean_rcved)
+            all_iteration_mean.append(mean)
+            weights_dict[f"layer_{size-1}"] = weights.tolist()
 
     jax.block_until_ready(token)
 
@@ -679,17 +689,9 @@ def train(token, params: Params, weights):
     token = mpi4jax.barrier(comm=comm, token=token)
     end_time = time.time()
     
-    if rank==size-1:
-        plt.figure(figsize=(10, 6))
-        plt.plot(all_epoch_accuracies, marker='o', linestyle='-', color='b')
-        plt.title('Epoch Accuracies')
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy')
-        plt.grid(True)
-
-        # Save the plot as an image file
-        plt.savefig('epoch_accuracies.png')
-        
+    # val_accuracy = batch_predict(token, "val", save=False)
+    
+    if rank==size-1:        
         # Final accuracy
         total_accuracy = all_epoch_accuracies[-1]
         jax.debug.print("Final Accuracy: {:.2f}%", total_accuracy * 100)
@@ -699,8 +701,8 @@ def train(token, params: Params, weights):
         print(f"Execution Time: {execution_time:.6f} seconds")
         
         # Set up file path
-        filename = "_".join(map(str, layer_sizes)) + ".json"
-        filename = f"{random_seed}" + f"_ep{num_epochs}" + f"_batch{batch_size}" + filename 
+        filename = "_".join(map(str, layer_sizes)) 
+        filename = f"{random_seed}" + f"_ep{num_epochs}" + f"_batch{batch_size}_" + filename 
         if best:
             filename = "best_" + filename
         result_dir = os.path.join("network_results", "training")
@@ -711,18 +713,33 @@ def train(token, params: Params, weights):
         result_data = {
             "time": float(execution_time),
             "processes": size,
-            "accuracy": float(total_accuracy),
+            "training accuracy": float(total_accuracy),
+            "validation accuracy": float(all_validation_accuracies[-1]),
             "iterations mean": [float(mean) for mean in all_iteration_mean[1:]],
             "layer_sizes": layer_sizes,
             "batch_size": batch_size,
             "thresholds": thresholds,
+            "weights": weights_dict
         }
 
-        with open(result_path, "w") as f:
+        with open(result_path + ".json", "w") as f:
             json.dump(result_data, f, indent=4)
 
         print(f"Results saved to {result_path}")
-    
+
+        plt.figure(figsize=(8, 5))
+        epochs = [i + 1 for i in range(num_epochs)]
+        plt.plot(epochs, all_epoch_accuracies, 'o-', label='Training Accuracy')
+        plt.plot(epochs, all_validation_accuracies, 's-', label='Validation Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.title(f"Final Val Acc: {all_validation_accuracies[-1]:.4f} | Final Train Acc: {all_epoch_accuracies[-1]:.4f}")
+        plt.legend()
+        plt.grid(True)
+
+        # Save the plot as an image file
+        plt.savefig(result_path + ".png")
+        plt.close()
     
     
 def accuracy(batch_number, outputs, y, iterations, print):
@@ -758,7 +775,6 @@ def init_params(key, load_file=False, best=False):
                                                           "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))})
 
         if load_file:
-            # 
             filename = f"tensor_data_{'_'.join(map(str, layer_sizes))}.npz"
             if best:
                 filename = "best_" + filename
@@ -768,7 +784,9 @@ def init_params(key, load_file=False, best=False):
                 if i == rank-1:
                     weights = jnp.array(w_data[k])
                     print(weights.shape)
-                    return weights, neuron_states                
+                    return weights, neuron_states      
+                
+                      
         
         # Random initializatoin of the weights       
         weights = random_layer_params(layer_sizes[rank], layer_sizes[rank-1], keys[rank])        
@@ -812,7 +830,7 @@ def pad_batch(batch_x, batch_y, batch_size):
     return batch_x, batch_y
 
 # region Main 
-def batch_predict(token):
+def batch_predict(token, weights, dataset:str="train", save=True, debug=True):
     if rank == size-1:
         correct_predictions = 0
         total_samples = 0 
@@ -826,70 +844,87 @@ def batch_predict(token):
                                         input_residuals=np.zeros((layer_sizes[rank-1], 1)),
                                         weight_residuals={"activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
                                                           "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))})
-    for epoch in range(num_epochs):
-        if rank == size-1:
-            epoch_correct = 0
-            epoch_total = 0
+    
+    if dataset == "train":
+        total_batches = total_train_batches
+        if rank == 0:
+            print(f"Inference on the training set...")
+            batch_iterator = iter(training_generator)
+    elif dataset == "val":
+        total_batches = total_val_batches
+        if rank == 0:
+            print(f"Inference on the validation set...")
+            batch_iterator = iter(validation_generator)
+    else:
+        print("INVALID DATASET")
+        return
+        
+    if rank == size-1:
+        epoch_correct = 0
+        epoch_total = 0
             
-        all_iterations = []
-        
-        for i in range(total_batches):
-            neuron_states = empty_neuron_states
-            batched_predict = jax.vmap(
-                                predict,
-                                in_axes=(None, None, None, 0),  # Only batch over `batch_data`
-                                out_axes=(None, 0, 0, 0)        # Customize based on outputs
-                            )
-            if rank == 0:
-                batch_x, batch_y = next(batch_iterator)
-                batch_x = jnp.array(batch_x)
-                batch_y = jnp.array(batch_y, dtype=jnp.float32)
-                # print(f"Batch_x: {batch_x}, {batch_y.dtype}")
-                
-                batch_x, batch_y = pad_batch(batch_x, batch_y, batch_size)
-                
-                token, outputs, iterations, all_neuron_states = jit(predict_batched)(weights, neuron_states, token, batch_x)
-                all_iterations.append(iterations)
+    all_iterations = []
+    
+    for i in range(total_batches):
+        neuron_states = empty_neuron_states
+        batched_predict = jax.vmap(
+                            predict,
+                            in_axes=(None, None, None, 0),  # Only batch over `batch_data`
+                            out_axes=(None, 0, 0, 0)        # Customize based on outputs
+                        )
+        if rank == 0:                     
+            batch_x, batch_y = next(batch_iterator)
+            batch_x = jnp.array(batch_x)
+            batch_y = jnp.array(batch_y, dtype=jnp.float32)
+            # print(f"Batch_x: {batch_x}, {batch_y.dtype}")
+            
+            batch_x, batch_y = pad_batch(batch_x, batch_y, batch_size)
+            
+            token, outputs, iterations, all_neuron_states = jit(predict)(weights, neuron_states, token, batch_x)
+            all_iterations.append(iterations)
 
-                token = send(batch_y, dest=size-1, tag=10,comm=comm, token=token)
-            else:
-                token, outputs, iterations, all_neuron_states = jit(predict_batched)(weights, neuron_states, token, jnp.zeros((batch_size, layer_sizes[0])))
-                # jax.debug.print("All neuron states shape: {}, values of first input residuals: {}", all_neuron_states.input_residuals.shape, all_neuron_states.input_residuals[0])
-
-                all_iterations.append(iterations)
-
-                if rank == size-1:
-
-                    y, token = recv(jnp.zeros((batch_size,)), source=0, tag=10, comm=comm, token=token)   
-                    
-                    valid_y, batch_correct = accuracy(i, outputs, y, iterations, True)                 
-                    
-                    epoch_correct += batch_correct
-                    epoch_total += valid_y.shape[0]
-            # break
-        all_iterations = jnp.array(all_iterations).flatten()
-        mean = jnp.mean(all_iterations)
-        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, all_iterations.shape[0])
-        
-        # Calculate epoch accuracy
-        if rank != size-1:
-            # jax.debug.print("rank {} send tag 20: i:{}", rank, i)                 
-            token = send(mean, dest=size-1, tag=20,comm=comm, token=token)
+            token = send(batch_y, dest=size-1, tag=10,comm=comm, token=token)
         else:
-            epoch_accuracy = epoch_correct / epoch_total
-            all_epoch_accuracies.append(epoch_accuracy)
-            correct_predictions += epoch_correct
-            total_samples += epoch_total
-            
-            jax.debug.print("Epoch {} Accuracy: {:.2f}%", epoch, epoch_accuracy * 100)
+            token, outputs, iterations, all_neuron_states = jit(predict)(weights, neuron_states, token, jnp.zeros((batch_size, layer_sizes[0])))
+            # jax.debug.print("All neuron states shape: {}, values of first input residuals: {}", all_neuron_states.input_residuals.shape, all_neuron_states.input_residuals[0])
+
+            all_iterations.append(iterations)
+
+            if rank == size-1:
+
+                y, token = recv(jnp.zeros((batch_size,)), source=0, tag=10, comm=comm, token=token)   
+                
+                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
+                
+                epoch_correct += batch_correct
+                epoch_total += valid_y.shape[0]
+        # break
+    all_iterations = jnp.array(all_iterations).flatten()
+    mean = jnp.mean(all_iterations)
+    if rank != 0 and debug:
+        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, all_iterations.shape[0])
+    
+    # Calculate epoch accuracy
+    if rank != size-1:
+        # jax.debug.print("rank {} send tag 20: i:{}", rank, i)                 
+        token = send(mean, dest=size-1, tag=20,comm=comm, token=token)
+        epoch_accuracy = 0.0
+    else:
+        epoch_accuracy = epoch_correct / epoch_total
+        all_epoch_accuracies.append(epoch_accuracy)
+        correct_predictions += epoch_correct
+        total_samples += epoch_total
+        
+        if debug:
+            jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
-            
-            all_iteration_mean = []
-            for i in range(size-1):
-                mean, token = recv(jnp.zeros(()), source=i, tag=20, comm=comm, token=token)   
-                             
-                all_iteration_mean.append(mean)
-            all_iteration_mean.append(jnp.mean(all_iterations))
+        
+        all_iteration_mean = []
+        for i in range(size-1):
+            mean_rcved, token = recv(jnp.zeros(()), source=i, tag=20, comm=comm, token=token)   
+                            
+            all_iteration_mean.append(mean_rcved)
+        all_iteration_mean.append(mean)
 
     jax.block_until_ready(token)
 
@@ -897,7 +932,7 @@ def batch_predict(token):
     token = mpi4jax.barrier(comm=comm, token=token)
     end_time = time.time()
 
-    if rank == size-1:            
+    if rank == size-1 and save:            
         # Final accuracy
         total_accuracy = all_epoch_accuracies[-1]
         jax.debug.print("Final Accuracy: {:.2f}%", total_accuracy * 100)
@@ -908,6 +943,7 @@ def batch_predict(token):
         
         # Set up file path
         filename = "_".join(map(str, layer_sizes)) + ".json"
+        filename = f"{random_seed}" + f"_batch{batch_size}_" + filename 
         if best:
             filename = "best_" + filename
         result_dir = os.path.join("network_results", "mnist")
@@ -929,6 +965,7 @@ def batch_predict(token):
             json.dump(result_data, f, indent=4)
 
         print(f"Results saved to {result_path}")
+    return epoch_accuracy, mean
     
 if __name__ == "__main__":
     random_seed = 42
@@ -941,7 +978,7 @@ if __name__ == "__main__":
     # layer_sizes = [4, 5, 3] 
     # load_file = False
     thresholds = [0, 0 ,0]  
-    num_epochs = 10
+    num_epochs = 2
     learning_rate = 0.01
     batch_size = 64
 
@@ -963,26 +1000,20 @@ if __name__ == "__main__":
     key, subkey = jax.random.split(key) 
     if rank != 0:
         weights, neuron_states = init_params(subkey, load_file=load_file, best=best)
-        total_batches = 0
+        total_train_batches,total_val_batches = 0, 0
         batch_iterator = None
     if rank == 0:
         # Preprocess the data 
-        training_generator, train_set, test_set, total_batches = torch_loader_manual(batch_size, shuffle=False)
+        (training_generator, total_train_batches), (validation_generator, total_val_batches), test_set = torch_loader_manual(batch_size, shuffle=False)
         # training_generator, train_set, test_set, total_batches = torch_loader(batch_size, shuffle=False)
 
         # TODO get max_nonzero from the training set 
-        batch_iterator = iter(training_generator)
-
-        weights = jnp.zeros(layer_sizes[0])
+        weights = jnp.zeros((layer_sizes[-1], layer_sizes[0]))
         
     # Broadcast total_batches to all other ranks
-    total_batches, token = bcast(total_batches, root=0, comm=comm)
-    print(f"number of batches: {total_batches}")
+    total_train_batches, token = bcast(total_train_batches, root=0 , comm=comm)
+    total_val_batches, token = bcast(total_val_batches, root=0 , comm=comm)
+    print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}")
 
-    # train(params, token, weights, batch_iterator)
-    # init_x = jnp.array(1.0)  # Initial value
-    # num_steps = 5  # Number of iterations
-    # final_x, results = jax.lax.scan(predict, init_x, xs=None, length=num_steps)
-    
-    # batch_predict(token)
+    # batch_predict(token, weights, "val", save=True, debug=True)
     train(token, params, weights)
