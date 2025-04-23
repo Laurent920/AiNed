@@ -467,7 +467,6 @@ def predict_bwd(batch_data, weights, empty_neuron_states, token):
     
     weight_res = all_neuron_states.weight_residuals
     weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(weight_res["activity"], weight_res["values"])
-
     
     # weight_res = weight_res["values"] # incorrect residual but faster for testing
     
@@ -587,6 +586,7 @@ def train(token, params: Params, weights):
         total_samples = 0 
         all_epoch_accuracies = []
         all_validation_accuracies = []
+        all_loss = []
         
     token = mpi4jax.barrier(comm=comm, token=token)
     start_time = time.time()
@@ -600,6 +600,7 @@ def train(token, params: Params, weights):
         if rank == size-1:
             epoch_correct = 0
             epoch_total = 0
+            epoch_loss = []
             
         all_iterations = []
         if rank == 0:
@@ -627,7 +628,8 @@ def train(token, params: Params, weights):
 
                     # (loss, token, iterations), gradients = jax.value_and_grad(loss_fn)(jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token, y_encoded)
                     (loss, outputs, iterations), gradients = jit(loss_fn)(jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token, y_encoded)
-
+                    epoch_loss.append(loss)
+                    
                     weight_grad = gradients[1]
                     
                     # Send gradient to previous layers                
@@ -663,13 +665,15 @@ def train(token, params: Params, weights):
             token = send(mean, dest=size-1, tag=20,comm=comm, token=token)
             token = send(weights, dest=size-1, tag=5,comm=comm, token=token)
         else:
+            mean_loss = jnp.mean(jnp.array(epoch_loss))
+            all_loss.append(mean_loss)
             epoch_accuracy = epoch_correct / epoch_total
             all_epoch_accuracies.append(epoch_accuracy)
             all_validation_accuracies.append(val_accuracy)
             correct_predictions += epoch_correct
             total_samples += epoch_total
             
-            jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, average val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, val_mean)
+            jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, mean_loss, val_mean)
             jax.debug.print("----------------------------\n")
             
             all_iteration_mean = []
@@ -719,6 +723,7 @@ def train(token, params: Params, weights):
             "layer_sizes": layer_sizes,
             "batch_size": batch_size,
             "thresholds": thresholds,
+            "loss": [float(loss) for loss in all_loss],
             "weights": weights_dict
         }
 
