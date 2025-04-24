@@ -716,6 +716,7 @@ def train(token, params: Params, weights):
         # Store the results
         result_data = {
             "time": float(execution_time),
+            "loadfile": load_file,
             "processes": size,
             "training accuracy": float(total_accuracy),
             "validation accuracy": float(all_validation_accuracies[-1]),
@@ -983,9 +984,9 @@ if __name__ == "__main__":
     # layer_sizes = [4, 5, 3] 
     # load_file = False
     thresholds = [0, 0 ,0]  
-    num_epochs = 2
+    num_epochs = 30
     learning_rate = 0.01
-    batch_size = 64
+    batch_size = 32
 
     params = Params(
         layer_sizes=layer_sizes, 

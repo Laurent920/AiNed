@@ -413,21 +413,49 @@ class MLP:
 
         # Flatten all parameters into a single list
         self.param = np.array([layer.param for layer in self.layers]).flatten()
+        self.last_acts = self.reset_activations()
 
 
     def forward(self, x):
         """
-        Computes the forward pass through the MLP.
+        Runs the network and stores intermediate activations.
 
-        Args:
-            x (Tensor): Input tensor.
-
-        Returns:
-            Tensor: The network's output.
+        Returns
+        -------
+        Tensor : output of the final layer
         """
-        for layer in self.layers:
+        # print(self.last_acts)
+        for i, layer in enumerate(self.layers):
+            # print(x.data.shape)
+            self.last_acts[i].append(x)  
             x = layer.forward(x)
         return x
+    
+    def batch_activation_count(self, threshold=0.0):
+        """
+        For the most-recent forward pass, return the total count of activated neurons for each layer.
+        The count is the total number of activations that exceed the threshold in each layer, over the entire dataset.
+        """
+        total_active_counts = []
+        # Iterate over each layer's activations
+        for act in self.last_acts:
+            # print(len(act), len(act[0].data), type(act[0].data))
+            
+            non_zeros = 0
+            for tensor in act:
+                arr = np.array(tensor.data)
+                non_zeros += np.count_nonzero(arr)
+            non_zeros /= len(act) * len(act[0].data)
+                
+            # Sum across all samples in the batch for the layer
+            total_active_counts.append(non_zeros)  # Total active neurons for the layer
+
+        return total_active_counts
+    
+    def reset_activations(self):
+        """Clear stored activations for a new epoch (or whenever)."""
+        self.last_acts = [[] for _ in self.layers]
+
 
     
 class SGDOptimizer:
@@ -584,7 +612,7 @@ def one_hot_encode(labels, num_classes=10):
     return [[1 if i == label else 0 for i in range(num_classes)] for label in labels]
     
 # Your code: implement the function
-def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num):
+def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num, act_threshold = 0.0):
     """
     Trains a neural network using the provided training and validation data loaders.
 
@@ -606,9 +634,16 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
     """
     validation_acc = []
     training_acc = []
+    epoch_act_means = []         # list of list: epoch‑>layer‑>mean‑frac‑active
+    epoch_act_totals  = []             # epochs × n_layers  – active counts
+    epoch_neuron_tot  = []  
+    
     for epoch in range(epoch_num):
         i = 0
+        network.reset_activations()
+
         for x, y in train_dataloader:
+            # print(f"x shape: {x.shape}")
             output = network.forward(Tensor(x))
 
             labels = Tensor(one_hot_encode(y, num_classes=10))
@@ -622,17 +657,27 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
             
             optimizer.step()
             optimizer.zero_grad()
+            
+        mean_activations = network.batch_activation_count(threshold=0.0)
         
         with no_grad():
-            train_accuracy, _, _ = validation_func(network, train_dataloader)
-            training_acc.append(train_accuracy)
+            train_acc, _, _ = validation_func(network, train_dataloader)
+            training_acc.append(train_acc)
             
-            val_accuracy, correct_num, total_num = validation_func(network, val_dataloader)
-            validation_acc.append(val_accuracy)
-            print(f"epoch {epoch} with training accuracy: {train_accuracy} and validation accuracy: {val_accuracy}")
+            val_acc, _, _ = validation_func(network, val_dataloader)
+            validation_acc.append(val_acc)
 
+            print(
+            f"epoch {epoch:02d} | "
+            f"train {train_acc:.4f} | val {val_acc:.4f} | "
+            f"active {mean_activations}"
+        )
 
-    return training_acc, validation_acc
+    return (
+        np.array(training_acc),
+        np.array(validation_acc),
+        np.array(epoch_act_means)
+    )
 
 class InfiniteDataLoader:
     def __init__(self, data_loader):
@@ -814,7 +859,28 @@ def torch_train(training_generator, train, test, params):
     print("Training set accuracy {}".format(train_acc))
     print("Test set accuracy {}".format(test_acc))
     
-    
+def average_active_inputs(train_dataloader):
+    """
+    Returns the mean number of non-zero features per sample across the
+    *entire* training set.
+
+    Assumes each batch_x is (batch, features, ...). For images, flatten first.
+    """
+    total_active_features = 0   # numerator
+    total_samples         = 0   # denominator
+
+    for batch_x, _ in train_dataloader:
+        # 👉 ensure 2‑D (batch , features) – flatten everything but batch axis
+        flat = batch_x.reshape(batch_x.shape[0], -1)
+
+        # non‑zero count per sample
+        active_per_sample = (flat != 0).sum(axis=1)      # shape (batch ,)
+
+        total_active_features += active_per_sample.sum() # scalar
+        total_samples         += flat.shape[0]
+
+    return total_active_features / total_samples
+
 if __name__ == "__main__":
     torch_load = False
     if torch_load:
@@ -840,6 +906,9 @@ if __name__ == "__main__":
 
         (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test) = torch_loader_manual(batch_size, shuffle=False)
 
+        avg_non_zero = average_active_inputs(train_dataloader)
+        print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
+
         # Define neural network
         layer_dims = (784, 128, 10)
         network = MLP(layer_dims)
@@ -853,8 +922,14 @@ if __name__ == "__main__":
         # Define loss function
         loss_func = SoftmaxCrossEntropy()
 
-        epoch_num = 20
-        train_accuracy_list, val_accuracy_list = train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num)
+        epoch_num = 35
+        start_time = time.time()
+        train_accuracy_list, val_accuracy_list, activations = train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num)
+        end_time = time.time()
+        
+        execution_time = end_time - start_time
+        print(f"Execution Time: {execution_time:.6f} seconds")
+        
         plt.figure(figsize=(8, 5))
         epochs = [i + 1 for i in range(epoch_num)]
 
