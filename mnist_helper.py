@@ -729,8 +729,17 @@ def torch_loader_manual(batch_size, shuffle=True):
 
     # Define training set dataloader object
     test_set_dataloader = DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
+    
+    max_nonzero = 0
+    for dataset in [train_dataloader, val_dataloader, test_set_dataloader]:
+        for x, _ in iter(dataset):
+            non_zeros = np.array([np.count_nonzero(row) for row in x])
+            n_nonzeros = max(non_zeros)
+            max_nonzero = max(n_nonzeros, max_nonzero)
 
-    return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test)
+    print(max_nonzero)
+
+    return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test), max_nonzero
 
 # region TORCH LOADER
 import os
