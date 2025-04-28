@@ -1,12 +1,12 @@
 {
-    "time": 24.603655099868774,
+    "time": 1.006460189819336,
     "loadfile": true,
-    "shuffle": true,
+    "shuffle": false,
     "processes": 3,
-    "training accuracy": 0.0983801782131195,
+    "training accuracy": 0.46875,
     "iterations mean": [
-        -1.0,
-        -1.0
+        159.25,
+        958.65625
     ],
     "layer_sizes": [
         784,

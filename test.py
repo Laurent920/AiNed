@@ -297,14 +297,14 @@ if __name__ == "__main__":
     x = x.at[rows, columns].set(values)
     
     max_nonzero = jnp.max(jnp.array([jnp.count_nonzero(row) for row in x]))
-    print(max_nonzero)
-    print(x)
+    # print(max_nonzero)
+    # print(x)
     p_data = jax.vmap(lambda x: preprocess_to_sparse_data_padded(x, max_nonzero))(x)
-    print((p_data))
+    # print((p_data))
     first_values = p_data[:, 0]
     a = first_values[:, 0]
     b = first_values[:, 1]
-    print(a, b)
+    # print(a, b)
     
     # ______________________________________________________________________________________________________________________________________    
     def clone_neuron_state(template: Neuron_states, batch_size: int) -> Neuron_states:
@@ -333,9 +333,15 @@ if __name__ == "__main__":
     # print(clone_neuron_state(empty_neuron_states, 2))
     
     # ______________________________________________________________________________________________________________________________________    
-    
     def layer_computation_batched(neuron_idx, layer_input, weights, neuron_states):    
-        activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
+        # activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
+        
+        activations = jax.lax.cond(neuron_idx==-1,
+                               lambda _: (neuron_states.values).astype(jnp.float32),
+                               lambda _: jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values,
+                               None
+                               )
+        
         new_input_residuals = neuron_states.input_residuals.at[neuron_idx].add(layer_input)
         
         def last_layer_case(_):
@@ -355,4 +361,25 @@ if __name__ == "__main__":
         
         return jax.lax.cond(rank == size-1, last_layer_case, hidden_layer_case, None)
     
+    rank = 1
+    empty_neuron_states = Neuron_states(values=jnp.full((layer_sizes[rank]), 0), 
+                                        threshold=thresholds[(rank-1)%len(thresholds)], 
+                                        input_residuals=jnp.zeros((layer_sizes[rank-1], 1)),
+                                        weight_residuals={"activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
+                                                          "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))})
+    batch_size = 10
+    neuron_idx = jnp.full((batch_size), 3, dtype=jnp.int32)
+    layer_input = jnp.ones((batch_size), dtype=jnp.float32)
+    w = jnp.full((784, 128), 5.2)
     
+    activated_output, new_neuron_states = jax.vmap(
+                    layer_computation_batched,
+                    in_axes=(0, 0, None, 0)  # neuron_idx[batch], layer_input[batch], weights[shared], neuron_states[batch]
+                    )(neuron_idx, layer_input, w, clone_neuron_state(empty_neuron_states, batch_size))
+    print(activated_output)
+    act_loop, new_neuron_loop = [], []
+    for i in range(batch_size):
+        a, nn = layer_computation_batched(neuron_idx[i], layer_input[i], w, empty_neuron_states)
+        act_loop.append(a)
+        new_neuron_loop.append(nn)
+    print(jnp.array(act_loop))
