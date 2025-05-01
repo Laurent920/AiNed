@@ -671,6 +671,7 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
             f"epoch {epoch:02d} | "
             f"train {train_acc:.4f} | val {val_acc:.4f} | "
             f"active {mean_activations}"
+            f"loss {loss.data}"
         )
 
     return (
@@ -913,13 +914,13 @@ if __name__ == "__main__":
     else:    
         batch_size = 64
 
-        (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (mnist_data_x_test, mnist_data_y_test) = torch_loader_manual(batch_size, shuffle=False)
+        (training_generator, total_train_batches), (validation_generator, total_val_batches), test_set, max_nonzero = torch_loader_manual(batch_size, shuffle=True)
 
-        avg_non_zero = average_active_inputs(train_dataloader)
+        avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
 
         # Define neural network
-        layer_dims = (784, 128, 10)
+        layer_dims = (784, 64, 10)
         network = MLP(layer_dims)
         
         filename = f"tensor_data_{'_'.join(map(str, layer_dims))}"
@@ -931,9 +932,9 @@ if __name__ == "__main__":
         # Define loss function
         loss_func = SoftmaxCrossEntropy()
 
-        epoch_num = 35
+        epoch_num = 40
         start_time = time.time()
-        train_accuracy_list, val_accuracy_list, activations = train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, epoch_num)
+        train_accuracy_list, val_accuracy_list, activations = train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
         end_time = time.time()
         
         execution_time = end_time - start_time
