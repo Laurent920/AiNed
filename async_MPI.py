@@ -1,4 +1,3 @@
-from socketserver import ThreadingMixIn
 from network_helper import one_hot_encode
 from mpi4py import MPI
 import jax
@@ -22,8 +21,8 @@ import tree_math
 import dataclasses
 from typing import Generic, Any, Union, TypeVar, Tuple
 
-from mnist_helper import torch_loader_manual
-from iris_species_helper import torch_loader
+from z_helpers.mnist_helper import torch_loader_manual
+from z_helpers.iris_species_helper import torch_loader
 
 # jax.config.update("jax_debug_nans", True)
 
@@ -70,7 +69,17 @@ def activation_func_jvp(primals, tangents, k=1.0):
     ans = activation_func(neuron_states, activations)
     ans_dot = jnp.where(activations > neuron_states.threshold, activations, 0.0)
     return ans, ans_dot
-    
+
+def keep_top_k(x, k):
+    # Get the top-k values and their indices
+    _, top_indices = jax.lax.top_k(x, k)
+
+    # Create a mask with 1s at top-k indices, 0 elsewhere
+    mask = jnp.zeros_like(x)
+    mask = mask.at[top_indices].set(1)
+
+    return x * mask
+
 @partial(jax.jit, static_argnames=['params'])
 def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, iteration=0):    
     # activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
@@ -101,10 +110,14 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
     def hidden_layer_case(_):
         fire = (iteration-neuron_states.last_sent_iteration) > params.firing_rate
         fire = jnp.logical_or(fire, neuron_idx < 0) # fire if firing rate reached or last input received
+        
+        top_activations = keep_top_k(activations, params.firing_nb) # Get the top k activations
+        # jax.debug.print("Rank {} activations: {}, top activations: {}", rank, activations, top_activations)
+
         activated_output = jax.lax.cond(fire, 
                                         lambda args: activation_func(args[0], args[1]), 
                                         lambda _: jnp.zeros(activations.shape),
-                                        (neuron_states, activations))
+                                        (neuron_states, top_activations))
         layer_activity = neuron_states.weight_residuals["layer activity"]
         
         non_activated_neurons = jnp.where(layer_activity, 0, 1) # Get the neurons of the layer that have not activated yet
@@ -722,6 +735,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         "loadfile": params.load_file,
         "shuffle": params.shuffle,
         "processes": size,
+        "firing number": params.firing_nb,
         "firing rate": params.firing_rate,
         "training accuracy": train_accuracy,
         "validation accuracy": val_accuracy,
@@ -990,13 +1004,12 @@ if __name__ == "__main__":
     batch_size = 32
     shuffle = False
     
-    print(f"Batch size {batch_size}")
     if len(layer_sizes) != size:
         print(f"Error: layer_sizes ({len(layer_sizes)}) must match number of MPI ranks ({size})")
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_r in [1, 2, 4, 8, 16, 32, 64, 128, 256, 784]:
+    for f_nb in [4, 8, 16, 32, 64, 128]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1013,7 +1026,6 @@ if __name__ == "__main__":
         
         # Broadcast total_batches to all other ranks
         (total_train_batches, total_val_batches, total_test_batches), token = bcast(jnp.array([total_train_batches, total_val_batches, total_test_batches]), root=0 , comm=comm)
-        print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
     
         params = Params(
             random_seed=random_seed,
@@ -1025,11 +1037,14 @@ if __name__ == "__main__":
             load_file=load_file,
             shuffle=shuffle,
             restrict=False,
-            firing_nb=784,
-            firing_rate=f_r,
+            firing_nb=f_nb,
+            firing_rate=1,
             max_nonzero=max_nonzero,
             shuffle_input=True
         )
+        if rank == 0:
+            print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
+            print(params)
         
         empty_neuron_states = Neuron_states(
                                 values=jnp.zeros((layer_sizes[rank])), 
