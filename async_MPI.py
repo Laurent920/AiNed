@@ -1,4 +1,4 @@
-from network_helper import one_hot_encode
+from z_helpers.network_helper import one_hot_encode
 from mpi4py import MPI
 import jax
 import jax.numpy as jnp
@@ -50,9 +50,9 @@ class Params:
     batch_size: int
     load_file: bool
     shuffle: bool           # Shuffle the dataset
-    restrict: int           # The amount of times a single neuron can fire accross all inputs
+    restrict: int           # The amount of times a single neuron can fire accross all inputs, if negative then no restriction
     firing_nb: int          # The maximum number of neurons that can fire for one input at each layer
-    firing_rate: int        # The number of inputs that needs to be accumulated before firing  
+    sync_rate: int        # The number of inputs that needs to be accumulated before firing  
     max_nonzero: int
     shuffle_input:bool      # Shuffle the data in each layer to simulate async individual neurons
 
@@ -108,47 +108,43 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                             )
     
     def hidden_layer_case(_):
-        fire = (iteration-neuron_states.last_sent_iteration) > params.firing_rate
-        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if firing rate reached or last input received
+        fire = (iteration-neuron_states.last_sent_iteration) > params.sync_rate
+        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if synchronization rate reached or last input received
         
-        top_activations = keep_top_k(activations, params.firing_nb) # Get the top k activations
-        # jax.debug.print("Rank {} activations: {}, top activations: {}", rank, activations, top_activations)
-
         activated_output = jax.lax.cond(fire, 
                                         lambda args: activation_func(args[0], args[1]), 
                                         lambda _: jnp.zeros(activations.shape),
-                                        (neuron_states, top_activations))
+                                        (neuron_states, activations))
+        
+        # activated_output = activation_func(neuron_states, activations)
+        
+        # jax.debug.print("Rank {} weight_residuals shape: {}, neuron_idx: {}, input: {}", rank, neuron_states.weight_residuals["values"].shape, neuron_idx, layer_input)
+        new_input_activities = neuron_states.weight_residuals["input activity"].at[neuron_idx].set(True)     
+        
         layer_activity = neuron_states.weight_residuals["layer activity"]
         
-        non_activated_neurons = jnp.where(layer_activity, 0, 1) # Get the neurons of the layer that have not activated yet
+        restrict_cond = jnp.logical_and(params.restrict > 0, layer_activity >= params.restrict) 
+        output_mask = jnp.where(restrict_cond, 0.0, 1.0) # Create a mask to skip the neurons of the layer that have activated above the restricted value
         
-        # Apply a mask to only allow each neuron to activate once
-        output_mask = jax.lax.cond(params.restrict, 
-                                   lambda args: jnp.logical_and(jnp.squeeze(args[1]), args[0]), 
-                                   lambda args, : jnp.full(args[0].shape, True),
-                                   (activated_output, non_activated_neurons))
+        active_output = activated_output * (output_mask) # Apply the mask to the activated output to get the actual activations
         
-                
-        new_layer_activities = jnp.logical_or(jnp.squeeze(layer_activity), activated_output).reshape(layer_activity.shape) # Update the layer activity with the new activated neurons
+        active_indexes = jnp.where(activated_output > 0, 1, 0)
         
-        # jax.debug.print("Rank {}, activations {}, non active neurons: {}, activated output: {}, weight_gradient shape: {}, new layer activities: {}", rank, activations.shape, non_activated_neurons.shape, activated_output.shape, active_gradient.shape, new_layer_activities.shape)
-        
-        active_output = jnp.where(output_mask > 0, 1, 0) # Cumulating the derivatives of the ReLu
-        new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_output)
-        
-        
-        new_input_activities = neuron_states.weight_residuals["input activity"].at[neuron_idx].set(True)            
+        new_layer_activities = layer_activity + active_indexes # Update the layer activity by adding the active neurons
+
+        new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_indexes)
         new_weight_residuals = {"input activity": new_input_activities, 
                                 "layer activity": new_layer_activities,
                                 "values": new_values}
-        
+
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
-        new_neuron_states = Neuron_states(values=activations - activated_output, 
+
+        new_neuron_states = Neuron_states(values=activations - active_output, 
                                           threshold=neuron_states.threshold, 
                                           input_residuals=new_input_residuals, 
                                           weight_residuals=new_weight_residuals,
                                           last_sent_iteration=new_last_sent_iteration)
-        return activated_output*output_mask, new_neuron_states
+        return active_output, new_neuron_states
     
     return jax.lax.cond(rank == size-1, last_layer_case, hidden_layer_case, None)
 
@@ -736,7 +732,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         "shuffle": params.shuffle,
         "processes": size,
         "firing number": params.firing_nb,
-        "firing rate": params.firing_rate,
+        "synchronization rate": params.sync_rate,
         "training accuracy": train_accuracy,
         "validation accuracy": val_accuracy,
         "test accuracy": test_accuracy,
@@ -824,7 +820,7 @@ def init_params(key, load_file=False, best=False):
                                       threshold=thresholds[rank-1], 
                                       input_residuals=np.zeros((layer_sizes[rank-1], 1)),
                                       weight_residuals={"input activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
-                                                        "layer activity": jnp.zeros((layer_sizes[rank], 1), dtype=bool), 
+                                                        "layer activity": jnp.zeros((layer_sizes[rank], ), dtype=int), 
                                                         "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))},
                                       last_sent_iteration=0
                                       )
@@ -1009,7 +1005,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_nb in [4, 8, 16, 32, 64, 128]:
+    for f_nb in [128]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1032,15 +1028,15 @@ if __name__ == "__main__":
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
             num_epochs=8, 
-            learning_rate=0.001, 
+            learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
-            restrict=False,
-            firing_nb=f_nb,
-            firing_rate=1,
+            restrict=-1,
+            firing_nb=128,
+            sync_rate=1,
             max_nonzero=max_nonzero,
-            shuffle_input=True
+            shuffle_input=False
         )
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
@@ -1051,7 +1047,7 @@ if __name__ == "__main__":
                                 threshold=thresholds[(rank-1)%len(thresholds)], 
                                 input_residuals=np.zeros((layer_sizes[rank-1], 1)),
                                 weight_residuals={"input activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
-                                                    "layer activity": jnp.zeros((layer_sizes[rank], 1), dtype=bool), 
+                                                    "layer activity": jnp.zeros((layer_sizes[rank], ), dtype=int), 
                                                     "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))},
                                 last_sent_iteration=0
                                 )

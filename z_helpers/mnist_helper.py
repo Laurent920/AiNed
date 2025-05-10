@@ -6,7 +6,7 @@ import random
 from PIL import Image
 import math
 from abc import ABC, abstractmethod
-import network_helper
+import z_helpers.network_helper as network_helper
 
 # region TORCH LOADER
 import os
