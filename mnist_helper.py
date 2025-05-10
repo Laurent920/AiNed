@@ -697,7 +697,8 @@ class InfiniteDataLoader:
 
 
 def torch_loader_manual(batch_size, shuffle=True):
-    mnist_data = pd.read_csv('train.csv')
+    folder = "datasets/mnist/"
+    mnist_data = pd.read_csv(folder+'mnist_train.csv')
     # Extract the image data from the data
     mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
     # Extract the labels from the data
@@ -720,7 +721,7 @@ def torch_loader_manual(batch_size, shuffle=True):
     # val_dataloader = InfiniteDataLoader(val_dataloader)
     
     # Read all MNIST training data from the file
-    mnist_data = pd.read_csv('test.csv')
+    mnist_data = pd.read_csv(folder+'mnist_test.csv')
     # Extract the image data from the data
     mnist_data_x_test = mnist_data.iloc[:, 0:].values.astype('float')
     # Extract the labels from the data
