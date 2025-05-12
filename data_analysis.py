@@ -3,7 +3,20 @@ import json
 import matplotlib.pyplot as plt
 
 # Define your folder path
-folder_path = "network_results/training/firing_nb_loadfileF_1_2_4_8_16_32_64_128/"
+parameter_values = "1_2_4_8_16_32_64_128"
+folder_path = "network_results/training/firing_nb_" + parameter_values + "/"
+data_field = "firing number"
+data_field_label = "Firing number"
+
+# parameter_values = "None_1_2_4_8_16_32_64_128_256_512"
+# folder_path = "network_results/training/restrict_" + parameter_values + "/"
+# data_field = "restrict"
+# data_field_label = "Number of times a neuron can fire in total"
+
+# parameter_values = "1_2_4_8_16_32_64_128_256_784"
+# folder_path = "network_results/training/sync_rate_" + parameter_values + "/"
+# data_field = "synchronization rate"
+# data_field_label = "Synchronization rate"
 
 # Lists to hold the extracted values
 firing_rates = []
@@ -20,7 +33,7 @@ for filename in os.listdir(folder_path):
         with open(file_path, 'r') as f:
             data = json.load(f)
             try:
-                firing_rates.append(data['firing number'])
+                firing_rates.append(data[data_field])
                 train_accs.append(data['training accuracy'])
                 val_accs.append(data['validation accuracy'])
                 test_accs.append(data['test accuracy'])
@@ -45,34 +58,39 @@ os.makedirs(plot_folder, exist_ok=True)
 # Create a single figure with subplots
 fig, axs = plt.subplots(3, 1, figsize=(10, 12))
 
+plt.suptitle("Results for parameters with values: " + parameter_values, fontsize=16)
+
+# Adjust layout to accommodate the global title
+plt.tight_layout(rect=[0, 0, 1, 0.96])
+
 # Plot Accuracy
 axs[0].plot(firing_rates, train_accs, marker='o', label="Train Accuracy")
 axs[0].plot(firing_rates, val_accs, marker='o', label="Validation Accuracy")
 axs[0].plot(firing_rates, test_accs, marker='o', label="Test Accuracy")
-axs[0].set_xlabel("Firing Rate")
+axs[0].set_xlabel(data_field_label)
 axs[0].set_ylabel("Accuracy")
-axs[0].set_title("Accuracy vs Firing Number")
+axs[0].set_title("Accuracy vs "+data_field_label)
 axs[0].legend()
 axs[0].grid(True)
 
 # Plot Time
 axs[1].plot(firing_rates, times, marker='o', color='purple', label="Time (min)")
-axs[1].set_xlabel("Firing Rate")
+axs[1].set_xlabel(data_field_label)
 axs[1].set_ylabel("Time per epoch(min)")
-axs[1].set_title("Time vs Firing Number")
+axs[1].set_title("Time vs "+data_field_label)
 axs[1].legend()
 axs[1].grid(True)
 
 # Plot Iterations Mean
 axs[2].plot(firing_rates, iterations_means, marker='o', label="Iterations Mean[1]")
-axs[2].set_xlabel("Firing Rate")
+axs[2].set_xlabel(data_field_label)
 axs[2].set_ylabel("Iterations Mean")
-axs[2].set_title("Iterations Mean vs Firing Number")
-# axs[2].set_yscale("log")
+axs[2].set_title("Iterations Mean vs "+data_field_label)
+# axs[2].set_xscale("log")
 axs[2].legend()
 axs[2].grid(True)
 
 # Adjust layout and save the figure
 plt.tight_layout()
-plt.savefig(plot_folder + "combined_plots.png")
+plt.savefig(plot_folder + data_field+".png")
 plt.close()
