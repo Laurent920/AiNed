@@ -1,4 +1,5 @@
 from z_helpers.network_helper import one_hot_encode
+from z_helpers.network_helper import one_hot_encode
 from mpi4py import MPI
 import jax
 import jax.numpy as jnp
@@ -72,7 +73,13 @@ def activation_func_jvp(primals, tangents, k=1.0):
 
 def keep_top_k(x, k):
     # Get the top-k values and their indices
-    _, top_indices = jax.lax.top_k(x, k)
+
+    k_safe = min(k, x.shape[-1])
+    # jax.debug.print("{}", x.shape[-1])
+    if k_safe != k:
+        jax.debug.print("Rank {} activations: {}, top activations: {}, {}", rank, x.shape, k, k_safe)
+    
+    _, top_indices = jax.lax.top_k(x, k_safe)
 
     # Create a mask with 1s at top-k indices, 0 elsewhere
     mask = jnp.zeros_like(x)
@@ -108,8 +115,11 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                             )
     
     def hidden_layer_case(_):
-        fire = (iteration-neuron_states.last_sent_iteration) > params.sync_rate
-        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if synchronization rate reached or last input received
+        fire = (iteration-neuron_states.last_sent_iteration) > params.firing_rate
+        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if firing rate reached or last input received
+        
+        # jax.debug.print("Rank {} activations: {}, top activations: {}", rank, activations.shape, params.firing_nb)
+        top_activations = keep_top_k(activations, params.firing_nb) # Get the top k activations
         
         activated_output = jax.lax.cond(fire, 
                                         lambda args: activation_func(args[0], args[1]), 
@@ -1005,7 +1015,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_nb in [128]:
+    for f_nb in [16, 32, 64, 128]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:

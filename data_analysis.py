@@ -3,7 +3,7 @@ import json
 import matplotlib.pyplot as plt
 
 # Define your folder path
-folder_path = "network_results/training/firing_rate_loadfileT_8_16_32_64_128_256_784/"
+folder_path = "network_results/training/firing_nb_loadfileF_1_2_4_8_16_32_64_128/"
 
 # Lists to hold the extracted values
 firing_rates = []
@@ -20,7 +20,7 @@ for filename in os.listdir(folder_path):
         with open(file_path, 'r') as f:
             data = json.load(f)
             try:
-                firing_rates.append(data['firing rate'])
+                firing_rates.append(data['firing number'])
                 train_accs.append(data['training accuracy'])
                 val_accs.append(data['validation accuracy'])
                 test_accs.append(data['test accuracy'])
@@ -51,7 +51,7 @@ axs[0].plot(firing_rates, val_accs, marker='o', label="Validation Accuracy")
 axs[0].plot(firing_rates, test_accs, marker='o', label="Test Accuracy")
 axs[0].set_xlabel("Firing Rate")
 axs[0].set_ylabel("Accuracy")
-axs[0].set_title("Accuracy vs Firing Rate")
+axs[0].set_title("Accuracy vs Firing Number")
 axs[0].legend()
 axs[0].grid(True)
 
@@ -59,7 +59,7 @@ axs[0].grid(True)
 axs[1].plot(firing_rates, times, marker='o', color='purple', label="Time (min)")
 axs[1].set_xlabel("Firing Rate")
 axs[1].set_ylabel("Time per epoch(min)")
-axs[1].set_title("Time vs Firing Rate")
+axs[1].set_title("Time vs Firing Number")
 axs[1].legend()
 axs[1].grid(True)
 
@@ -67,7 +67,8 @@ axs[1].grid(True)
 axs[2].plot(firing_rates, iterations_means, marker='o', label="Iterations Mean[1]")
 axs[2].set_xlabel("Firing Rate")
 axs[2].set_ylabel("Iterations Mean")
-axs[2].set_title("Iterations Mean vs Firing Rate")
+axs[2].set_title("Iterations Mean vs Firing Number")
+# axs[2].set_yscale("log")
 axs[2].legend()
 axs[2].grid(True)
 
