@@ -1,6 +1,11 @@
 from z_helpers.network_helper import one_hot_encode
 from z_helpers.network_helper import one_hot_encode
+import os
+
 from mpi4py import MPI
+# os.environ["JAX_TRACEBACK_FILTERING"] = "on"
+os.environ.pop("JAX_TRACEBACK_FILTERING", None)
+
 import jax
 import jax.numpy as jnp
 from jax import custom_jvp, jit
@@ -12,7 +17,6 @@ import matplotlib.pyplot as plt
 import time
 
 import json
-import os
 import sys
 import numpy as np
 import mpi4jax
@@ -53,7 +57,7 @@ class Params:
     shuffle: bool           # Shuffle the dataset
     restrict: int           # The amount of times a single neuron can fire accross all inputs, if negative then no restriction
     firing_nb: int          # The maximum number of neurons that can fire for one input at each layer
-    sync_rate: int        # The number of inputs that needs to be accumulated before firing  
+    sync_rate: int          # The number of inputs that needs to be accumulated before firing  
     max_nonzero: int
     shuffle_input:bool      # Shuffle the data in each layer to simulate async individual neurons
 
@@ -74,18 +78,28 @@ def activation_func_jvp(primals, tangents, k=1.0):
 def keep_top_k(x, k):
     # Get the top-k values and their indices
 
-    k_safe = min(k, x.shape[-1])
-    # jax.debug.print("{}", x.shape[-1])
-    if k_safe != k:
-        jax.debug.print("Rank {} activations: {}, top activations: {}, {}", rank, x.shape, k, k_safe)
-    
-    _, top_indices = jax.lax.top_k(x, k_safe)
+    k_safe = min(k, x.shape[0])
+    jax.lax.cond(k_safe != k,
+                 lambda _: jax.debug.print("Rank {} k safe: {}, k: {}", rank, k_safe, k),
+                 lambda _: None,
+                 None)
+    k = k_safe
+
+    _, top_indices = jax.lax.top_k(x, k)
 
     # Create a mask with 1s at top-k indices, 0 elsewhere
-    mask = jnp.zeros_like(x)
+    mask = jnp.zeros(x.shape)
     mask = mask.at[top_indices].set(1)
 
-    return x * mask
+    out = x * mask
+    # jax.debug.print("Rank {} activations : {}, shape: {}, out: {}, shape: {}, k: {}", rank, x, x.shape, out, out.shape, k)
+    return out
+
+    # jax.debug.print("{}, k: {}", x.shape, (k))
+    # jax.debug.print("{}", x.shape[-1])
+    # if k != k_safe:
+        # jax.debug.print("Rank {} activations size: {}, top activations nb: {}", rank, x.shape, k)
+    # jax.debug.print("Rank {} activations : {}, shape: {}, type: {}, k: {}", rank, x, x.shape, type(x), k)
 
 @partial(jax.jit, static_argnames=['params'])
 def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, iteration=0):    
@@ -102,7 +116,11 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
     # jax.debug.print("Rank {}: Activation values: {}", rank, activations)
     
     # jax.debug.print("Rank {} input_residuals shape: {}, neuron_idx: {}, input: {}", rank, neuron_states.input_residuals.shape, neuron_idx, layer_input)
-    new_input_residuals = neuron_states.input_residuals.at[neuron_idx].add(layer_input)
+    new_input_residuals = jax.lax.cond(neuron_idx < 0,
+                            lambda _: neuron_states.input_residuals,
+                            lambda _: neuron_states.input_residuals.at[neuron_idx].add(layer_input),
+                            None
+                            )
     # jax.debug.print("Rank {} new input_residuals: {}, neuron_idx: {}, input: {}", rank, new_input_residuals, neuron_idx, layer_input)
 
     def last_layer_case(_):
@@ -115,24 +133,25 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                             )
     
     def hidden_layer_case(_):
-        fire = (iteration-neuron_states.last_sent_iteration) > params.firing_rate
-        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if firing rate reached or last input received
-        
-        # jax.debug.print("Rank {} activations: {}, top activations: {}", rank, activations.shape, params.firing_nb)
-        top_activations = keep_top_k(activations, params.firing_nb) # Get the top k activations
-        
+        fire = (iteration-neuron_states.last_sent_iteration) >= params.sync_rate 
+        fire = jnp.logical_or(fire, neuron_idx < 0) # fire if sync rate reached or last input received
+
+        # APPLY THE SYNC RATE  
         activated_output = jax.lax.cond(fire, 
                                         lambda args: activation_func(args[0], args[1]), 
                                         lambda _: jnp.zeros(activations.shape),
                                         (neuron_states, activations))
         
-        # activated_output = activation_func(neuron_states, activations)
-        
-        # jax.debug.print("Rank {} weight_residuals shape: {}, neuron_idx: {}, input: {}", rank, neuron_states.weight_residuals["values"].shape, neuron_idx, layer_input)
-        new_input_activities = neuron_states.weight_residuals["input activity"].at[neuron_idx].set(True)     
-        
+        # APPLY THE FIRING NUMBER        
+        # jax.debug.print("Rank {} before top k: {}, fire: {}", rank, activated_output, fire)
+        activated_output = keep_top_k(activated_output, params.firing_nb) # Get the top k activations
+        # jax.debug.print("{}, iteration: {}, neuron idx: {}", activated_output, iteration, neuron_idx)
+        # jax.debug.print("Rank {} after  top k: {}", rank, activated_output)
+
+        # jax.debug.print("Rank {} weight_residuals shape: {}, neuron_idx: {}, input: {}", rank, neuron_states.weight_residuals["values"].shape, neuron_idx, layer_input)        
         layer_activity = neuron_states.weight_residuals["layer activity"]
         
+        # APPLY THE RESTRICTION
         restrict_cond = jnp.logical_and(params.restrict > 0, layer_activity >= params.restrict) 
         output_mask = jnp.where(restrict_cond, 0.0, 1.0) # Create a mask to skip the neurons of the layer that have activated above the restricted value
         
@@ -141,8 +160,15 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
         active_indexes = jnp.where(activated_output > 0, 1, 0)
         
         new_layer_activities = layer_activity + active_indexes # Update the layer activity by adding the active neurons
-
         new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_indexes)
+
+        new_input_activities = neuron_states.weight_residuals["input activity"].at[neuron_idx].set(True) # Update the input activity by setting the input neuron to True        
+        
+        jax.lax.cond(neuron_idx == -2,
+                     lambda _: jax.debug.print("{}, iteration: {}, neuron idx: {}", layer_input, iteration, neuron_idx),
+                     lambda _: None,
+                     None)
+
         new_weight_residuals = {"input activity": new_input_activities, 
                                 "layer activity": new_layer_activities,
                                 "values": new_values}
@@ -156,7 +182,8 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                           last_sent_iteration=new_last_sent_iteration)
         return active_output, new_neuron_states
     
-    return jax.lax.cond(rank == size-1, last_layer_case, hidden_layer_case, None)
+    cond = jnp.logical_or(rank == size-1, neuron_idx < 0)
+    return jax.lax.cond(cond, last_layer_case, hidden_layer_case, None)
 
 @partial(jax.jit, static_argnames=['params'])
 def predict(params, key, weights, empty_neuron_states, token, batch_data: jnp.ndarray):
@@ -1005,7 +1032,7 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = False
+    load_file = True
     thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
@@ -1015,7 +1042,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_nb in [16, 32, 64, 128]:
+    for f_nb in [1, 2, 4, 8, 16, 32, 64, 128]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1043,7 +1070,7 @@ if __name__ == "__main__":
             load_file=load_file,
             shuffle=shuffle,
             restrict=-1,
-            firing_nb=128,
+            firing_nb=f_nb,
             sync_rate=1,
             max_nonzero=max_nonzero,
             shuffle_input=False
@@ -1068,5 +1095,5 @@ if __name__ == "__main__":
         #     all_time += ex_time
         # print("average execution time : {}", all_time/t)
         
-        # batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
+        # batch_predict(params, key, token, weights, empty_neuron_states, "val", save=True, debug=True)
         train(token, params, key, weights, empty_neuron_states)
