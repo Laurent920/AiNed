@@ -58,7 +58,7 @@ os.makedirs(plot_folder, exist_ok=True)
 # Create a single figure with subplots
 fig, axs = plt.subplots(3, 1, figsize=(10, 12))
 
-plt.suptitle("Results for parameters with values: " + parameter_values, fontsize=16)
+plt.suptitle("Results for 8 epochs with parameters values: " + parameter_values, fontsize=16)
 
 # Adjust layout to accommodate the global title
 plt.tight_layout(rect=[0, 0, 1, 0.96])
@@ -70,6 +70,7 @@ axs[0].plot(firing_rates, test_accs, marker='o', label="Test Accuracy")
 axs[0].set_xlabel(data_field_label)
 axs[0].set_ylabel("Accuracy")
 axs[0].set_title("Accuracy vs "+data_field_label)
+# axs[0].set_xscale("log")
 axs[0].legend()
 axs[0].grid(True)
 

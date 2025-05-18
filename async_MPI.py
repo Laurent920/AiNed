@@ -1032,7 +1032,7 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = True
+    load_file = False
     thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
@@ -1042,7 +1042,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_nb in [1, 2, 4, 8, 16, 32, 64, 128]:
+    for _sync in [2, 4, 8, 16]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1064,14 +1064,14 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=8, 
+            num_epochs=15, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
             restrict=-1,
-            firing_nb=f_nb,
-            sync_rate=1,
+            firing_nb=1,
+            sync_rate=4,
             max_nonzero=max_nonzero,
             shuffle_input=False
         )
