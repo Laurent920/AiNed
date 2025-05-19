@@ -8,15 +8,20 @@ folder_path = "network_results/training/firing_nb_" + parameter_values + "/"
 data_field = "firing number"
 data_field_label = "Firing number"
 
-# parameter_values = "None_1_2_4_8_16_32_64_128_256_512"
-# folder_path = "network_results/training/restrict_" + parameter_values + "/"
-# data_field = "restrict"
-# data_field_label = "Number of times a neuron can fire in total"
+parameter_values = "1_2_4_8_16" #"None_1_2_4_8_16_32_64_128_256_512"
+folder_path = "network_results/training/restrict_fixed_" + parameter_values + "/"
+data_field = "restrict"
+data_field_label = "Number of times a neuron can fire in total"
 
-# parameter_values = "1_2_4_8_16_32_64_128_256_784"
-# folder_path = "network_results/training/sync_rate_" + parameter_values + "/"
+parameter_values = "1_2_4_8_16_32_64_128_256_784"
+folder_path = "network_results/training/sync_rate_" + parameter_values + "/"
+data_field = "synchronization rate"
+data_field_label = "Synchronization rate"
+
+# parameter_values = "2_4_8" #"1_2_4_8_16_32_64_128_256_784"
+# folder_path = "network_results/training/firing_nb_2_sync_rate_" + parameter_values + "/"
 # data_field = "synchronization rate"
-# data_field_label = "Synchronization rate"
+# data_field_label = "Synchronization rate with firing nb 2"
 
 # Lists to hold the extracted values
 firing_rates = []
@@ -70,7 +75,6 @@ axs[0].plot(firing_rates, test_accs, marker='o', label="Test Accuracy")
 axs[0].set_xlabel(data_field_label)
 axs[0].set_ylabel("Accuracy")
 axs[0].set_title("Accuracy vs "+data_field_label)
-# axs[0].set_xscale("log")
 axs[0].legend()
 axs[0].grid(True)
 
