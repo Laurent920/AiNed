@@ -62,6 +62,7 @@ class Params:
     shuffle_input:bool      # Shuffle the data in each layer to simulate async individual neurons
     threshold_lr: float
     threshold_impact: float
+    history_size: int
 
 # region INFERENCE
 @custom_jvp # If threshold == 0 then this behaves as a ReLu activation function 
@@ -103,6 +104,21 @@ def keep_top_k(x, k):
         # jax.debug.print("Rank {} activations size: {}, top activations nb: {}", rank, x.shape, k)
     # jax.debug.print("Rank {} activations : {}, shape: {}, type: {}, k: {}", rank, x, x.shape, type(x), k)
 
+def update_history(weight_residuals, new_value):
+    history = weight_residuals["values_history"]
+    index = weight_residuals["history_index"]
+
+    # Replace value at current index
+    history = history.at[index].set(new_value)
+
+    # Increment index and wrap around
+    new_index = (index + 1) % history.shape[0]
+
+    updated = weight_residuals.copy()
+    updated["values_history"] = history
+    updated["history_index"] = new_index
+    return updated
+
 @partial(jax.jit, static_argnames=['params'])
 def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, iteration=0):    
     # activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
@@ -126,11 +142,18 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
     # jax.debug.print("Rank {} new input_residuals: {}, neuron_idx: {}, input: {}", rank, new_input_residuals, neuron_idx, layer_input)
 
     def last_layer_case(_):
+        # jax.lax.cond(rank==size-1,
+        #              lambda _: jax.debug.print("rank {}, index {}, Updating with activations: {}", rank, neuron_idx, activations),
+        #              lambda _: None,
+        #              None)
+        # jax.debug.print("rank {}, Updating with values shape: {}", rank, activations.shape)
+        new_weight_residuals = update_history(neuron_states.weight_residuals, activations)
+
         return jnp.zeros_like(activations), Neuron_states(
                                             values=activations, 
                                             threshold=neuron_states.threshold, 
                                             input_residuals=new_input_residuals, 
-                                            weight_residuals=neuron_states.weight_residuals,
+                                            weight_residuals=new_weight_residuals,
                                             last_sent_iteration=neuron_states.last_sent_iteration
                                             )
     
@@ -143,7 +166,6 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                         lambda args: activation_func(args[0], args[1]), 
                                         lambda _: jnp.zeros(activations.shape),
                                         (neuron_states, activations))
-        
         # APPLY THE FIRING NUMBER        
         # jax.debug.print("Rank {} before top k: {}, fire: {}", rank, activated_output, fire)
         activated_output = keep_top_k(activated_output, params.firing_nb) # Get the top k activations
@@ -173,7 +195,12 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
 
         new_weight_residuals = {"input activity": new_input_activities, 
                                 "layer activity": new_layer_activities,
-                                "values": new_values}
+                                "values": new_values,
+                                "values_history": neuron_states.weight_residuals["values_history"],
+                                "history_index": neuron_states.weight_residuals["history_index"]}
+        
+        # new_activations = activations - active_output
+        # weight_residuals = update_history(new_weight_residuals, new_value)
 
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
 
@@ -563,6 +590,18 @@ def output_weight_grad(loss_grad, all_residuals):
 
     return weight_grad
 
+
+def get_ordered_history(weight_residuals):
+    history = weight_residuals["values_history"]     # shape: (B, T, 10)
+    index = weight_residuals["history_index"]        # shape: (B,)
+
+    def reorder_single(h, idx):
+        return jnp.roll(h, shift=-idx, axis=0)
+
+    # Vectorize across batch
+    return jax.vmap(reorder_single)(history, index)
+
+
 @partial(jax.jit, static_argnames=['params'])
 def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target):
     token, all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, token, batch_data)
@@ -576,8 +615,8 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
 
     thr_impact = params.threshold_impact
     threshold = all_neuron_states.threshold[0]
-    threshold_loss = thr_impact * (jnp.mean(jnp.sum(all_residuals, axis=1), axis=0) + (1/threshold)) # average over the batches for the sum of activations outputed from the last hidden layer
-    threshold_grad = -thr_impact / (threshold ** 2)
+    threshold_loss = thr_impact * (jnp.mean(jnp.sum(all_residuals, axis=1), axis=0)) #+ (1/threshold)) # average over the batches for the sum of activations outputed from the last hidden layer
+    threshold_grad = -thr_impact #/ (threshold ** 2)
     # jax.debug.print("threshold loss shape: {} {}", threshold_loss, threshold_grad)
     
     # jax.debug.print("regularized average iterations: {},  {}/{}", reg_avg_iterations, jnp.mean(iterations), jnp.max(iterations))
@@ -593,7 +632,13 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     # jax.debug.print("all residuals {}, {}", all_residuals.shape, all_residuals.dtype)
     # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad.shape)
 
-    return (loss, all_outputs, iterations), (out_grad, mean_weight_grad, threshold_grad)
+    # Ensure values_history is a JAX array with shape [T, num_classes]
+    values_history = get_ordered_history(all_neuron_states.weight_residuals)
+
+    # One-hot target → scalar class index
+    target_label = jnp.argmax(target, axis=-1)
+    
+    return (loss, all_outputs, iterations, (jnp.array(values_history), target_label)), (out_grad, mean_weight_grad, threshold_grad)
 
 # region TRAINING
 def train(token, params: Params, key, weights, empty_neuron_states):     
@@ -608,6 +653,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
         all_epoch_accuracies = []
         all_validation_accuracies = []
         all_loss = []
+        all_history = []
     all_mean_iterations = []
         
     token = mpi4jax.barrier(comm=comm, token=token)
@@ -644,9 +690,10 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=layer_sizes[-1]))
                     # print("encoded y: ", y, y_encoded.shape, y_encoded)              
 
-                    (loss, outputs, iterations), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token, y_encoded)
+                    (loss, outputs, iterations, history), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token, y_encoded)
                     epoch_loss.append(loss)
-                    
+                    all_history.append(history)
+
                     weight_grad = gradients[1]
                     threshold_grad = gradients[2]
                     
@@ -676,7 +723,8 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             # if rank == size-1:
             #     jax.debug.print("Threshold grad {}, new threshold {}", threshold_grad, (empty_neuron_states.threshold))
             epoch_iterations.append(iterations)
-            # break
+            # if i > 2:
+            #     break
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
@@ -725,10 +773,11 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                             all_iteration_mean,
                             weights_dict,
                             all_loss, 
-                            threshold)
+                            threshold,
+                            all_history)
         
 # region SAVE DATA
-def store_training_data(params, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, threshold):    
+def store_training_data(params, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, threshold, all_history):    
     # Choose the saving folder
     if mode == "train":
         result_dir = os.path.join("network_results", "training")
@@ -773,8 +822,11 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
                 index+=1
             else:
                 result_path = new_result_path
-                break                
-
+                break        
+                    
+    # Output history analysis
+    store_history(all_history, result_path)
+    
     # Store the results
     threshold =  np.array(threshold).tolist()
     result_data = {
@@ -784,8 +836,8 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         "processes": size,
         "firing number": params.firing_nb,
         "synchronization rate": params.sync_rate,
-        "training accuracy": train_accuracy,
-        "validation accuracy": val_accuracy,
+        "training accuracy": np.array(all_epoch_accuracies).tolist(),
+        "validation accuracy": np.array(all_validation_accuracies).tolist(),
         "test accuracy": test_accuracy,
         "layer_sizes": params.layer_sizes,
         "batch_size": params.batch_size,
@@ -842,7 +894,81 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         plt.tight_layout()
         plt.savefig(result_path + "_activations.png") 
         plt.close()
+
+def store_history(all_history, result_path):
+    def process_history(values_history, target_labels):
+        def get_all_max(single_values_history, targets):
+            return jax.vmap(lambda v, t: jnp.argmax(v) == t, in_axes=(0, None))(single_values_history, targets)
+        
+        def get_target_rank(single_values_history, targets):
+            def single_history(history, single_target):
+                return jnp.sum(history > history[single_target]) + 1
+            return jax.vmap(single_history, in_axes=(0, None))(single_values_history, targets)
+        
+        # Get the output prediction of all stored steps
+        out_history = jax.vmap(get_all_max)(values_history, target_labels)
+        
+        # Get the rank of the position corresponding to the target value
+        correct_target_ranks = jax.vmap(get_target_rank)(values_history, target_labels)
+        return out_history, correct_target_ranks
     
+    out_history, correct_target_ranks = [], []
+    for values_history, target_labels in all_history:
+        out_hist, correct_target = process_history(values_history, target_labels)
+        out_history.append(out_hist)
+        correct_target_ranks.append(correct_target)
+    print("History shapes:", jnp.stack(out_history).shape,  jnp.stack(correct_target_ranks).shape)
+    
+    def flatten_history(history, batch_number=total_train_batches):
+        T, B, H = history.shape
+        
+        assert T % batch_number == 0, f"T={T} must be divisible by batch_number={batch_number}"
+        N = T // batch_number
+        
+        # Reshape from (T, B, H) to (N, batch_number, B, H)
+        history = history.reshape(N, batch_number, B, H)
+        
+        # Merge batch_number and batch axes → (N, batch_number * B, H)
+        return history.reshape(N, batch_number * B, H)
+    out_history_list = flatten_history(jnp.stack(out_history))  # shape (epoch * num_batches, batch_size, 100) -> (epoch, num_batches*batch_size, 100)
+    correct_target_list = flatten_history(jnp.stack(correct_target_ranks))
+    print(f"Flattened shape: {out_history_list.shape}, {correct_target_list.shape}")
+    
+    # Create side-by-side subplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns
+
+    H = out_history_list.shape[-1]
+    assert H == params.history_size, f"History param must match the values got {params.history_size} and {H}"
+
+    # PLot the average of history and rank 
+    for epoch in range(out_history_list.shape[0]):
+        out_history_data = out_history_list[epoch]         # shape: (data_points, H)
+        correct_target = correct_target_list[epoch]         # shape: (data_points, H)
+        
+        acc = jnp.sum(out_history_data, axis=0) / out_history_data.shape[0]
+        avg_rank = jnp.sum(correct_target, axis=0) / correct_target.shape[0]
+        
+        axes[0].plot(range(H), acc, label=f"Epoch {epoch} ({acc[-1]*100:.2f}%)")
+        axes[1].plot(range(H), avg_rank, label=f"Epoch {epoch}")
+        
+
+    axes[0].set_xlabel(f"Iteration from {H} iterations before final output")
+    axes[0].set_ylabel("Average prediction accuracy")
+    axes[0].set_title(f"Correct predictions for last {H} values in the output layer")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].set_xlabel(f"Iteration from {H} iterations before final output")
+    axes[1].set_ylabel("Average rank of target value")
+    axes[1].set_title(f"Average rank of target for last {H} values in the output layer")
+    axes[1].legend()
+    axes[1].grid(True)
+
+    # Save both plots into one image
+    plt.tight_layout()
+    plt.savefig(result_path + "_history.png")
+    plt.close()
+
 def accuracy(batch_number, outputs, y, iterations, print):
     # Get predictions (indices of max values)
     predictions = jnp.argmax(outputs, axis=-1)
@@ -1048,8 +1174,8 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = False
-    thresholds = (1e-2, 1e-2 ,1e-2)  
+    load_file = True
+    thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
     
@@ -1080,7 +1206,7 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=25, 
+            num_epochs=2, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
@@ -1090,8 +1216,9 @@ if __name__ == "__main__":
             sync_rate=1,
             max_nonzero=max_nonzero,
             shuffle_input=False,
-            threshold_lr=1e-3,
-            threshold_impact=1e-2
+            threshold_lr=0,
+            threshold_impact=0,
+            history_size=200
         )
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
@@ -1103,7 +1230,10 @@ if __name__ == "__main__":
                                 input_residuals=np.zeros((layer_sizes[rank-1], 1)),
                                 weight_residuals={"input activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
                                                     "layer activity": jnp.zeros((layer_sizes[rank], ), dtype=int), 
-                                                    "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))},
+                                                    "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank])),
+                                                    "values_history": jnp.zeros((params.history_size, layer_sizes[rank])),   # Initialize values_history as an empty list
+                                                    "history_index": jnp.array(0, dtype=jnp.int32),
+                                                },
                                 last_sent_iteration=0
                                 )
         t = 100
