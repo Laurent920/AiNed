@@ -601,6 +601,30 @@ def get_ordered_history(weight_residuals):
     # Vectorize across batch
     return jax.vmap(reorder_single)(history, index)
 
+def process_history(values_history, target_labels):
+    def preprocess_history(values_history, target_labels):
+        def get_all_max(single_values_history, targets):
+            return jax.vmap(lambda v, t: jnp.argmax(v) == t, in_axes=(0, None))(single_values_history, targets)
+        
+        def get_target_rank(single_values_history, targets):
+            def single_history(history, single_target):
+                return jnp.sum(history > history[single_target]) + 1
+            return jax.vmap(single_history, in_axes=(0, None))(single_values_history, targets)
+        
+        # Get the output prediction of all stored steps
+        out_history = jax.vmap(get_all_max)(values_history, target_labels)
+        
+        # Get the rank of the position corresponding to the target value
+        correct_target_ranks = jax.vmap(get_target_rank)(values_history, target_labels)
+        return out_history, correct_target_ranks
+
+    out_hist, correct_target = preprocess_history(values_history, target_labels)
+
+    # Compute the average value over the batch 
+    acc_history = jnp.sum(out_hist, axis=0) / out_hist.shape[0]
+    avg_rank = jnp.sum(correct_target, axis=0) / correct_target.shape[0]
+
+    return acc_history, avg_rank
 
 @partial(jax.jit, static_argnames=['params'])
 def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target):
@@ -636,9 +660,10 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     values_history = get_ordered_history(all_neuron_states.weight_residuals)
 
     # One-hot target → scalar class index
-    target_label = jnp.argmax(target, axis=-1)
+    target_labels = jnp.argmax(target, axis=-1)
+    acc_history, avg_rank = process_history(values_history, target_labels)
     
-    return (loss, all_outputs, iterations, (jnp.array(values_history), target_label)), (out_grad, mean_weight_grad, threshold_grad)
+    return (loss, all_outputs, iterations, (acc_history, avg_rank)), (out_grad, mean_weight_grad, threshold_grad)
 
 # region TRAINING
 def train(token, params: Params, key, weights, empty_neuron_states):     
@@ -825,7 +850,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
                 break        
                     
     # Output history analysis
-    store_history(all_history, result_path)
+    store_history(jnp.array(all_history), result_path)
     
     # Store the results
     threshold =  np.array(threshold).tolist()
@@ -896,54 +921,33 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         plt.close()
 
 def store_history(all_history, result_path):
-    def process_history(values_history, target_labels):
-        def get_all_max(single_values_history, targets):
-            return jax.vmap(lambda v, t: jnp.argmax(v) == t, in_axes=(0, None))(single_values_history, targets)
-        
-        def get_target_rank(single_values_history, targets):
-            def single_history(history, single_target):
-                return jnp.sum(history > history[single_target]) + 1
-            return jax.vmap(single_history, in_axes=(0, None))(single_values_history, targets)
-        
-        # Get the output prediction of all stored steps
-        out_history = jax.vmap(get_all_max)(values_history, target_labels)
-        
-        # Get the rank of the position corresponding to the target value
-        correct_target_ranks = jax.vmap(get_target_rank)(values_history, target_labels)
-        return out_history, correct_target_ranks
-    
-    out_history, correct_target_ranks = [], []
-    for values_history, target_labels in all_history:
-        out_hist, correct_target = process_history(values_history, target_labels)
-        out_history.append(out_hist)
-        correct_target_ranks.append(correct_target)
-    print("History shapes:", jnp.stack(out_history).shape,  jnp.stack(correct_target_ranks).shape)
-    
+    all_history = all_history.transpose(1, 0, 2)
+
     def flatten_history(history, batch_number=total_train_batches):
-        T, B, H = history.shape
+        # shape (epoch * num_batches, 100) -> (epoch, num_batches, 100)
+        T, H = history.shape # T: total iterations, H: history size
         
         assert T % batch_number == 0, f"T={T} must be divisible by batch_number={batch_number}"
-        N = T // batch_number
+        E = T // batch_number # E: epochs
         
-        # Reshape from (T, B, H) to (N, batch_number, B, H)
-        history = history.reshape(N, batch_number, B, H)
-        
-        # Merge batch_number and batch axes → (N, batch_number * B, H)
-        return history.reshape(N, batch_number * B, H)
-    out_history_list = flatten_history(jnp.stack(out_history))  # shape (epoch * num_batches, batch_size, 100) -> (epoch, num_batches*batch_size, 100)
-    correct_target_list = flatten_history(jnp.stack(correct_target_ranks))
-    print(f"Flattened shape: {out_history_list.shape}, {correct_target_list.shape}")
+        return history.reshape(E, batch_number, H) # (E, batch_number, H)
+    
+    flat_history = jnp.stack([
+                    flatten_history(arr_slice, total_train_batches)
+                    for arr_slice in all_history  # arr is shape (2, T, H)
+                    ])
+    print(f"Flattened shape: {flat_history[0].shape}, {flat_history[1].shape}")
     
     # Create side-by-side subplots
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns
 
-    H = out_history_list.shape[-1]
+    H = flat_history.shape[-1]
     assert H == params.history_size, f"History param must match the values got {params.history_size} and {H}"
 
     # PLot the average of history and rank 
-    for epoch in range(out_history_list.shape[0]):
-        out_history_data = out_history_list[epoch]         # shape: (data_points, H)
-        correct_target = correct_target_list[epoch]         # shape: (data_points, H)
+    for epoch in range(flat_history.shape[1]):
+        out_history_data = flat_history[0][epoch]         # shape: (data_points, H)
+        correct_target = flat_history[1][epoch]         # shape: (data_points, H)
         
         acc = jnp.sum(out_history_data, axis=0) / out_history_data.shape[0]
         avg_rank = jnp.sum(correct_target, axis=0) / correct_target.shape[0]
@@ -1174,7 +1178,7 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = True
+    load_file = False
     thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
@@ -1206,7 +1210,7 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=2, 
+            num_epochs=40, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
