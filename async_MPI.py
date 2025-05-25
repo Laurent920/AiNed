@@ -542,10 +542,10 @@ def softmax_cross_entropy_with_logits(logits, labels):
     # jax.debug.print("logits {}, max: {}, cross entropy: {}", logits, logits_max, cross_entropy)
     return cross_entropy
 
-def mean_loss(logits, labels, threshold_loss):
+def mean_loss(logits, labels):
     batched_softmax_cross_entropy = jax.vmap(softmax_cross_entropy_with_logits, in_axes=(0, 0))
     losses = batched_softmax_cross_entropy(logits, labels)
-    return jnp.mean(losses) + threshold_loss
+    return jnp.mean(losses)
 
 def output_gradient(weights, loss_grad):
     return jnp.dot(weights, loss_grad)
@@ -576,12 +576,13 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
 
     thr_impact = params.threshold_impact
     threshold = all_neuron_states.threshold[0]
-    threshold_loss = thr_impact * (jnp.mean(jnp.sum(all_residuals, axis=1), axis=0) + (1/threshold)) # average over the batches for the sum of activations outputed from the last hidden layer
-    threshold_grad = -thr_impact / (threshold ** 2)
+    threshold_loss = thr_impact * jnp.mean(jnp.sum(all_residuals, axis=1), axis=0) #+ (1/threshold)) # average over the batches for the sum of activations outputed from the last hidden layer
+    threshold_grad = -thr_impact #/ (threshold ** 2)
     # jax.debug.print("threshold loss shape: {} {}", threshold_loss, threshold_grad)
     
     # jax.debug.print("regularized average iterations: {},  {}/{}", reg_avg_iterations, jnp.mean(iterations), jnp.max(iterations))
-    loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target, threshold_loss[0])
+    loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target)
+    total_loss = loss + threshold_loss[0]
     
     out_grad = jax.vmap(output_gradient, in_axes=(None, 0))(weights, loss_grad)
     
@@ -687,6 +688,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
         # Inference on the validation set
         val_accuracy, val_mean, _ = batch_predict(params, key, token, weights, empty_neuron_states, dataset="val", save=False, debug=False)
         # val_accuracy, val_mean = 0, 0
+        epoch_accuracy = 0.0
         if rank == size-1:
             # Store loss values
             mean_loss = jnp.mean(jnp.array(epoch_loss))
@@ -699,6 +701,9 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             
             jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, mean_loss, val_mean)
             jax.debug.print("----------------------------\n")
+        epoch_accuracy, token = bcast(epoch_accuracy, root=size-1, comm=comm, token=token)
+        if epoch_accuracy >= 0.9999:
+            break
     threshold = empty_neuron_states.threshold
     # Inference on the test set
     test_accuracy, test_mean, _ = batch_predict(params, key, token, weights, empty_neuron_states, dataset="test", save=False, debug=False)
@@ -784,8 +789,8 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         "processes": size,
         "firing number": params.firing_nb,
         "synchronization rate": params.sync_rate,
-        "training accuracy": train_accuracy,
-        "validation accuracy": val_accuracy,
+        "training accuracy": np.array(all_epoch_accuracies).tolist(),
+        "validation accuracy": np.array(all_validation_accuracies).tolist(),
         "test accuracy": test_accuracy,
         "layer_sizes": params.layer_sizes,
         "batch_size": params.batch_size,
@@ -805,7 +810,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
     print(f"Results saved to {result_path}")
 
     if mode == "train":
-        epochs = [i + 1 for i in range(params.num_epochs)]        
+        epochs = [i + 1 for i in range(len(all_epoch_accuracies))]        
         # Plot accuracies and loss values
         fig, ax1 = plt.subplots(figsize=(8, 5))
         ax1.plot(epochs, all_epoch_accuracies, 'o-', label='Training Accuracy')
@@ -1049,7 +1054,7 @@ if __name__ == "__main__":
     # layer_sizes = [4, 5, 3]
      
     load_file = False
-    thresholds = (1e-2, 1e-2 ,1e-2)  
+    thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
     
@@ -1058,7 +1063,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for _ in [1]: #[1, 2, 4, 8, 16, 32, 64, 128]:
+    for f_nb in [1, 4, 2]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1080,18 +1085,18 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=25, 
+            num_epochs=60, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
             restrict=-1,
-            firing_nb=128,
+            firing_nb=f_nb,
             sync_rate=1,
             max_nonzero=max_nonzero,
             shuffle_input=False,
-            threshold_lr=1e-3,
-            threshold_impact=1e-2
+            threshold_lr=0,#1e-3,
+            threshold_impact=0
         )
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
