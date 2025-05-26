@@ -760,6 +760,8 @@ def train(token, params: Params, key, weights, empty_neuron_states):
         # Inference on the validation set
         val_accuracy, val_mean, _ = batch_predict(params, key, token, weights, empty_neuron_states, dataset="val", save=False, debug=False)
         # val_accuracy, val_mean = 0, 0
+        
+        epoch_accuracy = 0.0
         if rank == size-1:
             # Store loss values
             mean_loss = jnp.mean(jnp.array(epoch_loss))
@@ -772,6 +774,10 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             
             jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, mean_loss, val_mean)
             jax.debug.print("----------------------------\n")
+        epoch_accuracy, token = bcast(epoch_accuracy, root=size-1, comm=comm, token=token)
+        if epoch_accuracy >= 0.9999:
+            break        
+    
     threshold = empty_neuron_states.threshold
     # Inference on the test set
     test_accuracy, test_mean, _ = batch_predict(params, key, token, weights, empty_neuron_states, dataset="test", save=False, debug=False)
@@ -882,7 +888,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
     print(f"Results saved to {result_path}")
 
     if mode == "train":
-        epochs = [i + 1 for i in range(params.num_epochs)]        
+        epochs = [i + 1 for i in range(len(all_epoch_accuracies))]        
         # Plot accuracies and loss values
         fig, ax1 = plt.subplots(figsize=(8, 5))
         ax1.plot(epochs, all_epoch_accuracies, 'o-', label='Training Accuracy')
@@ -1210,7 +1216,7 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=40, 
+            num_epochs=60, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
