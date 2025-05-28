@@ -91,10 +91,10 @@ def keep_top_k(x, k):
     # Get the top-k values and their indices
 
     k_safe = min(k, x.shape[0]) #TODO investigate why this function gets compiled for the last layer, without cond throws a shape error
-    jax.lax.cond(k_safe != k,
-                 lambda _: jax.debug.print("Rank {} k safe: {}, k: {}", rank, k_safe, k),
-                 lambda _: None,
-                 None)
+    # jax.lax.cond(k_safe != k,
+    #              lambda _: jax.debug.print("Rank {} k safe: {}, k: {}", rank, k_safe, k),
+    #              lambda _: None,
+    #              None)
     k = k_safe
 
     _, top_indices = jax.lax.top_k(x, k)
@@ -194,8 +194,8 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
         new_input_activities = neuron_states.weight_residuals["input activity"].at[neuron_idx].set(True) # Update the input activity by setting the input neuron to True        
         
         # jax.debug.print("{} {}", active_indexes.shape, new_input_activities.shape)
-        new_values = update_new_values(neuron_states.weight_residuals["values"], active_indexes, new_input_activities) # Update input activity before updating the values
-        # new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_indexes)
+        # new_values = update_new_values(neuron_states.weight_residuals["values"], active_indexes, new_input_activities) # Update input activity before updating the values
+        new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_indexes)
         
         jax.lax.cond(neuron_idx == -2,
                      lambda _: jax.debug.print("{}, iteration: {}, neuron idx: {}", layer_input, iteration, neuron_idx),
@@ -532,6 +532,12 @@ def process_single_batch(activity, values):
     )
     return values
 
+def zero_columns_where_L2_rows_all_zero(M1_single, L2_single):
+    # L2_single: (64, 10) — one batch element
+    # M1_single: (128, 64)
+    mask = jnp.all(L2_single == 0, axis=1)  # shape: (64,)
+    return M1_single * (1 - mask).astype(M1_single.dtype)
+
 @partial(jax.jit, static_argnames=['params'])
 def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     '''
@@ -540,10 +546,16 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     token, all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, token, batch_data)
     next_grad, token = recv(jnp.zeros((batch_size, layer_sizes[rank])), source=rank + 1, tag=2, comm=comm) # Shape: (B, 128)
 
+    next_weight_res = jnp.ones((batch_size, params.layer_sizes[rank], params.layer_sizes[rank+1]))
+    # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
+    (next_weight_res, token) = jax.lax.cond(rank < size - 2, 
+                                   lambda _: recv(next_weight_res, source=rank + 1, tag=3, comm=comm),
+                                   lambda _: (next_weight_res, token), None) 
+        
     weight_res = all_neuron_states.weight_residuals # "input activity": Shape (B, 784, 1), "values": Shape (B, 784, 128)
 
-    # weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(weight_res["input activity"], weight_res["values"]) # Shape: (B, 784, 128)
-    weight_res = weight_res["values"] # incorrect residual but faster for testing
+    weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(weight_res["input activity"], weight_res["values"]) # Shape: (B, 784, 128)
+    # weight_res = weight_res["values"] # incorrect residual but faster for testing
     
     # Expand the dimensions of next_grad to match the shape of weight_res
     next_grad_expanded = jnp.expand_dims(next_grad, axis=1)  # Shape: (B, 1, 128)
@@ -564,9 +576,11 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad)
     
     if rank > 1:
-        jax.debug.print("SENDING DATA TO RANK {}", rank-1)
-        token = send(z_grad, dest=rank-1, tag=2,comm=comm, token=token)
-    
+        send_grad = jnp.mean(weights @ next_grad.T, axis=1) # Shape: (784)
+        # jax.debug.print("SENDING DATA TO RANK {}", rank-1)
+        token = send(send_grad, dest=rank-1, tag=2,comm=comm, token=token)
+        token = send(weight_res, dest=rank-1, tag=3,comm=comm, token=token)
+        
     return token, all_outputs, iterations, all_neuron_states, mean_weight_grad 
 
 # Define the loss function
@@ -640,6 +654,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
     tag 0:  forward computation, data format: (previous_layer_neuron_index, neuron_value)
             end of input is encoded with the index -1
     tag 2: backward computation, last layer gradient shape: (layer_sizes[-1], 1)
+    tag 3: weight residuals, shape: (layer_sizes[rank], layer_sizes[rank+1])
     tag 5: weights
     tag 10: data labels(y)
     """   
@@ -1127,7 +1142,7 @@ if __name__ == "__main__":
     key = jax.random.key(random_seed)
     # Network structure and parameters
     layer_sizes = (28*28, 128, 64, 10)
-    layer_sizes = (28*28, 128, 10)
+    # layer_sizes = (28*28, 128, 10)
     # layer_sizes = (28*28, 64, 10)
     best = False
     # layer_sizes = [4, 5, 3]
@@ -1142,7 +1157,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # test_surrogate_grad()
-    for f_nb in [1, 4, 2]:
+    for f_nb in [1]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         if rank != 0:
@@ -1164,13 +1179,13 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=60, 
+            num_epochs=1, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
             restrict=-1,
-            firing_nb=f_nb,
+            firing_nb=128,
             sync_rate=1,
             max_nonzero=max_nonzero,
             shuffle_input=False,
