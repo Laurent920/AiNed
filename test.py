@@ -20,6 +20,130 @@ class Neuron_states:
     input_residuals: jnp.ndarray
     weight_residuals: dict[str, jnp.ndarray]
 
+#region Batched inference
+# def clone_neuron_state(template: Neuron_states, batch_size: int) -> Neuron_states:
+#     def tile(x):
+#         return jnp.broadcast_to(x, (batch_size,) + x.shape)
+
+#     return Neuron_states(
+#         values=tile(template.values),
+#         threshold=jnp.broadcast_to(template.threshold, (batch_size,)),
+#         input_residuals=tile(template.input_residuals),
+#         weight_residuals={
+#             k: tile(v) for k, v in template.weight_residuals.items()
+#         },
+#         last_sent_iteration=tile(template.last_sent_iteration)
+#     )
+
+# @partial(jax.jit, static_argnames=['params'])
+# def predict_batched(params, weights, empty_neuron_states, token, batch_data: jnp.ndarray):
+#     """
+#         sending: (batch_size, 2): list of neuron_index and values
+#     """
+#     empty_neuron_states = clone_neuron_state(empty_neuron_states, batch_size)
+    
+#     def input_layer(args):
+#         token, neuron_states, x = args
+        
+#         x = jax.vmap(lambda x: preprocess_to_sparse_data_padded(x, params.max_nonzero))(x)
+#         # TODO preprocess the input before calling predict
+        
+#         # Forward pass (Send input data to Layer 1)
+#         nb_neurons = x.shape[1]
+#         def cond_send_input(carry):
+#             i, _ = carry
+#             out_val = x[:, i]
+#             return jnp.logical_and(i < nb_neurons, jnp.any(out_val != -2))
+
+#         def send_input(carry):
+#             i, token = carry
+#             out_val = x[:, i]
+#             token = send(out_val, dest=rank + 1, tag=0, comm=comm, token=token)
+#             return i + 1, token
+
+#         iteration, token = jax.lax.while_loop(cond_send_input, send_input, (0, token))
+
+#         # Send end signal
+#         token = send(jnp.full((batch_size, 2), -1.0), dest=1, tag=0, comm=comm, token=token)
+
+#         return token, jnp.zeros((batch_size)), neuron_states, iteration
+    
+#     def other_layers(args):
+#         token, neuron_states, _ = args
+#         def cond(state): # end of input has been reached -> break the while loop
+#             _, _, _, neuron_idx, _= state   
+#             # jax.debug.print("Rank {} neuron idx in while cond {}, shape: {}", rank, neuron_idx, neuron_idx.shape)         
+#             return jnp.all(neuron_idx != -1)
+        
+#         def forward_pass(state):
+#             token, layer_input, neuron_states, neuron_idx, iteration = state
+            
+#             def hidden_layers(input): # Send activation to the next layers
+#                 token, activated_output = input
+#                 nb_neurons = activated_output.shape[1]
+#                 activated_output = jax.vmap(lambda x: preprocess_to_sparse_data_padded(x, nb_neurons))(activated_output)
+
+#                 # jax.debug.print("Rank {}, nb neurons: {}", rank, nb_neurons)
+#                 def cond_send_activation(carry):
+#                     i, _ = carry
+#                     out_val = activated_output[:, i]
+#                     return jnp.logical_and(i < nb_neurons, jnp.any(out_val != -2))
+
+#                 def send_activation(carry):
+#                     i, token = carry
+#                     out_val = activated_output[:, i]
+#                     token = send(out_val, dest=rank + 1, tag=0, comm=comm, token=token)
+#                     return i + 1, token
+
+#                 _, token = jax.lax.while_loop(cond_send_activation, send_activation, (0, token))
+#                 return token
+            
+#             # Receive neuron values from previous layers and compute the activations
+#             input_data, token = recv(jnp.zeros((batch_size, 2), dtype=jnp.float32), source=rank-1, tag=0, comm=comm, token=token)
+#             # if rank == 2:
+#             #     jax.debug.print("{}",input_data)
+#             neuron_idx, layer_input = input_data[:, 0].astype(jnp.int32), input_data[:, 1]
+#             # jax.debug.print("Rank {} neuron states shape: {} dtype: {}", rank, neuron_states.values.shape, neuron_states.values.dtype)
+#             # jax.debug.print("Rank {} received data type {} at neuron idx type: {}", rank, layer_input.dtype, neuron_idx.dtype)
+            
+#             activated_output, new_neuron_states = jax.vmap(
+#                     layer_computation,
+#                     in_axes=(0, 0, None, 0)  # neuron_idx[batch], layer_input[batch], weights[shared], neuron_states[batch]
+#                     )(neuron_idx, layer_input, weights, neuron_states, params, iteration)
+            
+#             # activated_output, new_neuron_states = jnp.zeros((layer_sizes[rank])), neuron_states
+#             # jax.debug.print("Rank {} activated outputs {}", rank, activated_output.shape)
+#             # jax.debug.print("Rank {} received data {} at neuron idx: {}", rank, layer_input, neuron_idx)
+#             neuron_states = new_neuron_states
+#             token = jax.lax.cond(rank==size-1, lambda input: input[0], hidden_layers, (token, activated_output))
+#             return token, layer_input, neuron_states, neuron_idx, iteration+1
+        
+#         neuron_idx = jnp.zeros((batch_size), dtype=jnp.int32)
+#         layer_input = jnp.zeros((batch_size))
+#         initial_state = (token, layer_input, neuron_states, neuron_idx, 0)
+        
+#         # Loop until the rank receives a -1 neuron_idx
+#         token, layer_input, neuron_states, neuron_idx, iteration = jax.lax.while_loop(cond, forward_pass, initial_state)
+#         # jax.debug.print("rank {} exited the while loop with neuron_idx: {} and neuron state {}", rank, neuron_idx, neuron_states)
+        
+#         # Send -1 to the next rank when all incoming data has been processed
+#         token = jax.lax.cond(
+#             rank != size - 1,
+#             lambda t: send(jnp.full((batch_size, 2), -1.0), dest=rank + 1, tag=0, comm=comm, token=t),
+#             lambda t: t,
+#             operand=token
+#         )
+#         return token, layer_input, neuron_states, iteration-1
+       
+#     token, all_outputs, all_neuron_states, all_iterations = jax.lax.cond(rank==0, input_layer, other_layers, (token, empty_neuron_states, batch_data))
+#     all_outputs = all_neuron_states.values
+    
+#     # Synchronize all ranks before starting the backward pass
+#     token = mpi4jax.barrier(comm=comm, token=token)
+
+#     # jax.block_until_ready(all_outputs)
+#     # jax.debug.print("rank {} finished computing and waiting at the barrier after scanning over {} elements", rank, all_outputs.shape)
+#     return token, all_outputs, all_iterations, all_neuron_states
 
 #region Python loop      
 # def python_predict(weights, empty_neuron_states, token, batch_data: jnp.ndarray):
