@@ -39,6 +39,7 @@ size = comm.Get_size()
 split_rank = None           # Rank corresponding to the layer
 process_per_layer = None    # Number of processes for each layer
 last_rank = None            # Rank of last layer
+batch_part = None           # The size of the batch on each process
 
 @dataclasses.dataclass
 @tree_math.struct
@@ -227,7 +228,7 @@ def predict(params, key, weights, empty_neuron_states, token, batch_data: jnp.nd
             token, count = carry
             data = x_p[i]
             def send_data(t):
-                return send(data, dest=1, tag=0, comm=comm, token=t), count + 1
+                return send(data, dest=rank+process_per_layer, tag=0, comm=comm, token=t), count + 1
 
             def skip_data(t):
                 return t, count
@@ -244,7 +245,7 @@ def predict(params, key, weights, empty_neuron_states, token, batch_data: jnp.nd
         token, iteration = jax.lax.fori_loop(0, x_p.shape[0], send_input, (token, 0))
 
         # Send end signal
-        token = send(jnp.array([-1.0, 0.0]), dest=1, tag=0, comm=comm, token=token)
+        token = send(jnp.array([-1.0, 0.0]), dest=rank+process_per_layer, tag=0, comm=comm, token=token)
 
         return token, jnp.zeros(()), neuron_states, iteration
     
@@ -433,13 +434,13 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     B: batch_size
     '''
     token, all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, token, batch_data)
-    next_grad, token = recv(jnp.zeros((batch_size, layer_sizes[split_rank])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
+    next_grad, token = recv(jnp.zeros((batch_part, layer_sizes[split_rank])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
     
     # "input activity": Shape (B, 784, 1), "values": Shape (B, 784, 128)
     weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(all_neuron_states.weight_residuals["input activity"], all_neuron_states.weight_residuals['values']) # Shape: (B, 784, 128)
     # weight_res = weight_res["values"] # incorrect residual but faster for testing
     
-    next_weight_res = jnp.ones((batch_size, params.layer_sizes[split_rank], params.layer_sizes[split_rank+1]))
+    next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank], params.layer_sizes[split_rank+1]))
     # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
     (next_weight_res, token) = jax.lax.cond(split_rank < last_rank - 2, 
                                    lambda _: recv(next_weight_res, source=rank + process_per_layer, tag=3, comm=comm),
@@ -540,6 +541,59 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
 
     return (loss, all_outputs, iterations), (out_grad, mean_weight_grad, threshold_grad)
 
+def share_split_rank_data(token, data):
+    data = jnp.array(data)
+    leader_rank = split_rank * process_per_layer
+    if rank == leader_rank:
+        for i in range(process_per_layer-1): # Sharing the data to all the corresponding ranks
+            token = send(data, dest=rank+i+1, tag=20, comm=comm, token=token)
+    else:
+        data, token = recv(data, source=leader_rank, tag=20, comm=comm, token=token)        
+    return token, data
+
+def split_batch(token, batch_iterator):
+    if rank == 0:
+        all_batch_x, all_batch_y = next(batch_iterator)
+        all_batch_y = jnp.array(all_batch_y, dtype=jnp.float32)
+        all_batch_x = jnp.array(all_batch_x, dtype=jnp.float32)
+        
+        for process in range(process_per_layer):
+            if process == 0:
+                batch_x = all_batch_x[:batch_part]
+                batch_y = all_batch_y[:batch_part]
+            else:
+                batch_x_to_send = all_batch_x[batch_part*(process):batch_part*(process+1)]
+                batch_y_to_send = all_batch_y[batch_part*(process):batch_part*(process+1)]
+                # print(f"rank {rank}, Batch_x: {batch_x_to_send.shape}, Batch_y: {batch_y_to_send.shape}")
+                
+                token = send(batch_x_to_send, dest=process, tag=4, comm=comm, token=token)
+                token = send(batch_y_to_send, dest=process, tag=4, comm=comm, token=token)
+    else:
+        batch_x, token = recv(jnp.zeros((batch_part, layer_sizes[0])), source=0, tag=4, comm=comm, token=token)  
+        batch_y, token = recv(jnp.zeros((batch_part,)), source=0, tag=4, comm=comm, token=token) 
+        
+    return token, batch_x, batch_y
+
+def gather_batch(token, data):
+    '''
+    Gather all the data from one split_rank onto one rank and resharing the average result to the corresonding split_ranks
+    '''
+    data = jnp.array(data)
+    leader_rank = split_rank * process_per_layer
+    if rank == leader_rank:
+        avg = data
+        for i in range(process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
+            received_data, token = recv(data, source=rank+i+1, tag=20, comm=comm, token=token)
+            avg += received_data
+        avg = avg / process_per_layer
+        
+        for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
+            token = send(avg, dest=rank+i+1, tag=20, comm=comm, token=token)
+    else:
+        token = send(data, dest=leader_rank, tag=20, comm=comm, token=token)
+        avg, token = recv(data, source=leader_rank, tag=20, comm=comm, token=token)
+    return token, avg
+
 # region TRAINING
 def train(token, params: Params, key, weights, empty_neuron_states):     
     """
@@ -547,8 +601,10 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             end of input is encoded with the index -1
     tag 2: backward computation, last layer gradient shape: (layer_sizes[-1], 1)
     tag 3: weight residuals, shape: (layer_sizes[rank], layer_sizes[rank+1])
+    tag 4: communication between processes that have the data
     tag 5: weights
     tag 10: data labels(y)
+    tag 20: other data
     """   
     if split_rank == last_rank:
         all_epoch_accuracies = []
@@ -568,29 +624,29 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             epoch_loss = []
             
         epoch_iterations = []
-        if rank == 0:
-            batch_iterator = iter(training_generator)
-        
+        if split_rank == 0:
+            batch_iterator = None
+            if rank == 0:
+                batch_iterator = iter(training_generator)
+
+            
         for i in range(total_train_batches):
             neuron_states = empty_neuron_states
             threshold_grad = 0.0
             if split_rank == 0:
-                batch_x, batch_y = next(batch_iterator)
-                batch_y = jnp.array(batch_y, dtype=jnp.float32)
-                # print(f"Batch_x: {batch_x}, Batch_y: {batch_y.shape}")
-                
-                batch_x, batch_y = pad_batch(batch_x, batch_y, batch_size)
-                token = send(batch_y, dest=size-1, tag=10,comm=comm, token=token)
+                token, batch_x, batch_y = split_batch(token, batch_iterator)
+                batch_x, batch_y = pad_batch(batch_x, batch_y, batch_part)
+                token = send(batch_y, dest=last_rank * process_per_layer + rank, tag=10,comm=comm, token=token) # Destination rank: last_rank * process_per_layer + rank
 
                 token, outputs, iterations, all_neuron_states = (predict)(params, subkey, weights, neuron_states, token, batch_data=jnp.array(batch_x))
             else:
-                if split_rank==size-1:
+                if split_rank==last_rank:
                     # Receive y
-                    y, token = recv(jnp.zeros((batch_size,)), source=0, tag=10, comm=comm, token=token)      
+                    y, token = recv(jnp.zeros((batch_part,)), source=rank - (last_rank * process_per_layer), tag=10, comm=comm, token=token)  # Source rank opposite operation: rank - (last_rank * process_per_layer)
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=layer_sizes[-1]))
                     # print("encoded y: ", y, y_encoded.shape, y_encoded)              
 
-                    (loss, outputs, iterations), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token, y_encoded)
+                    (loss, outputs, iterations), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token, y_encoded)
                     epoch_loss.append(loss)
                     
                     weight_grad = gradients[1]
@@ -604,42 +660,48 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     epoch_correct += batch_correct
                     epoch_total += valid_y.shape[0]
                 else:
-                    token, outputs, iterations, all_neuron_states, weight_grad = (predict_bwd)(params, subkey, jnp.zeros((batch_size, layer_sizes[0])), weights, neuron_states, token)
+                    token, outputs, iterations, all_neuron_states, weight_grad = (predict_bwd)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token)
                 
+                token, weight_grad = gather_batch(token, weight_grad)
                 # Update weights
                 weight_grad = jnp.reshape(weight_grad, (weights.shape[0], weights.shape[1]))
                 weights -= params.learning_rate * weight_grad #TODO use Adam AdamW
 
             # Update threshold
-            threshold_grad, token = bcast(threshold_grad, root=size-1, comm=comm, token=token)
-            empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
-            # if rank == last_rank:
-            #     jax.debug.print("Threshold grad {}, new threshold {}", threshold_grad, (empty_neuron_states.threshold))
+            # threshold_grad, token = bcast(threshold_grad, root=size-1, comm=comm, token=token)
+            # empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
+            
             epoch_iterations.append(iterations)
             # break
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
+        token, all_mean_iterations = gather_batch(token, all_mean_iterations)
+        all_mean_iterations = all_mean_iterations.tolist()
         
         if split_rank != 0:
-            jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points and a threshold of {}", rank, mean, epoch_iterations.shape[0], empty_neuron_states.threshold)
+            jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points and a threshold of {}", rank, mean, epoch_iterations.shape[0]*process_per_layer, empty_neuron_states.threshold)
         
         # Inference on the validation set
         val_accuracy, val_mean, _ = batch_predict(params, key, token, weights, empty_neuron_states, dataset="val", save=False, debug=False)
         # val_accuracy, val_mean = 0, 0
         epoch_accuracy = 0.0
-        if rank == size-1:
+        if split_rank == last_rank:
             # Store loss values
             mean_loss = jnp.mean(jnp.array(epoch_loss))
             all_loss.append(mean_loss)
-            
+            token, mean_loss = gather_batch(token, mean_loss)
+
             # Store training and validation accuracies
             epoch_accuracy = epoch_correct / epoch_total
             all_epoch_accuracies.append(epoch_accuracy)
             all_validation_accuracies.append(val_accuracy)
-            
-            jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, mean_loss, val_mean)
-            jax.debug.print("----------------------------\n")
+            token, all_epoch_accuracies = gather_batch(token, all_epoch_accuracies)
+            token, all_validation_accuracies = gather_batch(token, all_validation_accuracies)
+            all_epoch_accuracies, all_validation_accuracies = all_epoch_accuracies.tolist(), all_validation_accuracies.tolist()
+            if rank == size-1:
+                jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, epoch_accuracy * 100, val_accuracy * 100, mean_loss, val_mean)
+                jax.debug.print("----------------------------\n")
         epoch_accuracy, token = bcast(epoch_accuracy, root=size-1, comm=comm, token=token)
         if epoch_accuracy >= 0.9999:
             break
@@ -656,7 +718,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
     token = mpi4jax.barrier(comm=comm, token=token)
     end_time = time.time()
         
-    if rank==size-1:        
+    if rank == last_rank * process_per_layer:
         # Execution time
         execution_time = end_time - start_time
         print(f"Execution Time: {execution_time:.6f} seconds")
@@ -677,11 +739,11 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
     if mode == "train":
         result_dir = os.path.join("network_results", "training")
         filename_header = f"{params.random_seed}" + f"_ep{params.num_epochs}" + f"_batch{params.batch_size}_"
-        last_iterations_mean = [float(mean[-1]) for mean in all_iteration_mean.tolist()[1:]]
+        last_iterations_mean = [float(mean[-1]) for mean in all_iteration_mean[1:]]
     elif mode == "inference":
         result_dir = os.path.join("network_results", "mnist")
         filename_header = f"{params.random_seed}" + f"_load{params.load_file}" + f"_batch{params.batch_size}_"
-        last_iterations_mean = [float(mean) for mean in all_iteration_mean.tolist()[1:]]
+        last_iterations_mean = [float(mean) for mean in all_iteration_mean[1:]]
     else:
         print("Wrong mode for storing data choose 'train' or 'inference'. No data is saved")
         return          
@@ -865,18 +927,24 @@ def preprocess_data(data_generator):
 
 def gather_weights_and_iterations(weights, mean_iterations, token):
     # Send all the weights to the last layer to store them
+    leader_rank = split_rank * process_per_layer
+
     weights_dict = {}
-    if rank != size-1:
-        token = send(weights, dest=size-1, tag=5,comm=comm, token=token)
-    else:
-        for i in range(size-1):
-            w, token = recv(jnp.zeros((layer_sizes[i-1], layer_sizes[i])), source=i, tag=5, comm=comm, token=token)   
+    all_iteration_mean = []
+    if split_rank != last_rank and rank == leader_rank:
+        token = send(weights, dest=last_rank * process_per_layer, tag=5,comm=comm, token=token)
+        token = send(mean_iterations, dest=last_rank * process_per_layer, tag=5,comm=comm, token=token)
+    elif split_rank == last_rank and rank == leader_rank:
+        for i in range(last_rank):
+            w, token = recv(jnp.zeros((layer_sizes[i-1], layer_sizes[i])), source=i * process_per_layer, tag=5, comm=comm, token=token)   
             weights_dict[f"layer_{i}"] = w.tolist()
             
+            iter_mean, token = recv(mean_iterations, source=i * process_per_layer, tag=5, comm=comm, token=token)
+            all_iteration_mean.append(iter_mean)
         weights_dict[f"layer_{size-1}"] = weights.tolist()
     
     # Gather all the iterations values at the last layer
-    all_iteration_mean, token = mpi4jax.gather(mean_iterations, root=size-1, comm=comm, token=token)
+    # all_iteration_mean, token = mpi4jax.gather(mean_iterations, root=size-1, comm=comm, token=token)
     return weights_dict, all_iteration_mean
 
 # region Main 
@@ -886,52 +954,53 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
     
     if dataset == "train":
         total_batches = total_train_batches
-        if rank == 0:
-            print(f"Inference on the training set...")
-            batch_iterator = iter(training_generator)
+        if split_rank == 0:
+            batch_iterator = None
+            if rank == 0:
+                print(f"Inference on the training set...")
+                batch_iterator = iter(training_generator)
     elif dataset == "val":
         total_batches = total_val_batches
-        if rank == 0:
-            print(f"Inference on the validation set...")
-            batch_iterator = iter(validation_generator)
+        if split_rank == 0:
+            batch_iterator = None
+            if rank == 0:
+                print(f"Inference on the validation set...")
+                batch_iterator = iter(validation_generator)
     elif dataset == "test":
         total_batches = total_test_batches
-        if rank == 0:
-            print(f"Inference on the test set...")
-            batch_iterator = iter(test_generator)
+        if split_rank == 0:
+            batch_iterator = None
+            if rank == 0:
+                print(f"Inference on the test set...")
+                batch_iterator = iter(test_generator)
     else:
         print("INVALID DATASET")
         return
         
-    if rank == size-1:
+    if split_rank == last_rank:
         epoch_correct = 0
-        epoch_total = 0
+        epoch_total = 1
             
     epoch_iterations = []
-    
     for i in range(total_batches):
         neuron_states = empty_neuron_states
-        if rank == 0:                     
-            batch_x, batch_y = next(batch_iterator)
-            batch_x = jnp.array(batch_x)
-            batch_y = jnp.array(batch_y, dtype=jnp.float32)
-            # print(f"Batch_x: {batch_x}, {batch_y.dtype}")
-            
-            batch_x, batch_y = pad_batch(batch_x, batch_y, batch_size)
-            
+        if split_rank == 0:                 
+            token, batch_x, batch_y = split_batch(token, batch_iterator)
+            batch_x, batch_y = pad_batch(batch_x, batch_y, batch_part)
+            # print("after split batch", i)
+
             # token, outputs, iterations, all_neuron_states = (predict_batched)(weights, neuron_states, token, max_nonzero, batch_x)
-            token, outputs, iterations, all_neuron_states = (predict)(params, key, weights, neuron_states, token, batch_x)
+            token, outputs, iterations, all_neuron_states = (predict)(params, key, weights, neuron_states, token, jnp.array(batch_x))
             
             # Send label to the last layer
-            token = send(batch_y, dest=size-1, tag=10,comm=comm, token=token)
+            token = send(batch_y, dest=last_rank * process_per_layer + rank, tag=10,comm=comm, token=token)
         else:
-            token, outputs, iterations, all_neuron_states = (predict)(params, key, weights, neuron_states, token, jnp.zeros((batch_size, layer_sizes[0])))
+            token, outputs, iterations, all_neuron_states = (predict)(params, key, weights, neuron_states, token, jnp.zeros((batch_part, layer_sizes[0])))
             # token, outputs, iterations, all_neuron_states = (predict_batched)(weights, neuron_states, token, max_nonzero, jnp.zeros((batch_size, layer_sizes[0])))
             # jax.debug.print("Rank {} All neuron states shape: {}, output shape : {}", rank, all_neuron_states.input_residuals.shape, outputs.shape)
 
-            if rank == size-1:
-
-                y, token = recv(jnp.zeros((batch_size,)), source=0, tag=10, comm=comm, token=token)   
+            if split_rank == last_rank:
+                y, token = recv(jnp.zeros((batch_part,)), source=rank - (last_rank * process_per_layer), tag=10, comm=comm, token=token)   
                 
                 valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
                 
@@ -942,18 +1011,20 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
         # break
     epoch_iterations = jnp.array(epoch_iterations).flatten()
     mean = jnp.mean(epoch_iterations)
+    token, mean = gather_batch(token, mean)
+    # jax.debug.print("Rank {}, all iterations shape: {}", rank, (epoch_iterations.shape[0]))
     
-    jax.debug.print("Rank {}, all iterations shape: {}", rank, (epoch_iterations.shape[0]))
     if rank != 0 and debug:
-        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, epoch_iterations.shape[0])
+        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, epoch_iterations.shape[0]*process_per_layer)
     
     epoch_accuracy = -1.0
-    if rank == size-1:
+    if split_rank == last_rank:
         epoch_accuracy = epoch_correct / epoch_total
+        token, epoch_accuracy = gather_batch(token, epoch_accuracy)
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
-            
+    
     weights_dict, all_iteration_mean = gather_weights_and_iterations(weights, mean, token)
     # jax.debug.print("rank {} all iterations mean: {}, shape: {}", rank, all_iteration_mean, (all_iteration_mean.shape))
     
@@ -963,7 +1034,7 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
     token = mpi4jax.barrier(comm=comm, token=token)
     end_time = time.time()
 
-    if rank == size-1:
+    if rank == last_rank * process_per_layer:
         execution_time = end_time - start_time
 
         if debug:            
@@ -1028,10 +1099,14 @@ def get_split_rank():
     global split_rank 
     global process_per_layer
     global last_rank
+    global batch_part
     
-    last_rank = len(layer_sizes)
-    process_per_layer = size // last_rank
+    last_rank = len(layer_sizes)-1
+    process_per_layer = size // (last_rank+1)
     split_rank = rank // process_per_layer
+    batch_part = batch_size // process_per_layer
+
+    print(f"Rank {rank}, split rank: {split_rank}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_rank}")
 
 if __name__ == "__main__":
     random_seed = 42
@@ -1045,7 +1120,7 @@ if __name__ == "__main__":
      
     load_file = False
     thresholds = (0, 0 ,0)  
-    batch_size = 32
+    batch_size = 36
     shuffle = False
     
     if size % len(layer_sizes) != 0:
@@ -1053,32 +1128,41 @@ if __name__ == "__main__":
         sys.exit(1)
     
     get_split_rank() # Compute the split rank for training/inference with multiple processes per batch
+
+    if batch_size % process_per_layer != 0:
+        print(f"Error: one batch ({batch_size}) must be divisible by the number of processes per layer ({process_per_layer})")
+        sys.exit(1)
     
     # test_surrogate_grad()
     for r in [2]:
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
+        total_train_batches, total_val_batches, total_test_batches = 0, 0, 0
         if split_rank != 0:
             weights, neuron_states = init_params(subkey, load_file=load_file, best=best)
             batch_iterator = None
             max_nonzero = layer_sizes[split_rank]
         if split_rank == 0:
+            max_nonzero = 0
             if rank == 0:
                 # Load the data 
                 (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_loader_manual(batch_size, shuffle=shuffle)
                 # training_generator, train_set, test_set, total_batches = torch_loader(batch_size, shuffle=shuffle)
-            print("max non zero: ",max_nonzero)
+                print("max non zero: ",max_nonzero)
             weights = jnp.zeros((layer_sizes[-1], layer_sizes[0]))
         
         # Broadcast total_batches to all other ranks
-        total_train_batches, total_val_batches, total_test_batches = 0, 0, 0
         (total_train_batches, total_val_batches, total_test_batches), token = bcast(jnp.array([total_train_batches, total_val_batches, total_test_batches]), root=0 , comm=comm)
-    
+
+        if split_rank == 0:
+            token, max_nonzero = share_split_rank_data(token, max_nonzero) 
+            max_nonzero = max_nonzero.tolist() # share_split_rank_data returns an array
+            
         params = Params(
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=3, 
+            num_epochs=40, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
@@ -1087,7 +1171,7 @@ if __name__ == "__main__":
             firing_nb=128,
             sync_rate=1,
             max_nonzero=max_nonzero,
-            shuffle_input=True,
+            shuffle_input=False,
             threshold_lr=0,#1e-3,
             threshold_impact=0,
             rerun=""
@@ -1120,6 +1204,6 @@ if __name__ == "__main__":
         #     _, _, ex_time = batch_predict(params, key, token, weights, empty_neuron_states, "val", save=False, debug=True)
         #     all_time += ex_time
         # print("average execution time : {}", all_time/t)
-        
-        # batch_predict(params, key, token, weights, empty_neuron_states, "val", save=True, debug=True)
+
+        # batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
         train(token, params, key, weights, empty_neuron_states)
