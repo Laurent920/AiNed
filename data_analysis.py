@@ -17,7 +17,7 @@ data_field_label = "Firing number"
 parameter_values = "1_2_4_8_16_32_64_128"
 folder_path = "network_results/training/restrict_penalty_" + parameter_values + "/"
 data_field = "restrict"
-data_field_label = "Number of times a neuron can fire in total"
+data_field_label = "Number of times a neuron can fire in total before applying a penalty"
 folder_add = "_penalty"
 
 # parameter_values = "1_2_4_8_16_32_64_128_256_784"

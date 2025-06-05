@@ -177,11 +177,13 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
         
         # APPLY THE RESTRICTION
         restrict_cond = jnp.logical_and(params.restrict > 0, layer_activity >= params.restrict) 
-        output_mask = jnp.where(restrict_cond, 1.0, 1.0) # Create a mask to skip the neurons of the layer that have activated above the restricted value # ATTENTION RESTRICT REMOVED (0.0, 1.0)
-        penalty = jnp.where(restrict_cond, 0.0, 0.0) 
+        penalty_mask = jnp.where(restrict_cond, 1.0, 0.0) # Create a mask to keep the neurons that have activated above the restricted value 
         
-        active_output = activated_output * (output_mask) # Apply the mask to the activated output to get the actual activations
+        penalty = penalty_mask * activated_output
         
+        # active_output = activated_output * (output_mask) # Apply the mask to the activated output to get the actual activations
+        
+        active_output = activated_output
         active_indexes = jnp.where(active_output > 0, 1, 0)
         
         new_layer_activities = layer_activity + active_indexes # Update the layer activity by adding the active neurons
@@ -666,13 +668,13 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                 # Update weights
                 weight_grad = jnp.reshape(weight_grad, (weights.shape[0], weights.shape[1]))
                 weights -= params.learning_rate * weight_grad #TODO use Adam AdamW
-
             # Update threshold
             # threshold_grad, token = bcast(threshold_grad, root=size-1, comm=comm, token=token)
             # empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
             
             epoch_iterations.append(iterations)
             # break
+        token, weights = gather_batch(token, weights)
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
@@ -1021,6 +1023,8 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
     if split_rank == last_rank:
         epoch_accuracy = epoch_correct / epoch_total
         token, epoch_accuracy = gather_batch(token, epoch_accuracy)
+        jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
+        jax.debug.print("----------------------------\n")
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
@@ -1167,7 +1171,7 @@ if __name__ == "__main__":
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
-            restrict=-1,
+            restrict=1,
             firing_nb=128,
             sync_rate=1,
             max_nonzero=max_nonzero,
