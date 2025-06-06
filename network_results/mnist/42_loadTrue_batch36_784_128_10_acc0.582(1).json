@@ -1,5 +1,5 @@
 {
-    "time": 157.91436529159546,
+    "time": 186.05370020866394,
     "loadfile": true,
     "shuffle data": false,
     "shuffle input": false,
@@ -8,7 +8,7 @@
     "firing number": 128,
     "synchronization rate": 1,
     "training accuracy": [
-        0.5818548798561096
+        0.5818306803703308
     ],
     "validation accuracy": [
         -1
@@ -23,7 +23,8 @@
     "learning rate": 0.01,
     "thresholds": 0.0,
     "iterations mean": [
-        149.71044921875
+        149.62966918945312,
+        873.135986328125
     ],
     "restrict": -1,
     "threshold impact": 0,

@@ -1,14 +1,14 @@
 {
-    "time": 241.0163803100586,
+    "time": 259.1860589981079,
     "loadfile": true,
     "shuffle data": false,
     "shuffle input": false,
     "rerun": "",
-    "processes": 3,
+    "processes": 6,
     "firing number": 128,
     "synchronization rate": 1,
     "training accuracy": [
-        0.5820435285568237
+        0.5818132162094116
     ],
     "validation accuracy": [
         -1
@@ -23,7 +23,8 @@
     "learning rate": 0.01,
     "thresholds": 0.0,
     "iterations mean": [
-        149.6296844482422
+        149.71107482910156,
+        873.8197021484375
     ],
     "restrict": -1,
     "threshold impact": 0,
@@ -109814,7 +109815,7 @@
                 0.030684396624565125
             ]
         ],
-        "layer_2": [
+        "layer_5": [
             [
                 -0.032832320779561996,
                 -0.02804308757185936,
