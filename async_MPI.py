@@ -28,6 +28,7 @@ from typing import Generic, Any, Union, TypeVar, Tuple
 
 from z_helpers.mnist_helper import torch_loader_manual
 from z_helpers.iris_species_helper import torch_loader
+import pickle
 
 # jax.config.update("jax_debug_nans", True)
 
@@ -530,11 +531,14 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     # jax.debug.print("regularized average iterations: {},  {}/{}", reg_avg_iterations, jnp.mean(iterations), jnp.max(iterations))
     loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target)
     total_loss = loss + threshold_loss[0]
+    # jax.debug.print("rank {}, loss: {}", rank, loss)
     
     out_grad = jax.vmap(output_gradient, in_axes=(None, 0))(weights, loss_grad)
+    # jax.debug.print("rank {}, loss: {}, loss_grad shape: {}, out_grad shape: {}", rank, loss, loss_grad.shape, out_grad.shape)
     
     weight_grad =  jax.vmap(output_weight_grad, in_axes=(0, 0))(loss_grad, all_residuals)
     mean_weight_grad = jnp.mean(weight_grad, axis=0)
+    # jax.debug.print("rank {}, mean weight grad: {}", rank, mean_weight_grad)
     
     # jax.debug.print("loss: {}, loss gradient: {}", loss, loss_grad.shape)
     # jax.debug.print("out grad {}, {}", out_grad.shape, out_grad)
@@ -576,7 +580,7 @@ def split_batch(token, batch_iterator):
         
     return token, batch_x, batch_y
 
-def gather_batch(token, data):
+def gather_batch(token, data, average=True):
     '''
     Gather all the data from one split_rank onto one rank and resharing the average result to the corresonding split_ranks
     '''
@@ -587,7 +591,8 @@ def gather_batch(token, data):
         for i in range(process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
             received_data, token = recv(data, source=rank+i+1, tag=20, comm=comm, token=token)
             avg += received_data
-        avg = avg / process_per_layer
+        if average:
+            avg = avg / process_per_layer
         
         for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
             token = send(avg, dest=rank+i+1, tag=20, comm=comm, token=token)
@@ -647,8 +652,19 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     y, token = recv(jnp.zeros((batch_part,)), source=rank - (last_rank * process_per_layer), tag=10, comm=comm, token=token)  # Source rank opposite operation: rank - (last_rank * process_per_layer)
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=layer_sizes[-1]))
                     # print("encoded y: ", y, y_encoded.shape, y_encoded)              
-
                     (loss, outputs, iterations), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token, y_encoded)
+                    # print(f"Rank {rank} i: {i}, loss: {loss}, w_grad: {gradients[1].shape}, out grad: {gradients[0].shape}")
+                    # log_path = f"logs/rank_{rank}.pkl"
+                    # os.makedirs("logs", exist_ok=True) 
+                    # with open(log_path, "ab") as f:  # 'ab' = append binary
+                    #     pickle.dump({
+                    #         "rank": rank,
+                    #         "i": i,
+                    #         "loss": float(loss),
+                    #         "w_grad": gradients[1],
+                    #         "out_grad": gradients[0]
+                    #     }, f)
+
                     epoch_loss.append(loss)
                     
                     weight_grad = gradients[1]
@@ -664,7 +680,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                 else:
                     token, outputs, iterations, all_neuron_states, weight_grad = (predict_bwd)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token)
                 
-                token, weight_grad = gather_batch(token, weight_grad)
+                token, weight_grad = gather_batch(token, weight_grad, average=False) # Gather the weight gradients from all ranks in the split rank
                 # Update weights
                 weight_grad = jnp.reshape(weight_grad, (weights.shape[0], weights.shape[1]))
                 weights -= params.learning_rate * weight_grad #TODO use Adam AdamW
@@ -673,8 +689,8 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             # empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
             
             epoch_iterations.append(iterations)
-            # break
-        token, weights = gather_batch(token, weights)
+            # if i > 3:
+            #     break
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
@@ -1166,7 +1182,7 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=40, 
+            num_epochs=1, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,

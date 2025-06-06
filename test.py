@@ -6,7 +6,7 @@ import mpi4jax
 import dataclasses
 import tree_math
 from jax import custom_jvp
-
+import pickle
 # Initialize MPI
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
@@ -570,25 +570,58 @@ if __name__ == "__main__":
             }
 
     # Initialize
-    neuron_states = NeuronStates()
+    # neuron_states = NeuronStates()
 
-    # Suppose this is the new output of the neurons
-    activated_output = jnp.array([1.0, 2.0, 0.0, 0.0, 3.0])
+    # # Suppose this is the new output of the neurons
+    # activated_output = jnp.array([1.0, 2.0, 0.0, 0.0, 3.0])
 
-    # Indices we want to update (could be all neurons, or a subset)
-    neuron_idx = jnp.array([0, 1, 2, 3, 4])  # update all neurons
+    # # Indices we want to update (could be all neurons, or a subset)
+    # neuron_idx = jnp.array([0, 1, 2, 3, 4])  # update all neurons
 
-    # Your code
-    non_activated_neurons = jnp.where(neuron_states.weight_residuals["activity"], 0, 1)
-    active_gradient = jax.numpy.logical_and(non_activated_neurons, activated_output)
-    new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_gradient)
+    # # Your code
+    # non_activated_neurons = jnp.where(neuron_states.weight_residuals["activity"], 0, 1)
+    # active_gradient = jax.numpy.logical_and(non_activated_neurons, activated_output)
+    # new_values = neuron_states.weight_residuals["values"].at[neuron_idx].add(active_gradient)
 
-    new_layer_activities = jnp.logical_or(neuron_states.weight_residuals["activity"], activated_output)
+    # new_layer_activities = jnp.logical_or(neuron_states.weight_residuals["activity"], activated_output)
 
-    # Output
-    print("Initial activity:", neuron_states.weight_residuals["activity"])
-    print("Activated output:", activated_output)
-    print("Non-activated neurons (inverted activity):", non_activated_neurons)
-    print("Active gradient (logical AND):", active_gradient)
-    print("New values after update:", new_values)
-    print("New layer activity after update:", new_layer_activities)
+    # # Output
+    # print("Initial activity:", neuron_states.weight_residuals["activity"])
+    # print("Activated output:", activated_output)
+    # print("Non-activated neurons (inverted activity):", non_activated_neurons)
+    # print("Active gradient (logical AND):", active_gradient)
+    # print("New values after update:", new_values)
+    # print("New layer activity after update:", new_layer_activities)
+    
+    # ______________________________________________________________________________________________________________________________________
+    # Comparing multi-process gradients
+    
+    def load_pickle_objects(path):
+        data = []
+        with open(path, "rb") as f:
+            while True:
+                try:
+                    data.append(pickle.load(f))
+                except EOFError:
+                    break
+        return data
+
+    # Load data
+    data2 = load_pickle_objects("logs/rank_2.pkl")
+    data4 = load_pickle_objects("logs/rank_4.pkl")
+    data5 = load_pickle_objects("logs/rank_5.pkl")
+
+    # Sanity check: Ensure equal lengths
+    assert len(data2) == len(data4) == len(data5), "Pickle logs have different lengths."
+
+    # Compare entry by entry
+    for i, (entry2, entry4, entry5) in enumerate(zip(data2, data4, data5)):
+        avg_loss = (entry4["loss"] + entry5["loss"]) / 2
+        avg_w_grad = (jnp.array(entry4["w_grad"]) + jnp.array(entry5["w_grad"])) / 2
+        avg_out_grad = (jnp.array(entry4["out_grad"]) + jnp.array(entry5["out_grad"])) / 2
+
+        diff_loss = entry2["loss"] - avg_loss
+        diff_w_grad = jnp.linalg.norm(jnp.array(entry2["w_grad"]) - avg_w_grad)
+        diff_out_grad = jnp.linalg.norm(jnp.array(entry2["out_grad"]) - avg_out_grad)
+
+        print(f"[i={i}] Δloss: {diff_loss:.6f}, Δw_grad norm: {diff_w_grad:.6f}, Δout_grad norm: {diff_out_grad:.6f}")
