@@ -463,13 +463,14 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     x_reshaped = x[..., jnp.newaxis]   # Shape becomes (B, 784, 1, 1)
     
     weight_grad = x_reshaped * z_grad[:, :, jnp.newaxis, :] # (B, 784, 1, 128)
-    mean_weight_grad = jnp.mean(jnp.squeeze(weight_grad, axis=2), axis=0) # (784, 128)
+    weight_grad = jnp.squeeze(weight_grad, axis=2)
+    mean_weight_grad = jnp.expand_dims(jnp.mean(weight_grad, axis=0), axis=0) # (1, 784, 128)
     
     # jax.debug.print("x {}, x_reshaped{}", x.shape, x)
     # jax.debug.print("next_grad_expanded {}, {}", next_grad_expanded.shape, next_grad_expanded)
     # jax.debug.print("weight residuals {}, {}", weight_res.shape, weight_res)
     # jax.debug.print("z_grad {}, {}", z_grad.shape, z_grad)
-    # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad)
+    # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad.shape)
     
     # send_grad = jnp.mean(weights @ next_grad.T, axis=1) 
     if split_rank > 1:
@@ -477,7 +478,7 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
         token = send(send_grad, dest=rank-process_per_layer, tag=2,comm=comm, token=token)
         token = send(weight_res, dest=rank-process_per_layer, tag=3,comm=comm, token=token)
         
-    return token, all_outputs, iterations, all_neuron_states, mean_weight_grad 
+    return token, all_outputs, iterations, all_neuron_states, weight_grad 
 
 # Define the loss function
 def softmax_cross_entropy_with_logits(logits, labels):
@@ -530,6 +531,7 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     
     # jax.debug.print("regularized average iterations: {},  {}/{}", reg_avg_iterations, jnp.mean(iterations), jnp.max(iterations))
     loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target)
+    loss_grad /= process_per_layer
     total_loss = loss + threshold_loss[0]
     # jax.debug.print("rank {}, loss: {}", rank, loss)
     
@@ -537,7 +539,8 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     # jax.debug.print("rank {}, loss: {}, loss_grad shape: {}, out_grad shape: {}", rank, loss, loss_grad.shape, out_grad.shape)
     
     weight_grad =  jax.vmap(output_weight_grad, in_axes=(0, 0))(loss_grad, all_residuals)
-    mean_weight_grad = jnp.mean(weight_grad, axis=0)
+    weight_grad = jnp.reshape(jnp.squeeze(weight_grad, axis=3), (weight_grad.shape[0], weight_grad.shape[2], weight_grad.shape[1]))
+    mean_weight_grad = jnp.expand_dims(jnp.mean(weight_grad, axis=0), axis=0) # Shape: (1, 128, 10)
     # jax.debug.print("rank {}, mean weight grad: {}", rank, mean_weight_grad)
     
     # jax.debug.print("loss: {}, loss gradient: {}", loss, loss_grad.shape)
@@ -545,7 +548,7 @@ def loss_fn(params, key, batch_data, weights, empty_neuron_states, token, target
     # jax.debug.print("all residuals {}, {}", all_residuals.shape, all_residuals.dtype)
     # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad.shape)
 
-    return (loss, all_outputs, iterations), (out_grad, mean_weight_grad, threshold_grad)
+    return (loss, all_outputs, iterations), (out_grad, weight_grad, threshold_grad, loss_grad, weight_grad)
 
 def share_split_rank_data(token, data):
     data = jnp.array(data)
@@ -601,6 +604,33 @@ def gather_batch(token, data, average=True):
         avg, token = recv(data, source=leader_rank, tag=20, comm=comm, token=token)
     return token, avg
 
+def combine_batch(token, data, average=False):
+    '''
+    Gather all the data from one split_rank onto one rank by concatenating the batches and resharing the average result to the corresonding split_ranks
+    '''
+    data = jnp.array(data)
+    leader_rank = split_rank * process_per_layer
+    if rank == leader_rank:
+        avg = data
+        for i in range(process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
+            received_data, token = recv(data, source=rank+i+1, tag=20, comm=comm, token=token)
+            avg = jnp.concatenate([avg, received_data], axis=0)
+
+        if average:
+            # print(f"Rank {rank} combining batches, avg shape: {avg.shape}")
+            avg = jnp.mean(avg, axis=0)
+            # print(f"Rank {rank} combining batches, avg shape: {avg.shape}")
+
+
+        for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
+            token = send(avg, dest=rank+i+1, tag=20, comm=comm, token=token)
+    else:
+        token = send(data, dest=leader_rank, tag=20, comm=comm, token=token)
+        avg, token = recv(jnp.zeros((data.shape[1], data.shape[2])), source=leader_rank, tag=20, comm=comm, token=token)
+        
+    return token, avg
+
+
 # region TRAINING
 def train(token, params: Params, key, weights, empty_neuron_states):     
     """
@@ -653,7 +683,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=layer_sizes[-1]))
                     # print("encoded y: ", y, y_encoded.shape, y_encoded)              
                     (loss, outputs, iterations), gradients = (loss_fn)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token, y_encoded)
-                    # print(f"Rank {rank} i: {i}, loss: {loss}, w_grad: {gradients[1].shape}, out grad: {gradients[0].shape}")
+                    # print(f"Rank{rank} i: {i}, loss: {loss}, w_grad: {gradients[1].shape}, out grad: {gradients[0].shape}, loss grad: {gradients[3].shape}")
                     # log_path = f"logs/rank_{rank}.pkl"
                     # os.makedirs("logs", exist_ok=True) 
                     # with open(log_path, "ab") as f:  # 'ab' = append binary
@@ -662,8 +692,10 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     #         "i": i,
                     #         "loss": float(loss),
                     #         "w_grad": gradients[1],
-                    #         "out_grad": gradients[0]
-                    #     }, f)
+                    #         "out_grad": gradients[0],
+                    #         "loss_grad": gradients[3],
+                    #         "batch_w_grad": gradients[4]
+                    #     }, f) 
 
                     epoch_loss.append(loss)
                     
@@ -679,18 +711,35 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     epoch_total += valid_y.shape[0]
                 else:
                     token, outputs, iterations, all_neuron_states, weight_grad = (predict_bwd)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token)
+                    # print(f"Rank{rank} i: {i}, w_grad: {weight_grad.shape}")
+                    # log_path = f"logs/rank_{rank}.pkl"
+                    # os.makedirs("logs", exist_ok=True) 
+                    # with open(log_path, "ab") as f:  # 'ab' = append binary
+                    #     pickle.dump({
+                    #         "rank": rank,
+                    #         "i": i,
+                    #         "w_grad": weight_grad
+                    #     }, f)
+
                 
-                token, weight_grad = gather_batch(token, weight_grad, average=False) # Gather the weight gradients from all ranks in the split rank
+                token, weight_grad = combine_batch(token, weight_grad, average=True) # Gather the weight gradients from all ranks in the split rank
+                # log_path = f"logs3/rank_{rank}.pkl"
+                # os.makedirs("logs", exist_ok=True) 
+                # with open(log_path, "ab") as f:  # 'ab' = append binary
+                #     pickle.dump({
+                #         "rank": rank,
+                #         "i": i,
+                #         "w_grad": weight_grad
+                #     }, f)
+                # print(f"Rank{rank} i: {i}, w_grad: {weight_grad.shape}")
                 # Update weights
-                weight_grad = jnp.reshape(weight_grad, (weights.shape[0], weights.shape[1]))
                 weights -= params.learning_rate * weight_grad #TODO use Adam AdamW
+                
             # Update threshold
             # threshold_grad, token = bcast(threshold_grad, root=size-1, comm=comm, token=token)
             # empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
             
             epoch_iterations.append(iterations)
-            # if i > 3:
-            #     break
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
@@ -757,11 +806,10 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
     if mode == "train":
         result_dir = os.path.join("network_results", "training")
         filename_header = f"{params.random_seed}" + f"_ep{params.num_epochs}" + f"_batch{params.batch_size}_"
-        last_iterations_mean = [float(mean[-1]) for mean in all_iteration_mean[1:]]
     elif mode == "inference":
         result_dir = os.path.join("network_results", "mnist")
         filename_header = f"{params.random_seed}" + f"_load{params.load_file}" + f"_batch{params.batch_size}_"
-        last_iterations_mean = [float(mean) for mean in all_iteration_mean[1:]]
+        all_iteration_mean = np.array(all_iteration_mean).flatten().tolist()
     else:
         print("Wrong mode for storing data choose 'train' or 'inference'. No data is saved")
         return          
@@ -817,7 +865,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         "batch_size": params.batch_size,
         "learning rate": params.learning_rate,
         "thresholds": threshold,
-        "iterations mean": last_iterations_mean,
+        "iterations mean": np.array(all_iteration_mean).tolist(),
         "restrict": params.restrict,
         "threshold impact": params.threshold_impact,
         "threshold lr": params.threshold_lr,
@@ -856,8 +904,6 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         # Plot activation values
         plt.figure(figsize=(8, 5))
         for i, layer_values in enumerate(all_iteration_mean):
-            if i==0:
-                continue
             plt.plot(epochs, layer_values, marker='o', label=f'Layer {i} (last: {layer_values[-1]:.1f})')
 
         plt.xlabel("Epoch")
@@ -944,7 +990,7 @@ def preprocess_data(data_generator):
     return iter(preprocessed)
 
 def gather_weights_and_iterations(weights, mean_iterations, token):
-    # Send all the weights to the last layer to store them
+    # Gather all the weights and iteration values at the last layer to store them
     leader_rank = split_rank * process_per_layer
 
     weights_dict = {}
@@ -959,11 +1005,13 @@ def gather_weights_and_iterations(weights, mean_iterations, token):
             
             iter_mean, token = recv(mean_iterations, source=i * process_per_layer, tag=5, comm=comm, token=token)
             all_iteration_mean.append(iter_mean)
+        all_iteration_mean.append(mean_iterations)  # Append the mean iterations of the last layer
         weights_dict[f"layer_{size-1}"] = weights.tolist()
-    
-    # Gather all the iterations values at the last layer
-    # all_iteration_mean, token = mpi4jax.gather(mean_iterations, root=size-1, comm=comm, token=token)
+        all_iteration_mean = all_iteration_mean[1:] # Don't keep the value of the input layer
+        print("all iteration mean: rank", rank, all_iteration_mean)
+        
     return weights_dict, all_iteration_mean
+
 
 # region Main 
 def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str="train", save=True, debug=True):        

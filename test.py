@@ -607,21 +607,47 @@ if __name__ == "__main__":
         return data
 
     # Load data
+    # data2 = load_pickle_objects("logs/rank_2.pkl")
+    # data4 = load_pickle_objects("logs/rank_4.pkl")
+    # data5 = load_pickle_objects("logs/rank_5.pkl")
+
+    # # Sanity check: Ensure equal lengths
+    # assert len(data2) == len(data4) == len(data5), "Pickle logs have different lengths."
+
+    # # Compare entry by entry
+    # for i, (entry2, entry4, entry5) in enumerate(zip(data2, data4, data5)):
+    #     avg_loss = (entry4["loss"] + entry5["loss"]) / 2
+    #     avg_w_grad = (jnp.array(entry4["w_grad"]) + jnp.array(entry5["w_grad"]))/2
+    #     avg_out_grad = jnp.concatenate([jnp.array(entry4["out_grad"]), jnp.array(entry5["out_grad"])], axis=0)
+    #     avg_loss_grad = jnp.concatenate([jnp.array(entry4["loss_grad"]), jnp.array(entry5["loss_grad"])], axis=0)
+    #     batch_w_grad = jnp.concatenate([jnp.array(entry4["batch_w_grad"]), jnp.array(entry5["batch_w_grad"])], axis=0)
+
+    #     diff_loss = entry2["loss"] - avg_loss
+    #     diff_w_grad = jnp.linalg.norm(jnp.array(entry2["w_grad"]) - avg_w_grad)
+    #     diff_out_grad = jnp.linalg.norm(jnp.array(entry2["out_grad"]) - avg_out_grad)
+    #     diff_loss_grad = jnp.linalg.norm(jnp.array(entry2["loss_grad"]) - avg_loss_grad)
+    #     diff_w_grad_batch = jnp.linalg.norm(jnp.array(entry2["batch_w_grad"]) - batch_w_grad)
+
+    #     print(f"[i={i}] Δloss: {diff_loss:.6f}, Δw_grad norm: {diff_w_grad}, Δout_grad norm: {diff_out_grad:.6f}, Δloss_grad norm:\n {diff_loss_grad}, Δw_grad_batch norm: {diff_w_grad_batch:.6f}")
+        
+    data1_all = load_pickle_objects("logs3/rank_1.pkl")
+    data2_all = load_pickle_objects("logs3/rank_2.pkl")
+    
     data2 = load_pickle_objects("logs/rank_2.pkl")
+    data3 = load_pickle_objects("logs/rank_3.pkl")
     data4 = load_pickle_objects("logs/rank_4.pkl")
     data5 = load_pickle_objects("logs/rank_5.pkl")
 
     # Sanity check: Ensure equal lengths
-    assert len(data2) == len(data4) == len(data5), "Pickle logs have different lengths."
+    # assert len(data1) == len(data2) == len(data3), "Pickle logs have different lengths."
 
     # Compare entry by entry
-    for i, (entry2, entry4, entry5) in enumerate(zip(data2, data4, data5)):
-        avg_loss = (entry4["loss"] + entry5["loss"]) / 2
-        avg_w_grad = (jnp.array(entry4["w_grad"]) + jnp.array(entry5["w_grad"])) / 2
-        avg_out_grad = (jnp.array(entry4["out_grad"]) + jnp.array(entry5["out_grad"])) / 2
+    for i, (entry1_all, entry2_all, entry2, entry3, entry4, entry5) in enumerate(zip(data1_all, data2_all, data2, data3, data4, data5)):
+        avg_w_grad = (jnp.array(entry2["w_grad"]) + jnp.array(entry3["w_grad"]))
 
-        diff_loss = entry2["loss"] - avg_loss
-        diff_w_grad = jnp.linalg.norm(jnp.array(entry2["w_grad"]) - avg_w_grad)
-        diff_out_grad = jnp.linalg.norm(jnp.array(entry2["out_grad"]) - avg_out_grad)
+        diff_w_grad1 = jnp.linalg.norm(jnp.array(entry1_all["w_grad"]) - jnp.array(entry2["w_grad"]))
+        diff_w_grad2 = jnp.linalg.norm(jnp.array(entry2_all["w_grad"]) - jnp.array(entry4["w_grad"]))
 
-        print(f"[i={i}] Δloss: {diff_loss:.6f}, Δw_grad norm: {diff_w_grad:.6f}, Δout_grad norm: {diff_out_grad:.6f}")
+        print(f"[i={i}] Δw_grad norm: {diff_w_grad1}, {diff_w_grad2}")
+    print(jnp.array(entry2_all["w_grad"])[25:32])
+    print(jnp.array(entry5["w_grad"])[25:32])
