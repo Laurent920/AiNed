@@ -1193,14 +1193,14 @@ if __name__ == "__main__":
     key = jax.random.key(random_seed)
     # Network structure and parameters
     layer_sizes = (28*28, 128, 64, 10)
-    layer_sizes = (28*28, 128, 10)
+    # layer_sizes = (28*28, 128, 10)
     # layer_sizes = (28*28, 64, 10)
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = False
+    load_file = True
     thresholds = (0, 0 ,0)  
-    batch_size = 36
+    batch_size = 64
     shuffle = False
     
     if size % len(layer_sizes) != 0:
@@ -1285,5 +1285,5 @@ if __name__ == "__main__":
         #     all_time += ex_time
         # print("average execution time : {}", all_time/t)
 
-        # batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
-        train(token, params, key, weights, empty_neuron_states)
+        batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
+        # train(token, params, key, weights, empty_neuron_states)
