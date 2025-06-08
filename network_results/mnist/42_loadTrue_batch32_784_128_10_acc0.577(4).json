@@ -1,5 +1,9 @@
 {
+<<<<<<< HEAD
     "time": 60.59059953689575,
+=======
+    "time": 76.75341510772705,
+>>>>>>> 9ffa323 (4 layers data)
     "loadfile": true,
     "shuffle data": false,
     "shuffle input": false,
@@ -11,7 +15,11 @@
         -1
     ],
     "validation accuracy": [
+<<<<<<< HEAD
         0.5772276520729065
+=======
+        0.5772757530212402
+>>>>>>> 9ffa323 (4 layers data)
     ],
     "test accuracy": -1.0,
     "layer_sizes": [

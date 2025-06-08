@@ -1,14 +1,26 @@
 {
+<<<<<<< HEAD
     "time": 170.4847195148468,
+=======
+    "time": 305.1105558872223,
+>>>>>>> 9ffa323 (4 layers data)
     "loadfile": true,
     "shuffle data": false,
     "shuffle input": false,
     "rerun": "",
+<<<<<<< HEAD
     "processes": 6,
     "firing number": 128,
     "synchronization rate": 1,
     "training accuracy": [
         0.5821078419685364
+=======
+    "processes": 3,
+    "firing number": 128,
+    "synchronization rate": 1,
+    "training accuracy": [
+        0.5820556879043579
+>>>>>>> 9ffa323 (4 layers data)
     ],
     "validation accuracy": [
         -1
@@ -23,7 +35,12 @@
     "learning rate": 0.01,
     "thresholds": 0.0,
     "iterations mean": [
+<<<<<<< HEAD
         149.6048126220703
+=======
+        149.60476684570312,
+        872.9905395507812
+>>>>>>> 9ffa323 (4 layers data)
     ],
     "restrict": -1,
     "threshold impact": 0,
@@ -109814,7 +109831,11 @@
                 0.030684396624565125
             ]
         ],
+<<<<<<< HEAD
         "layer_5": [
+=======
+        "layer_2": [
+>>>>>>> 9ffa323 (4 layers data)
             [
                 -0.032832320779561996,
                 -0.02804308757185936,
