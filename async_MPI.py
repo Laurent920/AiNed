@@ -445,17 +445,19 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     '''
     token, all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, token, batch_data)
     next_grad, token = recv(jnp.zeros((batch_part, layer_sizes[split_rank])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
+    # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_grad)
     
     # "input activity": Shape (B, 784, 1), "values": Shape (B, 784, 128)
     weight_res = jax.vmap(process_single_batch, in_axes=(0, 0))(all_neuron_states.weight_residuals["input activity"], all_neuron_states.weight_residuals['values']) # Shape: (B, 784, 128)
     # weight_res = weight_res["values"] # incorrect residual but faster for testing
     
-    next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank], params.layer_sizes[split_rank+1]))
+    next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank], params.layer_sizes[split_rank+1])) # Shape: (B, 128, 10)
     # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
-    (next_weight_res, token) = jax.lax.cond(split_rank < last_rank - 2, 
+    (next_weight_res, token) = jax.lax.cond(split_rank < last_rank - 1, 
                                    lambda _: recv(next_weight_res, source=rank + process_per_layer, tag=3, comm=comm),
                                    lambda _: (next_weight_res, token), None) 
-    
+    # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_weight_res)
+
     # weight_res = jax.lax.cond(split_rank < last_rank - 2,
     #                             lambda args: jax.vmap(recompute_w_residuals, in_axes=(0, 0))(args[0], args[1]), # Shape: (B, 784, 128)
     #                             lambda _: weight_res,
@@ -480,12 +482,14 @@ def predict_bwd(params, key, batch_data, weights, empty_neuron_states, token):
     # jax.debug.print("z_grad {}, {}", z_grad.shape, z_grad)
     # jax.debug.print("weight_grad {}, mean_weight_grad{}", weight_grad.shape, mean_weight_grad.shape)
     
-    # send_grad = jnp.mean(weights @ next_grad.T, axis=1) 
     if split_rank > 1:
-        send_grad = jnp.mean(weights @ next_grad.T, axis=1) # Shape: (784)
+        tmp_send_grad = weights @ next_grad.T # Shape: (784, B)
+        send_grad = jnp.reshape(tmp_send_grad, (batch_part, tmp_send_grad.shape[0])) # Shape: (B, 784)
+        # send_grad = jnp.ones((batch_part, params.layer_sizes[split_rank-1])) 
+
         token = send(send_grad, dest=rank-process_per_layer, tag=2,comm=comm, token=token)
         token = send(weight_res, dest=rank-process_per_layer, tag=3,comm=comm, token=token)
-        
+
     return token, all_outputs, iterations, all_neuron_states, weight_grad 
 
 # Define the loss function
@@ -618,7 +622,7 @@ def gather_batch(token, data, average=True):
 
 def combine_batch(token, data, average=False):
     '''
-    Gather all the data from one split_rank onto one rank by concatenating the batches and resharing the average result to the corresonding split_ranks
+    Concatenate all the data from one split_rank onto one rank to reconstruct the batch and resharing the combined result to the corresonding split_ranks
     '''
     data = jnp.array(data)
     
@@ -694,6 +698,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
             neuron_states = empty_neuron_states
             threshold_grad = 0.0
             if split_rank == 0:
+                print(i)
                 token, batch_x, batch_y = split_batch(token, batch_iterator)
                 if jnp.isnan(batch_x).any():
                     jax.debug.print("Rank {}: i {}, NaN detected in batch_x: {}, batch_y: {}", rank, i, jnp.sum(jnp.isnan(batch_x)), jnp.sum(jnp.isnan(batch_y)))
@@ -722,12 +727,16 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                     epoch_total += valid_y.shape[0]
                 else:
                     token, outputs, iterations, all_neuron_states, weight_grad = (predict_bwd)(params, subkey, jnp.zeros((batch_part, layer_sizes[0])), weights, neuron_states, token)
+                    # print(f"Rank {rank} finished predict_bwd for batch {i}, outputs shape: {outputs.shape}, iterations: {iterations.shape}, weight_grad shape: {weight_grad.shape}")
+                    
                     if jnp.isnan(weight_grad).any():
                         numnans = jnp.sum(jnp.isnan(weight_grad))
                         print(f"Rank {rank} encountered NaN in weight_grad at epoch {epoch}, batch {i}, number nans: {numnans}. Skipping update.")
 
-                                
+                # print(f"Rank {rank} before combine_batch")
                 token, weight_grad = combine_batch(token, weight_grad, average=True) # Gather the weight gradients from all ranks in the split rank
+                # print(f"Rank {rank} after combine_batch")
+                
                 if jnp.isnan(weight_grad).any():
                     numnans = jnp.sum(jnp.isnan(weight_grad))
                     print(f"Rank {rank} encountered NaN in weight_grad at epoch {epoch}, batch {i}, number nans: {numnans}. Skipping update.")
@@ -743,6 +752,7 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                 # print(f"Rank{rank} i: {i}, w_grad: {weight_grad.shape}")
                 # Update weights
                 weights -= params.learning_rate * weight_grad #TODO use Adam AdamW
+
             # Update threshold
             # threshold_grad, token = bcast(threshold_grad, root=size-1, comm=comm, token=token)
             # empty_neuron_states.threshold -= threshold_grad * params.threshold_lr 
@@ -1198,9 +1208,9 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = True
+    load_file = False
     thresholds = (0, 0 ,0)  
-    batch_size = 64
+    batch_size = 36
     shuffle = False
     
     if size % len(layer_sizes) != 0:
@@ -1242,7 +1252,7 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             thresholds=thresholds, 
-            num_epochs=60, 
+            num_epochs=2, 
             learning_rate=0.01, 
             batch_size=batch_size,
             load_file=load_file,
@@ -1285,5 +1295,5 @@ if __name__ == "__main__":
         #     all_time += ex_time
         # print("average execution time : {}", all_time/t)
 
-        batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
-        # train(token, params, key, weights, empty_neuron_states)
+        # batch_predict(params, key, token, weights, empty_neuron_states, "train", save=True, debug=True)
+        train(token, params, key, weights, empty_neuron_states)
