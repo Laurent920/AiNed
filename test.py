@@ -643,11 +643,17 @@ if __name__ == "__main__":
 
     # Compare entry by entry
     for i, (entry1_all, entry2_all, entry2, entry3, entry4, entry5) in enumerate(zip(data1_all, data2_all, data2, data3, data4, data5)):
-        avg_w_grad = (jnp.array(entry2["w_grad"]) + jnp.array(entry3["w_grad"]))
-
-        diff_w_grad1 = jnp.linalg.norm(jnp.array(entry1_all["w_grad"]) - jnp.array(entry2["w_grad"]))
-        diff_w_grad2 = jnp.linalg.norm(jnp.array(entry2_all["w_grad"]) - jnp.array(entry4["w_grad"]))
+        diff_w_grad1 = jnp.linalg.norm(jnp.array(entry1_all["w_grad"]) - jnp.array(entry1_all["w_grad"]))
+        diff_w_grad2 = jnp.linalg.norm(jnp.array(entry2_all["w_grad"]) - jnp.array(entry5["w_grad"]))
 
         print(f"[i={i}] Δw_grad norm: {diff_w_grad1}, {diff_w_grad2}")
-    print(jnp.array(entry2_all["w_grad"])[25:32])
-    print(jnp.array(entry5["w_grad"])[25:32])
+    # print(jnp.array(entry2_all["w_grad"])[25:32])
+    # print(jnp.array(entry5["w_grad"])[25:32])
+    has_nan2 = jnp.isnan(jnp.array(data2[-1]["w_grad"]))
+    has_nan3 = jnp.isnan(jnp.array(data3[-1]["w_grad"]))
+
+    # Count how many NaNs
+    num_nans2 = jnp.sum(has_nan2)
+    num_nans3 = jnp.sum(has_nan3)
+    
+    print(f"Δw_grad norm: {jnp.array(data2[-1]["w_grad"]).shape}, {jnp.array(data2[-1]["w_grad"]).shape}, has_nan2: {num_nans2}, has_nan3: {num_nans3}")
