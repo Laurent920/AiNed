@@ -235,7 +235,7 @@ if __name__ == "__main__":
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
 
         # Define neural network
-        layer_dims = (784, 128, 10)
+        layer_dims = (784, 128, 64, 10)
         network = network_helper.MLP(layer_dims)
         
         filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
