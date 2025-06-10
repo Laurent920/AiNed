@@ -1,6 +1,14 @@
 # pip install -U jax
-matplotlib==3.10.1
-numpy==2.2.3
+absl==0.0
+jax==0.5.2
+matplotlib==3.10.3
+mpi4jax==0.7.1
+mpi4py==4.0.3
+numpy==2.3.0
+optax==0.2.4
+pandas==2.3.0
+Pillow==11.2.1
+scikit_learn==1.7.0
 torch==2.6.0
 torchvision==0.21.0
 tree_math==0.2.1

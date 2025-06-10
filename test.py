@@ -596,6 +596,17 @@ if __name__ == "__main__":
     # ______________________________________________________________________________________________________________________________________
     # Comparing multi-process gradients
     
+    # To use in training:  
+    # log_path = f"logs/rank_{rank}.pkl"
+    # os.makedirs("logs", exist_ok=True) 
+    # with open(log_path, "ab") as f:  # 'ab' = append binary
+    #     pickle.dump({
+    #         "rank": rank,
+    #         "i": i,
+    #         "w_grad": weights
+    #     }, f)
+    # print(f"Rank{rank} i: {i}, w_grad: {weight_grad.shape}")
+    
     def load_pickle_objects(path):
         data = []
         with open(path, "rb") as f:
