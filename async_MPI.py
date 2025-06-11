@@ -175,6 +175,7 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
     def hidden_layer_case(_):
         fire = (iteration-neuron_states.last_sent_iteration) >= params.sync_rate 
         fire = jnp.logical_or(fire, neuron_idx < 0) # fire if sync rate reached or last input received
+        # jax.debug.print("Rank {}, neuron idx: {}, fire: {}, iteration: {}, last sent iteration: {}", rank, neuron_idx, fire, iteration, neuron_states.last_sent_iteration)
 
         # APPLY THE SYNC RATE  
         activated_output = jax.lax.cond(fire, 
@@ -201,11 +202,21 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
         
         new_layer_activities = layer_activity + active_indexes # Update the layer activity by adding the active neurons
 
-        new_input_activities = neuron_states.weight_residuals["input order"].at[neuron_idx].set(iteration) # Update the input activity by setting the input neuron to the iteration number        
+        last_neuron_idx = jnp.argmax(neuron_states.weight_residuals["input order"]) # Last neuron index in the input order
+        # jax.lax.cond(neuron_idx == -1,
+        #              lambda _: jax.debug.print("{}, iteration: {}, neuron idx: {}", neuron_idx, iteration, last_neuron_idx),
+        #              lambda _: None,
+        #              None)
+        new_neuron_idx = jax.lax.cond(neuron_idx == -1,
+                     lambda _: last_neuron_idx, 
+                     lambda _: neuron_idx,
+                     None)
+        
+        new_input_activities = neuron_states.weight_residuals["input order"].at[new_neuron_idx].set(iteration) # Update the input activity by setting the input neuron to the iteration number        
         
         # jax.debug.print("{} {}", active_indexes.shape, new_input_activities.shape)
         # new_values = update_new_values(neuron_states.weight_residuals["output activity"], active_indexes, new_input_activities) # Update input activity before updating the values
-        new_output_activity = neuron_states.weight_residuals["output activity"].at[neuron_idx].add(active_indexes)
+        new_output_activity = neuron_states.weight_residuals["output activity"].at[new_neuron_idx].add(active_indexes)
         
         jax.lax.cond(neuron_idx == -2,
                      lambda _: jax.debug.print("{}, iteration: {}, neuron idx: {}", layer_input, iteration, neuron_idx),
@@ -226,7 +237,7 @@ def layer_computation(neuron_idx, layer_input, weights, neuron_states, params, i
                                           last_sent_iteration=new_last_sent_iteration)
         return active_output, new_neuron_states
     
-    cond = jnp.logical_or(split_rank == last_rank, neuron_idx < 0)
+    cond = split_rank == last_rank #jnp.logical_or(split_rank == last_rank, neuron_idx < 0)
     return jax.lax.cond(cond, last_layer_case, hidden_layer_case, None)
 
 @partial(jax.jit, static_argnames=['params'])
@@ -1214,7 +1225,7 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = True
+    load_file = False
     init_thresholds = 0
     batch_size = 36
     shuffle = False
@@ -1258,14 +1269,14 @@ if __name__ == "__main__":
             random_seed=random_seed,
             layer_sizes=layer_sizes, 
             init_thresholds=init_thresholds, 
-            num_epochs=20, 
+            num_epochs=1, 
             learning_rate=0.001, 
             batch_size=batch_size,
             load_file=load_file,
             shuffle=shuffle,
             restrict=-1,
             firing_nb=128,
-            sync_rate=1,
+            sync_rate=784,
             max_nonzero=max_nonzero,
             shuffle_input=False,
             threshold_lr=0,#1e-3,
