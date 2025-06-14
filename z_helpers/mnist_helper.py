@@ -227,7 +227,7 @@ if __name__ == "__main__":
             break
         # torch_train(training_generator, train, test, params)
     else:    
-        batch_size = 64
+        batch_size = 36
 
         (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_loader_manual(batch_size, shuffle=False)
 
@@ -242,13 +242,27 @@ if __name__ == "__main__":
         output_dir = "tensor_data"
         os.makedirs(output_dir, exist_ok=True)
 
+        reload = False
+        if reload:
+            filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
+            output_dir = "tensor_data"
+            file_path = os.path.join(output_dir, f"{filename}.npz")
+
+            # Load the saved tensors
+            loaded = np.load(file_path)
+
+            # Copy them back to the model
+            for param_tensor, loaded_array in zip(network.param, loaded.values()):
+                param_tensor.data[:] = loaded_array
+
         # Define optimizer
         optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
         # Define loss function
         loss_func = network_helper.SoftmaxCrossEntropy()
 
-        epoch_num = 40
+        epoch_num = 1
         start_time = time.time()
+        train_accuracy_list, val_accuracy_list = [], []
         train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
         end_time = time.time()
         
@@ -257,7 +271,7 @@ if __name__ == "__main__":
         
         execution_time = end_time - start_time
         print(f"Execution Time: {execution_time:.6f} seconds")
-        
+        print(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
         plt.figure(figsize=(8, 5))
         epochs = [i + 1 for i in range(epoch_num)]
 
@@ -269,15 +283,16 @@ if __name__ == "__main__":
         plt.title(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
         plt.legend()
         plt.grid(True)
+        
+        if not reload:
+            plt.savefig(os.path.join(output_dir, f"{filename}.png"))
 
-        plt.savefig(os.path.join(output_dir, f"{filename}.png"))
+            print(network.param[0].data.shape)
+
+            # Save parameters to .npz in the same folder
+            tensor_data = [tensor.data for tensor in network.param]
+            np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
         plt.close()
 
-        print(network.param[0].data.shape)
-
-        # Save parameters to .npz in the same folder
-        tensor_data = [tensor.data for tensor in network.param]
-        np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
-        
         data = np.load(os.path.join(output_dir, f"{filename}.npz"))
-        print(data)
+        print("Filename: {}", data)

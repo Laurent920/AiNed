@@ -484,9 +484,11 @@ class SGDOptimizer:
         for param in self.parameters:
             # Check if the parameter and its gradient dimensions require summing (i.e. Bias)
             if param.data.shape[0] == 1 and param.grad.shape[0] > 1:
+                print(f"Sum grad : {np.mean(np.sum(param.grad, axis=0, keepdims=True))}")
                 # Apply the learning rate and update the parameter for broadcast compatibility
                 param.data -= self.lr * np.sum(param.grad, axis=0, keepdims=True)
             else:
+                print(f"Regular update param :, mean : {np.mean(param.grad)}, max= {np.max(param.grad)}, min= {np.min(param.grad)}")
                 # Standard parameter update
                 param.data -= self.lr * param.grad  # Update parameter based on its gradient
 
@@ -639,6 +641,7 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
         network.reset_activations()
 
         for x, y in train_dataloader:
+            print(i)
             # print(f"x shape: {x.shape}")
             output = network.forward(Tensor(x))
 
