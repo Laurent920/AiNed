@@ -235,7 +235,7 @@ if __name__ == "__main__":
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
 
         # Define neural network
-        layer_dims = (784, 128, 64, 10)
+        layer_dims = (784, 128, 64, 32, 10)
         network = network_helper.MLP(layer_dims)
         
         filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
@@ -260,7 +260,7 @@ if __name__ == "__main__":
         # Define loss function
         loss_func = network_helper.SoftmaxCrossEntropy()
 
-        epoch_num = 1
+        epoch_num = 40
         start_time = time.time()
         train_accuracy_list, val_accuracy_list = [], []
         train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
