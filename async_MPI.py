@@ -602,13 +602,19 @@ def get_ordered_history(weight_residuals):
     return jax.vmap(reorder_single)(history, index)
 
 def process_history(values_history, target_labels):
+    '''
+    values_history: (B, T, 10)
+    target_labels: (B)
+    
+    return (T), (T)
+    '''
     def preprocess_history(values_history, target_labels):
         def get_all_max(single_values_history, targets):
             return jax.vmap(lambda v, t: jnp.argmax(v) == t, in_axes=(0, None))(single_values_history, targets)
         
         def get_target_rank(single_values_history, targets):
             def single_history(history, single_target):
-                return jnp.sum(history > history[single_target]) + 1
+                return jnp.sum(history > history[(single_target.astype(int))]) + 1
             return jax.vmap(single_history, in_axes=(0, None))(single_values_history, targets)
         
         # Get the output prediction of all stored steps
@@ -805,10 +811,11 @@ def train(token, params: Params, key, weights, empty_neuron_states):
                             weights_dict,
                             all_loss, 
                             threshold,
-                            all_history)
+                            all_history,
+                            total_train_batches)
         
 # region SAVE DATA
-def store_training_data(params, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, threshold, all_history):    
+def store_training_data(params, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, threshold, all_history, total_batches):    
     # Choose the saving folder
     if mode == "train":
         result_dir = os.path.join("network_results", "training")
@@ -856,7 +863,7 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
                 break        
                     
     # Output history analysis
-    store_history(jnp.array(all_history), result_path)
+    store_history(jnp.array(all_history), result_path, total_batches)
     
     # Store the results
     threshold =  np.array(threshold).tolist()
@@ -926,10 +933,11 @@ def store_training_data(params, mode, all_epoch_accuracies, all_validation_accur
         plt.savefig(result_path + "_activations.png") 
         plt.close()
 
-def store_history(all_history, result_path):
+def store_history(all_history, result_path, total_batches):
     all_history = all_history.transpose(1, 0, 2)
+    print(all_history.shape)
 
-    def flatten_history(history, batch_number=total_train_batches):
+    def flatten_history(history, batch_number):
         # shape (epoch * num_batches, 100) -> (epoch, num_batches, 100)
         T, H = history.shape # T: total iterations, H: history size
         
@@ -939,7 +947,7 @@ def store_history(all_history, result_path):
         return history.reshape(E, batch_number, H) # (E, batch_number, H)
     
     flat_history = jnp.stack([
-                    flatten_history(arr_slice, total_train_batches)
+                    flatten_history(arr_slice, total_batches)
                     for arr_slice in all_history  # arr is shape (2, T, H)
                     ])
     print(f"Flattened shape: {flat_history[0].shape}, {flat_history[1].shape}")
@@ -1096,7 +1104,7 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
     if rank == size-1:
         epoch_correct = 0
         epoch_total = 0
-            
+        all_history = []
     epoch_iterations = []
     
     for i in range(total_batches):
@@ -1127,6 +1135,16 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
                 
                 epoch_correct += batch_correct
                 epoch_total += valid_y.shape[0]
+                
+                # Ensure values_history is a JAX array with shape [T, num_classes]
+                values_history = get_ordered_history(all_neuron_states.weight_residuals)
+
+                # One-hot target → scalar class index
+                history = process_history(values_history, y)
+                all_history.append(history)
+                # print(f"history acc: {history[0].shape}, avg rank: {history[1].shape}, all history: {len(all_history)}")
+                
+                
         epoch_iterations.append(iterations)
         # jax.debug.print("Rank {}, iterations: {}", rank, iterations)
         # break
@@ -1171,7 +1189,10 @@ def batch_predict(params, key, token, weights, empty_neuron_states, dataset:str=
                                 execution_time,
                                 all_iteration_mean,
                                 weights_dict,
-                                [])
+                                [],
+                                [],
+                                all_history,
+                                total_batches)
     return epoch_accuracy, mean, end_time - start_time
     
 if __name__ == "__main__":
@@ -1184,7 +1205,7 @@ if __name__ == "__main__":
     best = False
     # layer_sizes = [4, 5, 3]
      
-    load_file = False
+    load_file = True
     thresholds = (0, 0 ,0)  
     batch_size = 32
     shuffle = False
@@ -1253,5 +1274,5 @@ if __name__ == "__main__":
         #     all_time += ex_time
         # print("average execution time : {}", all_time/t)
         
-        # batch_predict(params, key, token, weights, empty_neuron_states, "val", save=True, debug=True)
-        train(token, params, key, weights, empty_neuron_states)
+        batch_predict(params, key, token, weights, empty_neuron_states, "val", save=True, debug=True)
+        # train(token, params, key, weights, empty_neuron_states)
