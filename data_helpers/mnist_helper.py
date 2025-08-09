@@ -235,64 +235,89 @@ if __name__ == "__main__":
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
 
         # Define neural network
-        layer_dims = (784, 512, 256, 128, 64, 32, 16, 10)
-        network = network_helper.MLP(layer_dims)
+        # layer_dims = (784, 128, 10)
+        layer_size = []
         
-        filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
-        output_dir = "tensor_data"
-        os.makedirs(output_dir, exist_ok=True)
+        layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
+        layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
+        layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
+        # layer_size.append((28*28, 32, 32, 32, 32, 32, 10))
+        # layer_size.append((28*28, 32, 32, 32, 32, 10))
+        # layer_size.append((28*28, 32, 32, 32, 10))
+        # layer_size.append((28*28, 32, 32, 10))
+        # layer_size.append((28*28, 32, 10))
+        # layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 10))
+        # layer_size.append((28*28, 64, 64, 64, 64, 64, 10))
+        # layer_size.append((28*28, 64, 64, 64, 64,10))
+        # layer_size.append((28*28, 64, 64, 64, 10))
+        # layer_size.append((28*28, 64, 64, 10))
+        # layer_size.append((28*28, 64, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128,10))
+        # layer_size.append((28*28, 128, 128, 128, 10))
+        # layer_size.append((28*28, 128, 128, 10))
 
-        reload = False
-        if reload:
+        for layer_dims in layer_size:
+            print(f"running {layer_dims}")
+            network = network_helper.MLP(layer_dims)
+            
             filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
             output_dir = "tensor_data"
-            file_path = os.path.join(output_dir, f"{filename}.npz")
+            os.makedirs(output_dir, exist_ok=True)
 
-            # Load the saved tensors
-            loaded = np.load(file_path)
+            reload = False
+            if reload:
+                filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
+                output_dir = "tensor_data"
+                file_path = os.path.join(output_dir, f"{filename}.npz")
 
-            # Copy them back to the model
-            for param_tensor, loaded_array in zip(network.param, loaded.values()):
-                param_tensor.data[:] = loaded_array
+                # Load the saved tensors
+                loaded = np.load(file_path)
 
-        # Define optimizer
-        optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
-        # Define loss function
-        loss_func = network_helper.SoftmaxCrossEntropy()
+                # Copy them back to the model
+                for param_tensor, loaded_array in zip(network.param, loaded.values()):
+                    param_tensor.data[:] = loaded_array
 
-        epoch_num = 40
-        start_time = time.time()
-        train_accuracy_list, val_accuracy_list = [], []
-        train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
-        end_time = time.time()
-        
-        test_acc, _, _ = network_helper.validation_func(network, test_generator)
-        
-        
-        execution_time = end_time - start_time
-        print(f"Execution Time: {execution_time:.6f} seconds")
-        print(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
-        plt.figure(figsize=(8, 5))
-        epochs = [i + 1 for i in range(epoch_num)]
+            # Define optimizer
+            optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
+            # Define loss function
+            loss_func = network_helper.SoftmaxCrossEntropy()
 
-        plt.plot(epochs, train_accuracy_list, 'o-', label='Training Accuracy')
-        plt.plot(epochs, val_accuracy_list, 's-', label='Validation Accuracy')
+            epoch_num = 40
+            start_time = time.time()
+            train_accuracy_list, val_accuracy_list = [], []
+            train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
+            end_time = time.time()
+            
+            test_acc, _, _ = network_helper.validation_func(network, test_generator)
+            
+            
+            execution_time = end_time - start_time
+            print(f"Execution Time: {execution_time:.6f} seconds")
+            print(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
+            plt.figure(figsize=(8, 5))
+            epochs = [i + 1 for i in range(epoch_num)]
 
-        plt.xlabel('Epoch')
-        plt.ylabel('Accuracy')
-        plt.title(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
-        plt.legend()
-        plt.grid(True)
-        
-        if not reload:
-            plt.savefig(os.path.join(output_dir, f"{filename}.png"))
+            plt.plot(epochs, train_accuracy_list, 'o-', label='Training Accuracy')
+            plt.plot(epochs, val_accuracy_list, 's-', label='Validation Accuracy')
 
-            print(network.param[0].data.shape)
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.title(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
+            plt.legend()
+            plt.grid(True)
+            
+            if not reload:
+                plt.savefig(os.path.join(output_dir, f"{filename}.png"))
 
-            # Save parameters to .npz in the same folder
-            tensor_data = [tensor.data for tensor in network.param]
-            np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
-        plt.close()
+                print(network.param[0].data.shape)
 
-        data = np.load(os.path.join(output_dir, f"{filename}.npz"))
-        print("Filename: {}", data)
+                # Save parameters to .npz in the same folder
+                tensor_data = [tensor.data for tensor in network.param]
+                np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
+            plt.close()
+
+            # data = np.load(os.path.join(output_dir, f"{filename}.npz"))
+            # print("Filename: {}", data)

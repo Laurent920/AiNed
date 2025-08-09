@@ -635,8 +635,8 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
     epoch_act_means = []         # list of list: epoch‑>layer‑>mean‑frac‑active
     epoch_act_totals  = []             # epochs × n_layers  – active counts
     epoch_neuron_tot  = []  
-    
     for epoch in range(epoch_num):
+        # print(epoch)        
         i = 0
         network.reset_activations()
 
