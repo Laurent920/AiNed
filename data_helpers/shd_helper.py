@@ -85,7 +85,7 @@ if __name__ == '__main__':
     max_length = 0
     for batch in batch_iterator:
         data, labels = batch
-        print(data.shape, (data[0][-1]), (labels))
+        print(data.shape, (data[0][0]), (labels))
     
         for d in data:
             # last_el = d[:, -2:]
