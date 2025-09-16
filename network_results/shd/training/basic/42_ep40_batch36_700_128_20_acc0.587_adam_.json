@@ -13,7 +13,7 @@
         0,
         0
     ],
-    "threshold impact": 0.0,
+    "sparsity impact": 0.0,
     "threshold lr": 0.0,
     "test accuracy": 0.5871333479881287,
     "layer_sizes": [

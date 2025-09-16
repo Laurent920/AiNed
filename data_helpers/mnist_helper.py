@@ -117,7 +117,8 @@ def torch_mnist_loader(batch_size=1, n_targets=10):
     test_labels = one_hot(np.array(mnist_dataset_test.test_labels), n_targets)
     
     return training_generator, (train_images, train_labels), (test_images, test_labels), total_batches
-    
+
+
 def torch_train(training_generator, train, test, params):
     train_images, train_labels = train
     test_images, test_labels = test    
@@ -158,29 +159,53 @@ def average_active_inputs(train_dataloader):
     return total_active_features / total_samples
 
 #region MANUAL LOADER
-def torch_mnist_loader_manual(batch_size, shuffle=True):
+def torch_mnist_loader_manual(batch_size, shuffle=True, preprocess=True, cache_dir='./cache/mnist'):
+    max_nonzero = 351
     dataset_folder = "data/mnist/"
-    mnist_data = pd.read_csv(dataset_folder + 'mnist_train.csv')
-    # Extract the image data from the data
-    mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
-    # Extract the labels from the data
-    mnist_data_y = mnist_data.iloc[:, 0].values
-    
-    train_indices, val_indices = network_helper.train_validate_split(mnist_data_y, val_ratio=0.2, shuffle=shuffle)
+    os.makedirs(cache_dir, exist_ok=True)
 
+    train_cache_path = os.path.join(cache_dir, 'train.npz')
+    test_cache_path  = os.path.join(cache_dir, 'test.npz')
+
+    if preprocess and os.path.exists(train_cache_path):
+        print("Loading cached MNIST dataset")
+        data = np.load(train_cache_path)
+        mnist_data_x = data['x']
+        mnist_data_y = data['y']
+
+        data = np.load(test_cache_path)
+        mnist_data_x_test = data['x']
+        mnist_data_y_test = data['y']
+    else:
+        # Read all MNIST training data from the file
+        mnist_data = pd.read_csv(dataset_folder + 'mnist_train.csv')
+        mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
+        mnist_data_y = mnist_data.iloc[:, 0].values
+        
+        # Read all MNIST test data from the file
+        mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv')
+        mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
+        mnist_data_y_test = mnist_data.iloc[:, 0].values
+
+        if preprocess:
+            print('Preprocessing MNIST dataset')
+            mnist_data_x = preprocess_dataset(mnist_data_x, max_nonzero)
+            mnist_data_x_test = preprocess_dataset(mnist_data_x_test, max_nonzero)
+
+            # Save cached dataset
+            np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
+            np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
+    
+    # print(mnist_data_x[0], mnist_data_x.shape, mnist_data_x[0].shape)
+    
     # Define training set dataloader object
+    train_indices, val_indices = network_helper.train_validate_split(mnist_data_y, val_ratio=0.2, shuffle=shuffle)
     train_dataloader = network_helper.DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=shuffle)    
     val_dataloader = network_helper.DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=shuffle)
     
-    # Read all MNIST training data from the file
-    mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv')
-    # Extract the image data from the data
-    mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
-    # Extract the labels from the data
-    mnist_data_y_test = mnist_data.iloc[:, 0].values
-    test_indices, _ = network_helper.train_validate_split(mnist_data_y_test, val_ratio=0, shuffle=shuffle)
 
-    # Define training set dataloader object
+    # Define test set dataloader object
+    test_indices, _ = network_helper.train_validate_split(mnist_data_y_test, val_ratio=0, shuffle=shuffle)
     test_dataloader = network_helper.DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
     
     # Calculate total batches for train, val, test data
@@ -194,17 +219,42 @@ def torch_mnist_loader_manual(batch_size, shuffle=True):
     # val_dataloader = network_helper.InfiniteDataLoader(val_dataloader)
     # test_dataloader = network_helper.InfiniteDataLoader(test_dataloader)
     
-    # Compute the maximum of non-zero elements in the input data
-    max_nonzero = 0
-    for dataset in [train_dataloader, val_dataloader, test_dataloader]:
-        for x, _ in iter(dataset):
-            non_zeros = np.array([np.count_nonzero(row) for row in x])
-            n_nonzeros = max(non_zeros)
-            max_nonzero = max(n_nonzeros, max_nonzero)
-
-    print(max_nonzero)
-
+    # !!! WITHOUT PREPROCESSING !!! Compute the maximum of non-zero elements in the input data 
+    # max_nonzero = 0
+    # for dataset in [train_dataloader, val_dataloader, test_dataloader]:
+    #     for x, _ in iter(dataset):
+    #         non_zeros = np.array([np.count_nonzero(row) for row in x])
+    #         n_nonzeros = max(non_zeros)
+    #         max_nonzero = max(n_nonzeros, max_nonzero)
+    
     return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (test_dataloader, total_test_batches), max_nonzero
+
+def torch_mnist_loader_preprocessed_np(x, max_nonzero):
+    """
+    Preprocess a single MNIST sample (1D vector).
+    Stores (index, value) for non-zero pixels up to max_nonzero.
+    """
+    processed_data = np.full((max_nonzero, 2), -2.0, dtype=np.float32)
+    j = 0
+    for i, val in enumerate(x):
+        if val != 0:
+            processed_data[j] = [i, val]
+            j += 1
+            if j >= max_nonzero:  # stop if full
+                break
+    return processed_data
+
+def preprocess_dataset(dataset_x, max_nonzero):
+    """
+    Apply preprocessing to the whole dataset.
+    dataset_x: shape (N, 784)
+    Returns: shape (N, max_nonzero, 2)
+    """
+    N = dataset_x.shape[0]
+    processed_dataset = np.zeros((N, max_nonzero, 2), dtype=np.float32)
+    for n in range(N):
+        processed_dataset[n] = torch_mnist_loader_preprocessed_np(dataset_x[n], max_nonzero)
+    return processed_dataset
 
 if __name__ == "__main__":
     torch_load = False
@@ -228,8 +278,14 @@ if __name__ == "__main__":
         # torch_train(training_generator, train, test, params)
     else:    
         batch_size = 36
+        # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
+        
+        # d = iter(test_generator)
+        # for _, _ in iter(training_generator):
+        #     batchx, batchy = next(d)
+        #     print(jnp.array(batchx).shape)
 
-        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_mnist_loader_manual(batch_size, shuffle=False)
+        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_mnist_loader_manual(batch_size, shuffle=False, preprocess=False)
 
         avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
@@ -238,9 +294,9 @@ if __name__ == "__main__":
         # layer_dims = (784, 128, 10)
         layer_size = []
         
-        layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
-        layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
-        layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
+        # layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 10))
@@ -253,12 +309,13 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 64, 64, 64, 10))
         # layer_size.append((28*28, 64, 64, 10))
         # layer_size.append((28*28, 64, 10))
-        # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 10))
-        # layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
+        layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 10))
+        layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
-        # layer_size.append((28*28, 128, 128, 10))
-
+        # layer_size.append((28*28, 128, 10))
+        layer_size.append((28*28, 128, 128, 10))
+        
         for layer_dims in layer_size:
             print(f"running {layer_dims}")
             network = network_helper.MLP(layer_dims)
@@ -285,17 +342,20 @@ if __name__ == "__main__":
             # Define loss function
             loss_func = network_helper.SoftmaxCrossEntropy()
 
-            epoch_num = 40
+            epoch_num = 20
             start_time = time.time()
             train_accuracy_list, val_accuracy_list = [], []
             train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)
             end_time = time.time()
             
+            val_start = time.time()
             test_acc, _, _ = network_helper.validation_func(network, test_generator)
+            val_end = time.time()
             
-            
+            inference_time = val_end - val_start
             execution_time = end_time - start_time
             print(f"Execution Time: {execution_time:.6f} seconds")
+            print(f"Inference Execution Time: {inference_time:.6f} seconds")
             print(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
             plt.figure(figsize=(8, 5))
             epochs = [i + 1 for i in range(epoch_num)]
@@ -309,6 +369,7 @@ if __name__ == "__main__":
             plt.legend()
             plt.grid(True)
             
+            reload = True
             if not reload:
                 plt.savefig(os.path.join(output_dir, f"{filename}.png"))
 

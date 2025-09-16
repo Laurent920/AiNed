@@ -154,7 +154,7 @@ if __name__ == "__main__":
     (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), maximum_time_steps = torch_nmnist_loader(128, shuffle=False, augmentation=False)
     print(f"Total train batches: {total_train_batches}, Total val batches: {total_val_batches}, Total test batches: {total_test_batches}, maximum time steps: {maximum_time_steps}")
     
-    max = 0
+    # max = 0
     # for data, y in trainloader:
     #     for i, x in enumerate(data):
     #         new_max = x.shape[0] 
@@ -164,7 +164,7 @@ if __name__ == "__main__":
     #             print(new_max)
     #         # if i == 127:
     #         #     print(i)
-    #     print(f"data shape: {(x.shape)}, \ndata[0]: {(x[0])}, label: {(y.shape)}")
+    #     print(f"data shape: {(x.shape)}, \ndata[0]: {(x)}, label: {(y.shape)}")
     # print("final max", max)
 
 # CLEAR CACHE: rm -r ./cache/nmnist

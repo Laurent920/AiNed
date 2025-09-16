@@ -1,5 +1,8 @@
 import enum
 from mpi4py import MPI
+import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+
 import jax
 import jax.numpy as jnp
 import mpi4jax
@@ -224,37 +227,32 @@ def send_data():
     data1 = jnp.array([1., 1.])
     data2 = jnp.arange(1, 11)
     
-    token = mpi4jax.send(jnp.zeros(()), dest=size-1, tag=99, comm=comm)
-
     # token = mpi4jax.send(data0, dest=size-1, tag=0, token=token, comm=comm)
-    # token = mpi4jax.send(data1, dest=size-1, tag=10, token=token, comm=comm)
-    for data in data2:
-        token = mpi4jax.send(data, dest=size-1, tag=2, token=token, comm=comm)
+    mpi4jax.send(data1, dest=size-1, tag=10, comm=comm)
+    # for data in data2:
+    #     token = mpi4jax.send(data, dest=size-1, tag=2, comm=comm)
+    #     jax.debug.print("send return type: {}, {}", type(token), token)
     
-    token = mpi4jax.send(jnp.zeros((1,)), dest=size-1, tag=3, token=token, comm=comm)
-    return token  # Return token for JAX tracking
-
+    mpi4jax.send(data1, dest=size-1, tag=3, comm=comm)
+    return 
 @jax.jit
 def receive_data():
-    recv_buf2 = jnp.array(0)  # Ensure correct dtype
-    token = None
+    recv_buf2 = jnp.array([1., 1.])  # Ensure correct dtype
 
     def cond(state):
-        _, tag, _ = state
-        return tag != 3  # Continue loop until tag == 3
+        _, tag = state
+        return tag != -1  # Continue loop until tag == 3
 
     def body(state):
-        recv_buf, _, token = state
+        recv_buf, _ = state
         status = MPI.Status()
-        recv_buf, token = mpi4jax.recv(recv_buf, source=0, token=token, comm=comm, status=status)
+        recv_buf = mpi4jax.recv(recv_buf, source=0, comm=comm, status=status)
         new_tag = status.Get_tag()
         jax.debug.print("received data: {r}, tag:{t}", r=recv_buf, t=new_tag)
-        return recv_buf, new_tag, token
+        return recv_buf, new_tag
 
     # Initial state: (recv_buf2, tag, token)
-    _, token = mpi4jax.recv(jnp.zeros(()), source=0, tag=99, comm=comm)  # Dummy receive for token initialization
-
-    initial_state = (recv_buf2, jnp.array(-1), token)
+    initial_state = (recv_buf2, jnp.array(1))
 
     final_state = jax.lax.while_loop(cond, body, initial_state)
 
@@ -316,7 +314,7 @@ def loss_fn_bwd(residuals, g):
     return grad_output*weight, grad_output*input, None  # Gradient for 'output' and None for 'target' (no gradient wrt target)
 
 # Register the custom JVP with the forward and backward functions
-loss_fn.defvjp(loss_fn_fwd, loss_fn_bwd)
+# loss_fn.defvjp(loss_fn_fwd, loss_fn_bwd)
 
 
 # def loss_fn(input, weight, target):
@@ -419,13 +417,13 @@ if __name__ == "__main__":
     #         weight -= gradient[1] * lr
 
     # ______________________________________________________________________________________________________________________________________    
-    # if rank == 0:
-    #     send_data()  # JAX-compiled send function
+    if rank == 0:
+        send_data()  # JAX-compiled send function
 
-    # if rank == size-1:
-    #     data0, data1 = receive_data()  # JAX-compiled receive function
-    #     print(f"data0: {data0}")
-    #     print(f"data1: {data1}")
+    if rank == size-1:
+        data0 = receive_data()  # JAX-compiled receive function
+        print(f"data0: {data0}")
+        # print(f"data1: {data1}")
     
     # ______________________________________________________________________________________________________________________________________    
     # def weight_res_complete(activity, values):
@@ -641,30 +639,30 @@ if __name__ == "__main__":
 
     #     print(f"[i={i}] Δloss: {diff_loss:.6f}, Δw_grad norm: {diff_w_grad}, Δout_grad norm: {diff_out_grad:.6f}, Δloss_grad norm:\n {diff_loss_grad}, Δw_grad_batch norm: {diff_w_grad_batch:.6f}")
         
-    data1_all = load_pickle_objects("logs3/rank_1.pkl")
-    data2_all = load_pickle_objects("logs3/rank_2.pkl")
+    # data1_all = load_pickle_objects("logs3/rank_1.pkl")
+    # data2_all = load_pickle_objects("logs3/rank_2.pkl")
     
-    data2 = load_pickle_objects("logs/rank_2.pkl")
-    data3 = load_pickle_objects("logs/rank_3.pkl")
-    data4 = load_pickle_objects("logs/rank_4.pkl")
-    data5 = load_pickle_objects("logs/rank_5.pkl")
+    # data2 = load_pickle_objects("logs/rank_2.pkl")
+    # data3 = load_pickle_objects("logs/rank_3.pkl")
+    # data4 = load_pickle_objects("logs/rank_4.pkl")
+    # data5 = load_pickle_objects("logs/rank_5.pkl")
 
-    # Sanity check: Ensure equal lengths
-    # assert len(data1) == len(data2) == len(data3), "Pickle logs have different lengths."
+    # # Sanity check: Ensure equal lengths
+    # # assert len(data1) == len(data2) == len(data3), "Pickle logs have different lengths."
 
-    # Compare entry by entry
-    for i, (entry1_all, entry2_all, entry2, entry3, entry4, entry5) in enumerate(zip(data1_all, data2_all, data2, data3, data4, data5)):
-        diff_w_grad1 = jnp.linalg.norm(jnp.array(entry1_all["w_grad"]) - jnp.array(entry1_all["w_grad"]))
-        diff_w_grad2 = jnp.linalg.norm(jnp.array(entry2_all["w_grad"]) - jnp.array(entry5["w_grad"]))
+    # # Compare entry by entry
+    # for i, (entry1_all, entry2_all, entry2, entry3, entry4, entry5) in enumerate(zip(data1_all, data2_all, data2, data3, data4, data5)):
+    #     diff_w_grad1 = jnp.linalg.norm(jnp.array(entry1_all["w_grad"]) - jnp.array(entry1_all["w_grad"]))
+    #     diff_w_grad2 = jnp.linalg.norm(jnp.array(entry2_all["w_grad"]) - jnp.array(entry5["w_grad"]))
 
-        print(f"[i={i}] Δw_grad norm: {diff_w_grad1}, {diff_w_grad2}")
-    # print(jnp.array(entry2_all["w_grad"])[25:32])
-    # print(jnp.array(entry5["w_grad"])[25:32])
-    has_nan2 = jnp.isnan(jnp.array(data2[-1]["w_grad"]))
-    has_nan3 = jnp.isnan(jnp.array(data3[-1]["w_grad"]))
+    #     print(f"[i={i}] Δw_grad norm: {diff_w_grad1}, {diff_w_grad2}")
+    # # print(jnp.array(entry2_all["w_grad"])[25:32])
+    # # print(jnp.array(entry5["w_grad"])[25:32])
+    # has_nan2 = jnp.isnan(jnp.array(data2[-1]["w_grad"]))
+    # has_nan3 = jnp.isnan(jnp.array(data3[-1]["w_grad"]))
 
-    # Count how many NaNs
-    num_nans2 = jnp.sum(has_nan2)
-    num_nans3 = jnp.sum(has_nan3)
+    # # Count how many NaNs
+    # num_nans2 = jnp.sum(has_nan2)
+    # num_nans3 = jnp.sum(has_nan3)
     
-    print(f"Δw_grad norm: {jnp.array(data2[-1]["w_grad"]).shape}, {jnp.array(data2[-1]["w_grad"]).shape}, has_nan2: {num_nans2}, has_nan3: {num_nans3}")
+    # print(f"Δw_grad norm: {jnp.array(data2[-1]["w_grad"]).shape}, {jnp.array(data2[-1]["w_grad"]).shape}, has_nan2: {num_nans2}, has_nan3: {num_nans3}")

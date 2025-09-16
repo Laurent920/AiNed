@@ -1,6 +1,7 @@
 **/__pycache__
 **/venv
 **/venvWSL
+**/clean_venv
 **/datasets
 **/data
 **/cache
