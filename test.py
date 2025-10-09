@@ -5,6 +5,9 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax
 import jax.numpy as jnp
+from functools import partial
+import torch
+import numpy as np
 import mpi4jax
 import dataclasses
 import tree_math
@@ -417,13 +420,13 @@ if __name__ == "__main__":
     #         weight -= gradient[1] * lr
 
     # ______________________________________________________________________________________________________________________________________    
-    if rank == 0:
-        send_data()  # JAX-compiled send function
+    # if rank == 0:
+    #     send_data()  # JAX-compiled send function
 
-    if rank == size-1:
-        data0 = receive_data()  # JAX-compiled receive function
-        print(f"data0: {data0}")
-        # print(f"data1: {data1}")
+    # if rank == size-1:
+    #     data0 = receive_data()  # JAX-compiled receive function
+    #     print(f"data0: {data0}")
+    #     # print(f"data1: {data1}")
     
     # ______________________________________________________________________________________________________________________________________    
     # def weight_res_complete(activity, values):
@@ -486,13 +489,13 @@ if __name__ == "__main__":
         processed_data, _ = jax.lax.fori_loop(0, x.shape[0], body_fn, init_val)
         return processed_data
     
-    x = jnp.zeros((3, 10))
-    rows = jnp.array([0, 0, 0, 1, 2])
-    columns = jnp.array([0, 3, 7, 8, 0])
-    values = jnp.array([10, 10, 10, 10, 10])
-    x = x.at[rows, columns].set(values)
+    # x = jnp.zeros((3, 10))
+    # rows = jnp.array([0, 0, 0, 1, 2])
+    # columns = jnp.array([0, 3, 7, 8, 0])
+    # values = jnp.array([10, 10, 10, 10, 10])
+    # x = x.at[rows, columns].set(values)
     
-    max_nonzero = jnp.max(jnp.array([jnp.count_nonzero(row) for row in x]))
+    # max_nonzero = jnp.max(jnp.array([jnp.count_nonzero(row) for row in x]))
     # print(max_nonzero)
     # print(x)
     # p_data = jax.vmap(lambda x: preprocess_to_sparse_data_padded(x, max_nonzero))(x)
@@ -516,13 +519,13 @@ if __name__ == "__main__":
             }
         )
         
-    layer_sizes = [28*28, 128, 10]
-    thresholds = [0, 0 ,0]  
-    empty_neuron_states = Neuron_states(values=jnp.zeros((layer_sizes[rank])), 
-                                        threshold=thresholds[(rank-1)%len(thresholds)], 
-                                        input_residuals=jnp.zeros((layer_sizes[rank-1], 1)),
-                                        weight_residuals={"activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
-                                                          "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))})
+    # layer_sizes = [28*28, 128, 10]
+    # thresholds = [0, 0 ,0]  
+    # empty_neuron_states = Neuron_states(values=jnp.zeros((layer_sizes[rank])), 
+    #                                     threshold=thresholds[(rank-1)%len(thresholds)], 
+    #                                     input_residuals=jnp.zeros((layer_sizes[rank-1], 1)),
+    #                                     weight_residuals={"activity": jnp.zeros((layer_sizes[rank-1], 1), dtype=bool), 
+    #                                                       "values": jnp.zeros((layer_sizes[rank-1], layer_sizes[rank]))})
     
     # print(empty_neuron_states)
     # print("___________________________________")
@@ -666,3 +669,188 @@ if __name__ == "__main__":
     # num_nans3 = jnp.sum(has_nan3)
     
     # print(f"Δw_grad norm: {jnp.array(data2[-1]["w_grad"]).shape}, {jnp.array(data2[-1]["w_grad"]).shape}, has_nan2: {num_nans2}, has_nan3: {num_nans3}")
+
+    # ______________________________________________________________________________________________________________________________________
+    @jax.jit
+    def compact_nonzero_and_pad(events):
+        """
+        Reorders (c, x, y, v) events so that all v != 0 come first, 
+        and pads the rest with -2. Keeps output shape identical to input.
+
+        Args:
+            events: jnp.ndarray of shape (N, 4), each row [c, x, y, v].
+
+        Returns:
+            compacted: jnp.ndarray of shape (N, 4)
+            nonzero_count: number of nonzero v entries (scalar int32)
+        """
+        values = events[:, 3]
+        
+        # Boolean mask: 1 for nonzero values
+        mask = values != 0
+
+        # Get indices that would sort mask so that True come first
+        # (~mask) is used so that True (1) goes before False (0)
+        sort_keys = ~mask
+        perm = jnp.argsort(sort_keys.astype(jnp.int32))
+
+        # Reorder events
+        compacted = events[perm]
+
+        # Count nonzero
+        nonzero_count = jnp.sum(mask).astype(jnp.int32)
+
+        # Pad the remaining rows with -2 (only value field, not coords)
+        # For zero entries, overwrite everything with -2
+        def pad_fn(row, i):
+            return jnp.where(i < nonzero_count, row, jnp.full_like(row, -2.0))
+
+        indices = jnp.arange(events.shape[0])
+        compacted = jax.vmap(pad_fn)(compacted, indices)
+
+        return nonzero_count, compacted
+
+    @partial(jax.jit, static_argnums=(1, 2, 3, 4, 5,))
+    def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2), pad_value=0.0):
+        """
+        Sparse pooling on (c,x,y,value) event rows.
+
+        Args:
+            events: jnp.ndarray (N,4) containing (c, x, y, v). Use sentinel rows
+                    with c < 0 to indicate padding (they will be removed).
+            input_shape: (C, H, W) (integers)
+            mode: "max" or "avg"
+            pool_size: (ph, pw)
+            stride: (sh, sw)
+            pad_value: value for empty pooled windows (default 0.0)
+
+        Returns:
+            pooled_events: jnp.ndarray shape (C * Hp * Wp, 4) with rows (c, x, y, value)
+            pooled_shape: (C, Hp, Wp)
+        """
+        C, H, W = map(int, input_shape)
+        ph, pw = map(int, pool_size)
+        sh, sw = map(int, stride)
+        
+        # pooled grid sizes (assumes H and W are divisible by stride; adjust if needed)
+        Hp = H // sh
+        Wp = W // sw
+        # jax.debug.print("Pool output sizes: {} {} {} {} {}", Hp, Wp, C, H, W)
+        if events.shape[0] == 0:
+            # No events at all: return all zeros (or pad_value) sized array
+            Hp = H // sh
+            Wp = W // sw
+            coords_full = jnp.stack([
+                jnp.repeat(jnp.arange(C, dtype=jnp.int32), Hp * Wp),
+                jnp.tile(jnp.repeat(jnp.arange(Hp, dtype=jnp.int32), Wp), C),
+                jnp.tile(jnp.arange(Wp, dtype=jnp.int32), C * Hp)
+            ], axis=-1)
+            vals = jnp.full((C * Hp * Wp,), pad_value, dtype=jnp.float32)
+
+            return jnp.concatenate([coords_full, vals[:, None]], axis=-1), (C, Hp, Wp)
+
+        coords = events[:, :3].astype(jnp.int32)   # (N,3) integers
+        values = events[:, 3].astype(jnp.float32)  # (N,)
+
+        # map each event to pooled cell
+        pooled_c = coords[:, 0].astype(jnp.int32)
+        pooled_x = (coords[:, 1] // sh).astype(jnp.int32)
+        pooled_y = (coords[:, 2] // sw).astype(jnp.int32)
+
+        pooled_idx = pooled_c * (Hp * Wp) + pooled_x * Wp + pooled_y    # integer index (N,)
+
+        num_segments = C * Hp * Wp
+        # jax.debug.print("After pooling indexes {} {} {} {} {}", pooled_c, pooled_x, pooled_y, pooled_idx, num_segments)
+
+        # --- pooling ---
+        if mode == "max":
+            pooled_values = jax.ops.segment_max(values, pooled_idx, num_segments=num_segments)
+            jax.debug.print("After segment max: {}", pooled_values)
+            # replace -inf (empty segments) with pad_value (e.g., 0.0)
+            pooled_values = jnp.where(jnp.isneginf(pooled_values), pad_value, pooled_values)
+        elif mode == "avg":
+            # segment_sum returns 0 for empty segments
+            sums = jax.ops.segment_sum(values, pooled_idx, num_segments=num_segments)
+            # average over full kernel area (include zeros)
+            area = ph * pw
+            pooled_values = sums / float(area)
+            jax.debug.print("after segment sum and avg {} {} ", sums, pooled_values)
+        else:
+            raise ValueError("mode must be 'max' or 'avg'")
+
+        # reconstruct coords for every pooled cell in canonical order
+        pooled_c_full = jnp.repeat(jnp.arange(C, dtype=jnp.int32), Hp * Wp)
+        pooled_x_full = jnp.tile(jnp.repeat(jnp.arange(Hp, dtype=jnp.int32), Wp), C)
+        pooled_y_full = jnp.tile(jnp.arange(Wp, dtype=jnp.int32), C * Hp)
+
+        coords_full = jnp.stack([pooled_c_full, pooled_x_full, pooled_y_full], axis=-1)  # (num_segments, 3)
+        out = jnp.concatenate([coords_full, pooled_values[:, None]], axis=-1)  # (num_segments, 4)
+
+        jax.debug.print("{}, {}", coords_full, out)
+        nb_valid_el, compact_out = compact_nonzero_and_pad(out)
+        # nb_valid_el, compact_out = 0, out 
+        jax.debug.print("output {}, {}", nb_valid_el, compact_out)
+
+        return nb_valid_el, compact_out
+    # Define a small 4×4 "image" with a few non-zero activations
+    # Format: (channel, x, y, value)
+    events = jnp.array([
+            # [1,3,0,0],
+            # [5,6,0,0],
+            # [0,0,9,0],
+            # [0,0,0,4]
+            [0, 0, 0, 1.0],
+            [0, 0, 1, 3.0],
+            [0, 1, 0, 5.0],
+            [0, 1, 1, 6.0],
+            [0, 2, 2, 9.0],
+            [0, 3, 3, 4.0],
+            [0, 4, 4, -14.0],
+        ], dtype=jnp.float32)
+
+    print(events[:,3] >= 0)
+    # convert to sentinel format: here no sentinel rows needed
+    input_shape = (1, 5, 5)
+
+    pooled_max, pooled_shape = sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2), pad_value=0.0)
+    pooled_avg, _ = sparse_pool(events, input_shape, mode="avg", pool_size=(2, 2), stride=(2, 2), pad_value=0.0)
+
+    # print("Pooled (max):")
+    # print(pooled_max.reshape(pooled_shape[0], pooled_shape[1]*pooled_shape[2], 4))  # view by channel
+    # print("\nPooled (avg):")
+    # print(pooled_avg.reshape(pooled_shape[0], pooled_shape[1]*pooled_shape[2], 4))
+
+    # Random input
+    x_torch = torch.rand(10, 27, 27)
+    x_jax = jnp.array(x_torch.numpy())
+
+    # PyTorch pooling
+    pool = torch.nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+    y_torch = pool(x_torch)
+
+    # JAX pooling
+    def jax_pool(x):
+        return jax.lax.reduce_window(
+            x,
+            -jnp.inf,
+            jax.lax.max,
+            window_dimensions=(1, 2, 2),
+            window_strides=(1, 2, 2),
+            padding="VALID"
+        )
+
+    y_jax = jax_pool(x_jax)
+
+    print("PyTorch:\n", y_torch[-1])
+    print("JAX:\n", np.array(y_jax)[-1])
+    print("Difference:", np.abs(y_torch.numpy() - np.array(y_jax)).max())
+    
+    pool2 = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+
+    before = np.load("matrix0.npy")
+    after = np.load("matrix1.npy")
+
+    print(torch.equal(pool2(torch.tensor(before)), torch.tensor(after)))
+    print(pool2(torch.tensor(before)))
+    print("after")
+    print(after)

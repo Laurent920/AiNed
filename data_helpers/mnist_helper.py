@@ -6,8 +6,10 @@ import random
 from PIL import Image
 import math
 from abc import ABC, abstractmethod
-import data_helpers.network_helper as network_helper
-# import network_helper
+try:
+    import data_helpers.network_helper as network_helper
+except ModuleNotFoundError:
+    import network_helper
 # region TORCH LOADER
 import os
 
@@ -159,13 +161,28 @@ def average_active_inputs(train_dataloader):
     return total_active_features / total_samples
 
 #region MANUAL LOADER
-def torch_mnist_loader_manual(batch_size, shuffle=True, preprocess=True, cache_dir='./cache/mnist'):
+def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproces=False, cache_dir='./cache/mnist'):
     max_nonzero = 351
     dataset_folder = "data/mnist/"
-    os.makedirs(cache_dir, exist_ok=True)
 
-    train_cache_path = os.path.join(cache_dir, 'train.npz')
-    test_cache_path  = os.path.join(cache_dir, 'test.npz')
+    if not preprocess:
+        os.makedirs(cache_dir, exist_ok=True)
+        train_cache_path = os.path.join(cache_dir, '/train.npz')
+        test_cache_path  = os.path.join(cache_dir, '/test.npz')
+
+    else:
+        if CNN_preproces:
+            cache_dir += "/async_CNN"
+            os.makedirs(cache_dir, exist_ok=True)
+
+            train_cache_path = os.path.join(cache_dir, 'train.npz')
+            test_cache_path  = os.path.join(cache_dir, 'test.npz')
+        else:
+            cache_dir += "/async_MLP"
+            os.makedirs(cache_dir, exist_ok=True)
+
+            train_cache_path = os.path.join(cache_dir, 'train.npz')
+            test_cache_path  = os.path.join(cache_dir, 'test.npz')
 
     if preprocess and os.path.exists(train_cache_path):
         print("Loading cached MNIST dataset")
@@ -188,13 +205,22 @@ def torch_mnist_loader_manual(batch_size, shuffle=True, preprocess=True, cache_d
         mnist_data_y_test = mnist_data.iloc[:, 0].values
 
         if preprocess:
-            print('Preprocessing MNIST dataset')
-            mnist_data_x = preprocess_dataset(mnist_data_x, max_nonzero)
-            mnist_data_x_test = preprocess_dataset(mnist_data_x_test, max_nonzero)
+            if CNN_preproces:
+                print("Preprocess MNIST dataset for CNN")                    
+                mnist_data_x = preprocess_dataset_CNN(mnist_data_x, max_nonzero)
+                mnist_data_x_test = preprocess_dataset_CNN(mnist_data_x_test, max_nonzero)
 
-            # Save cached dataset
-            np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
-            np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
+                # Save cached dataset
+                np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
+                np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
+            else:
+                print('Preprocessing MNIST dataset')
+                mnist_data_x = preprocess_dataset(mnist_data_x, max_nonzero)
+                mnist_data_x_test = preprocess_dataset(mnist_data_x_test, max_nonzero)
+
+                # Save cached dataset
+                np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
+                np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
     
     # print(mnist_data_x[0], mnist_data_x.shape, mnist_data_x[0].shape)
     
@@ -203,7 +229,6 @@ def torch_mnist_loader_manual(batch_size, shuffle=True, preprocess=True, cache_d
     train_dataloader = network_helper.DataLoader(mnist_data_x, mnist_data_y, batch_size, train_indices, shuffle=shuffle)    
     val_dataloader = network_helper.DataLoader(mnist_data_x, mnist_data_y, batch_size, val_indices, shuffle=shuffle)
     
-
     # Define test set dataloader object
     test_indices, _ = network_helper.train_validate_split(mnist_data_y_test, val_ratio=0, shuffle=shuffle)
     test_dataloader = network_helper.DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
@@ -229,7 +254,7 @@ def torch_mnist_loader_manual(batch_size, shuffle=True, preprocess=True, cache_d
     
     return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (test_dataloader, total_test_batches), max_nonzero
 
-def torch_mnist_loader_preprocessed_np(x, max_nonzero):
+def mnist_loader_preprocessed_single(x, max_nonzero):
     """
     Preprocess a single MNIST sample (1D vector).
     Stores (index, value) for non-zero pixels up to max_nonzero.
@@ -253,7 +278,37 @@ def preprocess_dataset(dataset_x, max_nonzero):
     N = dataset_x.shape[0]
     processed_dataset = np.zeros((N, max_nonzero, 2), dtype=np.float32)
     for n in range(N):
-        processed_dataset[n] = torch_mnist_loader_preprocessed_np(dataset_x[n], max_nonzero)
+        processed_dataset[n] = mnist_loader_preprocessed_single(dataset_x[n], max_nonzero)
+    return processed_dataset
+
+def mnist_loader_preprocessed_single_CNN(x, max_nonzero, input_dimension=28):
+    """
+    Preprocess a single MNIST sample (1D vector).
+    Stores (0, x, y, value) for non-zero pixels up to max_nonzero.
+    """
+    processed_data = np.full((max_nonzero, 4), -2.0, dtype=np.float32)
+    j = 0
+    for i, val in enumerate(x):
+        if val != 0:
+            x = i // input_dimension    # row
+            y = i % input_dimension     # column
+            # print(i, x, y)
+            processed_data[j] = [0, x, y, val]
+            j += 1
+            if j >= max_nonzero:  # stop if full
+                break
+    return processed_data
+
+def preprocess_dataset_CNN(dataset_x, max_nonzero):
+    """
+    Apply preprocessing to the whole dataset.
+    dataset_x: shape (N, 784)
+    Returns: shape (N, max_nonzero, 4) ==> tuple(c, x, y, v) -- tuple(0, x, y, v)
+    """
+    N = dataset_x.shape[0]
+    processed_dataset = np.zeros((N, max_nonzero, 4), dtype=np.float32)
+    for n in range(N):
+        processed_dataset[n] = mnist_loader_preprocessed_single_CNN(dataset_x[n], max_nonzero)
     return processed_dataset
 
 if __name__ == "__main__":
@@ -277,15 +332,15 @@ if __name__ == "__main__":
             break
         # torch_train(training_generator, train, test, params)
     else:    
-        batch_size = 36
-        # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
+        batch_size = 128
+        # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
         
         # d = iter(test_generator)
         # for _, _ in iter(training_generator):
         #     batchx, batchy = next(d)
         #     print(jnp.array(batchx).shape)
 
-        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = torch_mnist_loader_manual(batch_size, shuffle=False, preprocess=False)
+        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=False, CNN_preproces=False)
 
         avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
@@ -297,7 +352,7 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
         # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
-        # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
+        layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 10))
@@ -309,25 +364,25 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 64, 64, 64, 10))
         # layer_size.append((28*28, 64, 64, 10))
         # layer_size.append((28*28, 64, 10))
-        layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 10))
-        layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 10))
+        # layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
-        # layer_size.append((28*28, 128, 10))
-        layer_size.append((28*28, 128, 128, 10))
+        # layer_size.append((28*28, 32, 10))
+        # layer_size.append((28*28, 128, 128, 10))
         
         for layer_dims in layer_size:
             print(f"running {layer_dims}")
             network = network_helper.MLP(layer_dims)
             
             filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
-            output_dir = "tensor_data"
+            output_dir = "tensor_data/MLP"
             os.makedirs(output_dir, exist_ok=True)
 
             reload = False
             if reload:
                 filename = f"tensor_data_{'_'.join(map(str, layer_dims))}_batch{batch_size}"
-                output_dir = "tensor_data"
+                output_dir = "tensor_data/MLP"
                 file_path = os.path.join(output_dir, f"{filename}.npz")
 
                 # Load the saved tensors
@@ -369,15 +424,16 @@ if __name__ == "__main__":
             plt.legend()
             plt.grid(True)
             
-            reload = True
+            # reload = True
             if not reload:
                 plt.savefig(os.path.join(output_dir, f"{filename}.png"))
 
-                print(network.param[0].data.shape)
-
+                # print(network.param[0].data.shape)
+                datafile = os.path.join(output_dir, f"{filename}.npz")
+                print(f"Data saved in {datafile}")
                 # Save parameters to .npz in the same folder
                 tensor_data = [tensor.data for tensor in network.param]
-                np.savez(os.path.join(output_dir, f"{filename}.npz"), *tensor_data)
+                np.savez(datafile, *tensor_data)
             plt.close()
 
             # data = np.load(os.path.join(output_dir, f"{filename}.npz"))
