@@ -709,148 +709,241 @@ if __name__ == "__main__":
         compacted = jax.vmap(pad_fn)(compacted, indices)
 
         return nonzero_count, compacted
-
-    @partial(jax.jit, static_argnums=(1, 2, 3, 4, 5,))
+    # --- Helper functions ---
     def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2), pad_value=0.0):
         """
         Sparse pooling on (c,x,y,value) event rows.
 
         Args:
-            events: jnp.ndarray (N,4) containing (c, x, y, v). Use sentinel rows
-                    with c < 0 to indicate padding (they will be removed).
-            input_shape: (C, H, W) (integers)
+            events: jnp.ndarray (N,4) containing (c, x, y, v).
+            input_shape: (C, H, W)
             mode: "max" or "avg"
             pool_size: (ph, pw)
             stride: (sh, sw)
-            pad_value: value for empty pooled windows (default 0.0)
+            pad_value: value for empty pooled windows
 
         Returns:
-            pooled_events: jnp.ndarray shape (C * Hp * Wp, 4) with rows (c, x, y, value)
+            pooled_events: jnp.ndarray (C*Hp*Wp, 4)
             pooled_shape: (C, Hp, Wp)
+            unpooled_values: jnp.ndarray (N,) same length as input values, 
+                            with pooled maxima restored to original positions (for backprop or debugging)
         """
         C, H, W = map(int, input_shape)
         ph, pw = map(int, pool_size)
         sh, sw = map(int, stride)
-        
-        # pooled grid sizes (assumes H and W are divisible by stride; adjust if needed)
+
+        # Compute pooled output shape
         Hp = H // sh
         Wp = W // sw
-        # jax.debug.print("Pool output sizes: {} {} {} {} {}", Hp, Wp, C, H, W)
+
+        # Handle empty case
         if events.shape[0] == 0:
-            # No events at all: return all zeros (or pad_value) sized array
-            Hp = H // sh
-            Wp = W // sw
             coords_full = jnp.stack([
                 jnp.repeat(jnp.arange(C, dtype=jnp.int32), Hp * Wp),
                 jnp.tile(jnp.repeat(jnp.arange(Hp, dtype=jnp.int32), Wp), C),
                 jnp.tile(jnp.arange(Wp, dtype=jnp.int32), C * Hp)
             ], axis=-1)
             vals = jnp.full((C * Hp * Wp,), pad_value, dtype=jnp.float32)
+            return jnp.concatenate([coords_full, vals[:, None]], axis=-1), (C, Hp, Wp), jnp.zeros(0)
 
-            return jnp.concatenate([coords_full, vals[:, None]], axis=-1), (C, Hp, Wp)
+        # Extract coordinates and values
+        coords = events[:, :3].astype(jnp.int32)
+        values = events[:, 3].astype(jnp.float32)
 
-        coords = events[:, :3].astype(jnp.int32)   # (N,3) integers
-        values = events[:, 3].astype(jnp.float32)  # (N,)
-
-        # map each event to pooled cell
-        pooled_c = coords[:, 0].astype(jnp.int32)
-        pooled_x = (coords[:, 1] // sh).astype(jnp.int32)
-        pooled_y = (coords[:, 2] // sw).astype(jnp.int32)
-
-        pooled_idx = pooled_c * (Hp * Wp) + pooled_x * Wp + pooled_y    # integer index (N,)
-
+        # Compute pooled cell indices
+        pooled_c = coords[:, 0]
+        pooled_x = coords[:, 1] // sh
+        pooled_y = coords[:, 2] // sw
+        pooled_idx = pooled_c * (Hp * Wp) + pooled_x * Wp + pooled_y
         num_segments = C * Hp * Wp
-        # jax.debug.print("After pooling indexes {} {} {} {} {}", pooled_c, pooled_x, pooled_y, pooled_idx, num_segments)
 
-        # --- pooling ---
+        # --- Perform pooling ---
         if mode == "max":
             pooled_values = jax.ops.segment_max(values, pooled_idx, num_segments=num_segments)
-            jax.debug.print("After segment max: {}", pooled_values)
-            # replace -inf (empty segments) with pad_value (e.g., 0.0)
+
+            # Compute argmax (original index of the max)
+            is_max = values == pooled_values[pooled_idx]
+            idx = jnp.arange(values.shape[0])
+            argmax_idx = jax.ops.segment_min(
+                jnp.where(is_max, idx, values.shape[0]),
+                pooled_idx,
+                num_segments=num_segments
+            )
+
+            # Handle empty segments (where pooled_values = -inf)
             pooled_values = jnp.where(jnp.isneginf(pooled_values), pad_value, pooled_values)
+
+            # Build unpooled activation map
+            unpooled_values = jnp.zeros_like(values)
+            unpooled_values = unpooled_values.at[argmax_idx].set(pooled_values)
+            print("argmax index: ", unpooled_values)
+
+            dense_reconstructed = jnp.concatenate([coords, unpooled_values[:, None]], axis=-1)
+            print("reconstructed:", dense_reconstructed)
+            # # --- Reconstruct dense unpooled matrix ---
+            # dense_reconstructed = jnp.zeros((C, H, W), dtype=jnp.float32)
+            # dense_reconstructed = dense_reconstructed.at[
+            #     coords[:, 0], coords[:, 1], coords[:, 2]
+            # ].set(unpooled_values)
         elif mode == "avg":
-            # segment_sum returns 0 for empty segments
             sums = jax.ops.segment_sum(values, pooled_idx, num_segments=num_segments)
-            # average over full kernel area (include zeros)
             area = ph * pw
             pooled_values = sums / float(area)
-            jax.debug.print("after segment sum and avg {} {} ", sums, pooled_values)
+            dense_reconstructed = jnp.zeros(input_shape)
         else:
             raise ValueError("mode must be 'max' or 'avg'")
 
-        # reconstruct coords for every pooled cell in canonical order
+        # Build pooled coordinate grid
         pooled_c_full = jnp.repeat(jnp.arange(C, dtype=jnp.int32), Hp * Wp)
         pooled_x_full = jnp.tile(jnp.repeat(jnp.arange(Hp, dtype=jnp.int32), Wp), C)
         pooled_y_full = jnp.tile(jnp.arange(Wp, dtype=jnp.int32), C * Hp)
+        coords_full = jnp.stack([pooled_c_full, pooled_x_full, pooled_y_full], axis=-1)
 
-        coords_full = jnp.stack([pooled_c_full, pooled_x_full, pooled_y_full], axis=-1)  # (num_segments, 3)
-        out = jnp.concatenate([coords_full, pooled_values[:, None]], axis=-1)  # (num_segments, 4)
+        pooled_events = jnp.concatenate([coords_full, pooled_values[:, None]], axis=-1)
 
-        jax.debug.print("{}, {}", coords_full, out)
-        nb_valid_el, compact_out = compact_nonzero_and_pad(out)
-        # nb_valid_el, compact_out = 0, out 
-        jax.debug.print("output {}, {}", nb_valid_el, compact_out)
-
-        return nb_valid_el, compact_out
-    # Define a small 4×4 "image" with a few non-zero activations
-    # Format: (channel, x, y, value)
+        return pooled_events, (C, Hp, Wp), dense_reconstructed
     events = jnp.array([
-            # [1,3,0,0],
-            # [5,6,0,0],
-            # [0,0,9,0],
-            # [0,0,0,4]
-            [0, 0, 0, 1.0],
-            [0, 0, 1, 3.0],
-            [0, 1, 0, 5.0],
-            [0, 1, 1, 6.0],
-            [0, 2, 2, 9.0],
-            [0, 3, 3, 4.0],
-            [0, 4, 4, -14.0],
-        ], dtype=jnp.float32)
+    [0, 0, 0, 1.0],
+    [0, 0, 1, 3.0],
+    [0, 1, 0, 5.0],
+    [0, 1, 1, 6.0],
+    [0, 2, 2, 9.0],
+    [0, 3, 3, 4.0],
+    [1, 2, 3, 4.0],
+    [1, 2, 2, 8.0],
+    [1, 1, 1, 2.0],
+    ], dtype=jnp.float32)
+    input_shape = (2, 4, 4)
+    C, H, W = map(int, input_shape)
 
-    print(events[:,3] >= 0)
-    # convert to sentinel format: here no sentinel rows needed
-    input_shape = (1, 5, 5)
+    original = jnp.zeros((C, H, W), dtype=jnp.float32)
+    original = original.at[
+        events[:, 0].astype(int), 
+        events[:, 1].astype(int), 
+        events[:, 2].astype(int)
+    ].set(events[:,3])
 
-    pooled_max, pooled_shape = sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2), pad_value=0.0)
-    pooled_avg, _ = sparse_pool(events, input_shape, mode="avg", pool_size=(2, 2), stride=(2, 2), pad_value=0.0)
+    # pooled, shape, dense_reconstructed = sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2))
+    # print("original:")
+    # print(original)
+    # print("Pooled events:")
+    # print(pooled)
+    # print("\nUnpooled values (maxima restored at original indices):")
+    # print(dense_reconstructed)
 
-    # print("Pooled (max):")
-    # print(pooled_max.reshape(pooled_shape[0], pooled_shape[1]*pooled_shape[2], 4))  # view by channel
-    # print("\nPooled (avg):")
-    # print(pooled_avg.reshape(pooled_shape[0], pooled_shape[1]*pooled_shape[2], 4))
+    # @jax.jit
+    def maxpool2d_unpool2d(matrix, pooling="max", pool_size=(2, 2), pool_stride=(2, 2)):
+        """
+        Performs MaxPool2D and Unpool2D (inverse) using JAX primitives only.
 
-    # Random input
-    x_torch = torch.rand(10, 27, 27)
-    x_jax = jnp.array(x_torch.numpy())
+        Args:
+            x: jnp.ndarray (C, H, W)
+            pool_size: (kh, kw)
+            stride: (sh, sw)
+        
+        Returns:
+            pooled: (C, H', W')
+            unpooled: (C, H, W) with max values placed back in original positions
+        """
+        input_matrix = matrix
 
-    # PyTorch pooling
-    pool = torch.nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-    y_torch = pool(x_torch)
+        C, H, W = input_matrix.shape        
+        kh, kw = pool_size
+        sh, sw = pool_stride
 
-    # JAX pooling
-    def jax_pool(x):
-        return jax.lax.reduce_window(
-            x,
-            -jnp.inf,
-            jax.lax.max,
-            window_dimensions=(1, 2, 2),
-            window_strides=(1, 2, 2),
-            padding="VALID"
-        )
+        # Compute output dimensions
+        out_h = (H - kh) // sh + 1
+        out_w = (W - kw) // sw + 1
+        # io_callback(lambda arr, name: save_to_file(arr, name), None, input_matrix, 0)
+        
+        def pool_fn(x):
+            # Extract all pooling windows efficiently
+            windows = jax.lax.reduce_window(
+                x,
+                init_value=-jnp.inf if pooling == "max" else 0.0,
+                computation=jax.lax.max if pooling == "max" else jax.lax.add,
+                window_dimensions=(1, kh, kw),
+                window_strides=(1, sh, sw),
+                padding="VALID",
+            )
+            if pooling == "avg":
+                windows = windows / (kh * kw)
+            return windows
 
-    y_jax = jax_pool(x_jax)
+        # Apply pooling channel-wise
+        matrix = pool_fn(input_matrix)
+        # H, W = matrix.shape[1:]
+        pooled = matrix
+        print(matrix)
+        # --- Compute argmax positions efficiently ---
+        # Upsampling matrix
+        
+        # x_up_h = jnp.repeat(matrix, 2, axis=1)
+        # # Repeat along width
+        # matrix_upsampled = jnp.repeat(x_up_h, 2, axis=2)
+        
+        # mask = input_matrix == matrix_upsampled
 
-    print("PyTorch:\n", y_torch[-1])
-    print("JAX:\n", np.array(y_jax)[-1])
-    print("Difference:", np.abs(y_torch.numpy() - np.array(y_jax)).max())
-    
-    pool2 = torch.nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # filtered_matrix = matrix_upsampled * mask
+        # print(filtered_matrix)
+        if pooling == "max":
+            # Create upsampled version
+            x_up_h = jnp.repeat(pooled, sh, axis=1)
+            matrix_upsampled = jnp.repeat(x_up_h, sw, axis=2)
+            
+            # Pad if necessary to match original dimensions
+            pad_h = H - matrix_upsampled.shape[1]
+            pad_w = W - matrix_upsampled.shape[2]
+            if pad_h > 0 or pad_w > 0:
+                matrix_upsampled = jnp.pad(matrix_upsampled, 
+                                        ((0, 0), (0, pad_h), (0, pad_w)), 
+                                        constant_values=0)
+            
+            # Create mask for matching values
+            mask = (input_matrix == matrix_upsampled)
+            print(mask)
+            # Create priority matrix: prefer top-left positions
+            # This gives unique priorities to each position
+            priority = jnp.arange(H * W).reshape(1, H, W) * mask
+            
+            # For each pooling window, keep only the position with highest priority
+            def keep_first_max(x):
+                return jax.lax.reduce_window(
+                    x,
+                    init_value=-jnp.inf,
+                    computation=jax.lax.max,
+                    window_dimensions=(1, kh, kw),
+                    window_strides=(1, sh, sw),
+                    padding="VALID",
+                )
+            
+            max_priorities = keep_first_max(priority)
+            max_priorities_upsampled = jnp.repeat(jnp.repeat(max_priorities, sh, axis=1), sw, axis=2)
+            
+            if pad_h > 0 or pad_w > 0:
+                max_priorities_upsampled = jnp.pad(max_priorities_upsampled, 
+                                                    ((0, 0), (0, pad_h), (0, pad_w)), 
+                                                    constant_values=-jnp.inf)
+            
+            # Keep only positions that have the maximum priority in their window
+            unique_mask = (priority == max_priorities_upsampled) & mask
+            unpooled = matrix_upsampled * unique_mask
+            
+            print(unpooled)
+            return pooled, unpooled
 
-    before = np.load("matrix0.npy")
-    after = np.load("matrix1.npy")
+    matrix = jnp.array([
+        [
+            [1., 3., 2., 0.],
+            [5., 6., 2., 1.],
+            [0., 2., 9., 3.],
+            [1., 0., 4., 7.],
+        ]
+    ])  # shape (1, 4, 4)
 
-    print(torch.equal(pool2(torch.tensor(before)), torch.tensor(after)))
-    print(pool2(torch.tensor(before)))
-    print("after")
-    print(after)
+    pooled, unpooled = maxpool2d_unpool2d(matrix, "max", pool_size=(2, 2), pool_stride=(2, 2))
+
+    # print("Pooled:")
+    # print(pooled[0])
+    # print("\nUnpooled:")
+    # print(unpooled[0])

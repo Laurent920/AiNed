@@ -35,7 +35,7 @@ def accuracy(batch_number, outputs, y, iterations, print):
 
 
 # region SAVING DATA
-def store_training_data(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname): 
+def store_training_data(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname, network_type): 
     filename_add_on = ""
     if optiname is not None:
         filename_add_on = f"_{optiname}_"
@@ -44,10 +44,10 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
 
     # Choose the saving folder
     if mode == "train":
-        result_dir = os.path.join("network_results", params.dataset, "training")
+        result_dir = os.path.join("network_results", params.dataset, "training", network_type)
         filename = f"{params.random_seed}" + f"_ep{params.num_epochs}" + network.filename
     elif mode == "inference":
-        result_dir = os.path.join("network_results", params.dataset, "inference")
+        result_dir = os.path.join("network_results", params.dataset, "inference", network_type)
         filename = f"{params.random_seed}" + f"_load{params.load_file}" + network.filename
         all_iteration_mean = np.array(all_iteration_mean).flatten().tolist()
     else:

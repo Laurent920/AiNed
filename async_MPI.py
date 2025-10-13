@@ -1174,8 +1174,6 @@ def create_runtime_video(runtimes_dict, activations_dict, output_file="runtimes_
     ani.save(output_file, fps=5, extra_args=['-vcodec', 'libx264'])
     plt.close()
 
-
-
 def compute_runtime_plot(all_runtimes, all_activations):
     global rank
     leader_rank = split_rank * process_per_layer
@@ -1757,8 +1755,8 @@ if __name__ == "__main__":
                 #     all_time += ex_time
                 # print("average execution time : {}", all_time/t)
 
-                batch_predict(params, key, weights, empty_neuron_states, "test", save=True, debug=True)
-                # result_path = train(params, key, weights, empty_neuron_states, "adam")
+                # batch_predict(params, key, weights, empty_neuron_states, "test", save=True, debug=True)
+                result_path = train(params, key, weights, empty_neuron_states, "adam")
                 # rerun = result_path
                 # print(rerun)
                 break

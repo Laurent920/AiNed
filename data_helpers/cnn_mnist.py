@@ -81,7 +81,105 @@ class SimpleCNN(nn.Module):
         nonzero = (x != 0).sum().item() / x.size(0)
         self.activation_stats[layer_name].append(nonzero)
 
+class VGG16(nn.Module):
+    def __init__(self, num_classes=1000):
+        super(VGG16, self).__init__()
 
+        # ----- Block 1 -----
+        self.conv1_1 = nn.Conv2d(1, 64, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.pool1   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # ----- Block 2 -----
+        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.pool2   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # ----- Block 3 -----
+        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        self.pool3   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # ----- Block 4 -----
+        self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False)
+        self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        self.conv4_3 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        self.pool4   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # ----- Block 5 -----
+        self.conv5_1 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        self.conv5_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        self.conv5_3 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        self.pool5   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # ----- Fully Connected Layers -----
+        self.fc1 = nn.Linear(512 * 7 * 7, 4096, bias=False)
+        self.fc2 = nn.Linear(4096, 4096, bias=False)
+        self.out = nn.Linear(4096, num_classes, bias=False)
+
+        # ----- Activation Stats -----
+        self.activation_stats = {
+            name: [] for name, module in self.named_children()
+            if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d))
+        }
+        self.activation_stats["input"] = []
+
+        # ----- Weight Initialization -----
+        self._initialize_weights()
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        # Block 1
+        x = F.relu(self.conv1_1(x)); self._record_activation("conv1_1", x)
+        x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
+        x = self.pool1(x);           self._record_activation("pool1", x)
+
+        # Block 2
+        x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
+        x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        x = self.pool2(x);           self._record_activation("pool2", x)
+
+        # Block 3
+        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        x = F.relu(self.conv3_3(x)); self._record_activation("conv3_3", x)
+        x = self.pool3(x);           self._record_activation("pool3", x)
+
+        # Block 4
+        x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
+        x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
+        x = F.relu(self.conv4_3(x)); self._record_activation("conv4_3", x)
+        x = self.pool4(x);           self._record_activation("pool4", x)
+
+        # Block 5
+        x = F.relu(self.conv5_1(x)); self._record_activation("conv5_1", x)
+        x = F.relu(self.conv5_2(x)); self._record_activation("conv5_2", x)
+        x = F.relu(self.conv5_3(x)); self._record_activation("conv5_3", x)
+        x = self.pool5(x);           self._record_activation("pool5", x)
+
+        # Flatten
+        x = x.view(x.size(0), -1)
+
+        # FC
+        x = F.relu(self.fc1(x)); self._record_activation("fc1", x)
+        x = F.relu(self.fc2(x)); self._record_activation("fc2", x)
+        x = self.out(x);         self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        """Record average nonzero activations per sample."""
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        """He (Kaiming) initialization for all conv and linear layers."""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+                
 # ==========================================================
 # TRAINING AND EVALUATION
 # ==========================================================
