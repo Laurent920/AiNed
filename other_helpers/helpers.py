@@ -33,22 +33,26 @@ def accuracy(batch_number, outputs, y, iterations, print):
                 batch_number, valid_predictions, valid_y, jnp.mean(iterations), batch_correct, valid_y.shape[0], outputs[-1])
     return valid_y, batch_correct
 
-
 # region SAVING DATA
 def store_training_data(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname, network_type): 
     filename_add_on = ""
     if optiname is not None:
         filename_add_on = f"_{optiname}_"
     
-    params = network.params
+    if hasattr(network, "params"):
+        params = network.params
+        filename_nn = network.filename
+    else:
+        params = network
+        filename_nn = f"_b{params.batch_size}_" + "_".join(map(str, params.layer_sizes)) 
 
     # Choose the saving folder
     if mode == "train":
         result_dir = os.path.join("network_results", params.dataset, "training", network_type)
-        filename = f"{params.random_seed}" + f"_ep{params.num_epochs}" + network.filename
+        filename = f"{params.random_seed}" + f"_ep{params.num_epochs}" + filename_nn
     elif mode == "inference":
         result_dir = os.path.join("network_results", params.dataset, "inference", network_type)
-        filename = f"{params.random_seed}" + f"_load{params.load_file}" + network.filename
+        filename = f"{params.random_seed}" + f"_load{params.load_file}" + filename_nn
         all_iteration_mean = np.array(all_iteration_mean).flatten().tolist()
     else:
         print("Wrong mode for storing data choose 'train' or 'inference'. No data is saved")

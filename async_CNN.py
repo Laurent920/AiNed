@@ -32,14 +32,17 @@ from functools import partial
 import mpi4jax
 from mpi4jax import send, recv, bcast
 
-from data_helpers.mnist_helper import mnist_loader_manual
-from data_helpers.iris_species_helper import torch_iris_loader
-from data_helpers.network_helper import one_hot_encode
-from data_helpers.nmnist_helper import torch_nmnist_loader
-from data_helpers.shd_helper import torch_SHD_loader
-from data_helpers.cnn_mnist import get_weights_for_rank
+from dataset_helpers.mnist_helper import mnist_loader_manual
+from dataset_helpers.iris_species_helper import torch_iris_loader
+from dataset_helpers.network_helper import one_hot_encode
+from dataset_helpers.nmnist_helper import torch_nmnist_loader
+from dataset_helpers.shd_helper import torch_SHD_loader
+from dataset_helpers.cnn_mnist import get_weights_for_rank
 
-from helpers import pad_batch, accuracy, store_training_data
+from other_helpers.helpers import pad_batch, accuracy, store_training_data
+from other_helpers.backpropagation import back_prop
+from other_helpers.loss_functions import loss_bpp, mean_loss
+
 from jax.experimental import io_callback
 
 def save_to_file(x, file_idx):
@@ -1194,79 +1197,6 @@ def conv_predict(params, key, weights, empty_neuron_states, layer_computation, b
 
 
 #region Training helpers
-@partial(jax.jit, static_argnames=['params'])
-def compute_full_bpp(params, all_neuron_states, next_res, next_grad):
-    '''
-    Computes the full bpp for a single element in the batch. 
-    Shapes are given as reference for a network (784, 128, 64, 10) and for the first hidden layer with weights (784, 128).
-
-    input_vector: contains for each input neuron the last iteration for which an event was received, input shape: (784,)
-    output_vector: contains for each output neuron the last iteration for which it activated, output shape: (128,)
-    layer_activity: contains for each neuron the number of times it activated, layer shape: (128,)
-
-    next_res: contains the weight residuals of the next layer (64, 10)
-    next_grad: contains the gradient from the next layer == gradient w.r.t. the output (O^t in mathematical derivation) (64,)
-
-    (1) Compute weight_res:
-        Computes the weight residual that contains 1 if the correponding weight has received an input and the correponding output has fired either directly or later after integrating the input and 0 otherwise
-    (2) Recompute weight_res with next_res:
-        Recompute the weight residuals of the current layer by taking into account the weight residuals of the next layer.
-        Basically if one row (neuron) in the next layer's weights residuals is all zeros (=neuron never activated), then the corresponding column in the current layer should be set to zero. 
-    (3) Apply restrict to the weight_res:
-        Apply [1-(1-alpha)^n]/alpha, the result of the finite geometric series where n is the number of times a neuron activated in the layer and alpha is the restrict parameter
-        Previous computation: 1+(1-alpha)^(n*(n+1)/2)
-    (4) Compute the partial gradient w.r.t the weights by integrating the next layer's gradient:
-        z_grad = weights_residuals * next_grad
-    (5) Compute the full gradient w.r.t the weights by multiplying with the input residuals:
-        weight_grad = input_residuals * z_grad
-
-
-    Return:
-        weight_grad, shape: (784, 128)
-    '''
-    input_vector = all_neuron_states.input_vector
-    output_vector = all_neuron_states.output_vector
-    layer_activity = all_neuron_states.layer_activity
-
-    # (1) Shape: (784, 128)
-    weight_res = (input_vector[:, None] <= output_vector[None, :])
-
-    # (2) Shape: (784, 128)
-    weight_res = weight_res * (~jnp.all(next_res == 0, axis=1))[None, :]
-
-    # (3) Shape: (784, 128)
-    # exponent = (layer_activity*(layer_activity+1)/2).astype(jnp.int32)
-    # new_layer_activity = jnp.where(params.restrict[split_rank] > 0, 1+jnp.power((1-params.restrict[split_rank]), exponent), 1)
-    a = params.restrict[split_rank]
-    new_layer_activity = jnp.where(a > 0, (1-jnp.power((1-a), layer_activity+1))/a, 1) # Shape (128,)
-    mul_res = jnp.broadcast_to(new_layer_activity, weight_res.shape) 
-    weight_res = weight_res * mul_res
-
-    # (4) Shape: (784, 128)
-    next_grad_expanded = jnp.expand_dims(next_grad, axis=0)  # Shape: (1, 128)
-    z_grad = weight_res * next_grad_expanded
-
-    # (5) Shape: (784, 128)
-    x = all_neuron_states.input_residuals # Shape (784,)
-    x_reshaped = x[..., jnp.newaxis]      # Shape becomes (784, 1)
-
-    weight_grad = x_reshaped * z_grad # (784, 128)
-
-    return weight_grad, weight_res
-
-@partial(jax.jit, static_argnames=['params'])
-def back_prop(params, all_neuron_states, next_grad, next_weight_res):
-    weight_grad, weight_res  = jax.vmap(compute_full_bpp, in_axes=(None, 0, 0, 0))(params, all_neuron_states, next_weight_res, next_grad) # Shape: (B, 784, 128)
-    mean_weight_grad = jnp.mean(weight_grad, axis=0) # (784, 128)
-    mean_weight_grad = jnp.expand_dims(mean_weight_grad, axis=0)  # Shape: (1, 784, 128)
-
-    layer_activity = jnp.where(all_neuron_states.layer_activity > 0, 1, 0)
-    th_grad = -jnp.mean(next_grad * layer_activity, axis=0)  # Shape: (128)
-    thresholds = all_neuron_states.thresholds
-    th_grad = th_grad * thresholds * (thresholds - 1)
-
-    return mean_weight_grad, th_grad, weight_res
-
 @partial(jax.jit, static_argnames=['params', 'layer_computation', 'conv_layer_sizes'])
 def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, layer_computation, batch_data):
     '''
@@ -1285,7 +1215,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
                                    lambda _: (next_weight_res), None) 
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_weight_res)
 
-    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, next_weight_res)
+    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, next_weight_res, split_rank)
 
     if split_rank > 1:
         send_grad = jnp.dot(next_grad, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
@@ -1405,45 +1335,6 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     return all_outputs, iterations, all_neuron_states, (weight_grad, th_grad, weight_sparsity_grad, th_sparsity_grad) 
 
 # Define the loss function
-def softmax_cross_entropy_with_logits(logits, labels):
-    # Compute the softmax in a numerically stable way
-    logits_max = jnp.max(logits, axis=0, keepdims=True)
-    exps = jnp.exp(logits - logits_max)
-    softmax = exps / (jnp.sum(exps, axis=0, keepdims=True) + 1e-8)
-    # Compute the cross-entropy loss
-    cross_entropy = -jnp.sum(labels * jnp.log(softmax + 1e-8), axis=0)
-    return cross_entropy
-
-def mean_loss(logits, labels):
-    batched_softmax_cross_entropy = jax.vmap(softmax_cross_entropy_with_logits, in_axes=(0, 0))
-    losses = batched_softmax_cross_entropy(logits, labels)
-    return jnp.mean(losses)
-
-@jit
-def loss_bpp(weights, all_neuron_states, loss_grad):
-    '''
-    For each batch element:
-    Compute the gradient of output layer and the gradient w.r.t the weights of the output layer
-    Shapes are given for an output layer of shape (128, 10) 
-
-    (1) Compute the gradient w.r.t the output of the layer:
-        out_grad = weights @ loss_grad
-    (2) Compute the gradient w.r.t the weights of the layer:
-        weight_grad = loss_grad * input_residuals
-
-    Return:
-        out_grad, shape: (128,)
-        weight_grad, shape: (128, 10)
-    '''
-    out_grad = jnp.dot(weights, loss_grad) # Shape: (128,)
-    
-    loss_grad_expanded = jnp.expand_dims(loss_grad, axis=1)  # Shape: (10, 1)
-    all_residuals = all_neuron_states.input_residuals # Shape: (128,)
-
-    weight_grad = loss_grad_expanded * all_residuals  # Shape: (10, 128)
-    
-    return out_grad, weight_grad.T
-
 @partial(jax.jit, static_argnames=['params', 'layer_computation',])
 def loss_fn(params, key, weights, empty_neuron_states, layer_computation, target, batch_data):
     all_outputs, iterations, all_neuron_states = (conv_predict)(params, key, weights, empty_neuron_states, layer_computation, batch_data)
@@ -2218,7 +2109,7 @@ if __name__ == "__main__":
                 shuffle_activations=False,
                 restrict=restrict,
                 firing_nb=2000,
-                sync_rate=1,
+                sync_rate=1000000,
                 max_nonzero=max_nonzero,
                 shuffle_input=False,
                 threshold_lr=0.0, 

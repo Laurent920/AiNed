@@ -7,7 +7,7 @@ from PIL import Image
 import math
 from abc import ABC, abstractmethod
 try:
-    import data_helpers.network_helper as network_helper
+    import dataset_helpers.network_helper as network_helper
 except ModuleNotFoundError:
     import network_helper
 # region TORCH LOADER
@@ -313,11 +313,13 @@ def preprocess_dataset_CNN(dataset_x, max_nonzero):
 
 if __name__ == "__main__":
     torch_load = False
+    torch_load = True
+
     if torch_load:
         layer_sizes = [784, 512, 512, 10]
         step_size = 0.01
-        num_epochs = 8
-        batch_size = 128
+        num_epochs = 20
+        batch_size = 36
         n_targets = 10
         
         params = init_network_params(layer_sizes, jax.random.key(0))
@@ -325,14 +327,14 @@ if __name__ == "__main__":
         batched_predict = vmap(predict, in_axes=(None, 0))
 
         training_generator, train, test, total_batches = torch_mnist_loader(batch_size, n_targets)
-        print(total_batches)
-        for x, y in training_generator:
-            print(f"Batch x: {x},{type(x)}")
-            print(f"Batch y: {y}, {type(y)}")
-            break
-        # torch_train(training_generator, train, test, params)
+        # print(total_batches)
+        # for x, y in training_generator:
+        #     print(f"Batch x: {x},{type(x)}")
+        #     print(f"Batch y: {y}, {type(y)}")
+        #     break
+        torch_train(training_generator, train, test, params)
     else:    
-        batch_size = 128
+        batch_size = 36
         # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
         
         # d = iter(test_generator)
@@ -352,7 +354,7 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
         # layer_size.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
-        layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
+        # layer_size.append((28*28, 32, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 32, 10))
         # layer_size.append((28*28, 32, 32, 32, 10))
@@ -368,9 +370,10 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
-        # layer_size.append((28*28, 32, 10))
+        layer_size.append((28*28, 128, 10))
         # layer_size.append((28*28, 128, 128, 10))
         
+        epoch_num = 20
         for layer_dims in layer_size:
             print(f"running {layer_dims}")
             network = network_helper.MLP(layer_dims)
@@ -397,7 +400,6 @@ if __name__ == "__main__":
             # Define loss function
             loss_func = network_helper.SoftmaxCrossEntropy()
 
-            epoch_num = 20
             start_time = time.time()
             train_accuracy_list, val_accuracy_list = [], []
             train_accuracy_list, val_accuracy_list, activations = network_helper.train_func(network, training_generator, validation_generator, optimizer, loss_func, epoch_num)

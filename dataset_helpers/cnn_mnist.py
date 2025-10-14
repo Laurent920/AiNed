@@ -1,5 +1,5 @@
 try:
-    from data_helpers.mnist_helper import mnist_loader_manual
+    from dataset_helpers.mnist_helper import mnist_loader_manual
 except ModuleNotFoundError:
     from mnist_helper import mnist_loader_manual
 
@@ -13,6 +13,9 @@ import time
 import matplotlib.pyplot as plt 
 import json
 
+save = False
+epochs = 10
+batch_size = 36
 # ==========================================================
 # CNN MODEL
 # ==========================================================
@@ -22,10 +25,10 @@ class SimpleCNN(nn.Module):
 
         # Define your layers
         self.conv1 = nn.Conv2d(1, 3, kernel_size=3, stride=1, padding=1, bias=False)
-        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
         self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
-        # self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
         # self.pool2 = nn.AvgPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
         # self.out = nn.Linear(28*28*3, 10, bias=False)
@@ -51,17 +54,15 @@ class SimpleCNN(nn.Module):
         self._record_activation("conv1", x)
         # print(x.shape)
 
-        x = self.pool1(x)
-        self._record_activation("pool1", x)
+        # x = self.pool1(x)
+        # self._record_activation("pool1", x)
         # print(x.shape)
 
         x = F.relu(self.conv2(x))
         self._record_activation("conv2", x)
  
-        # print("before pooling: ", torch.count_nonzero(x[0]))
-        # x = self.pool2(x)
-        # self._record_activation("pool2", x)
-        # print("after pooling: ", torch.count_nonzero(x[0]))
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
         
         # print(x.shape)
         x = x.view(x.size(0), -1)
@@ -183,7 +184,7 @@ class VGG16(nn.Module):
 # ==========================================================
 # TRAINING AND EVALUATION
 # ==========================================================
-def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.001):
+def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
     model = SimpleCNN().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
@@ -255,7 +256,7 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
     print(f"Execution Time: {execution_time:.6f} seconds")
     print(f"Inference Execution Time: {inference_time:.6f} seconds")
     input_shape = (1, 28, 28)
-    save_cnn_weights(model, input_shape, batch_size, epochs, train_accs, val_accs, test_acc, 
+    if save: save_cnn_weights(model, input_shape, batch_size, epochs, train_accs, val_accs, test_acc, 
                      execution_time=execution_time, inference_time=inference_time)
 
     return model
@@ -417,8 +418,6 @@ def get_weights_for_rank(filename, rank):
 # MAIN SCRIPT
 # ==========================================================
 if __name__ == "__main__":
-    batch_size = 36
-    epochs = 15
     (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, preprocess=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
