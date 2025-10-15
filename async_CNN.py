@@ -39,9 +39,10 @@ from dataset_helpers.nmnist_helper import torch_nmnist_loader
 from dataset_helpers.shd_helper import torch_SHD_loader
 from dataset_helpers.cnn_mnist import get_weights_for_rank
 
-from other_helpers.helpers import pad_batch, accuracy, store_training_data
+from other_helpers.helpers import accuracy, store_training_data
 from other_helpers.backpropagation import back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
+from other_helpers.MPI_helpers import MPIConfig, combine_batch, gather_batch, split_batch
 
 from jax.experimental import io_callback
 
@@ -65,10 +66,12 @@ split_rank = None           # Rank corresponding to the layer
 process_per_layer = None    # Number of processes for each layer
 last_rank = None            # Rank of last layer
 batch_part = None           # The size of the batch on each process
+mpi_config = None           # MPIConfig class for mpi helpers functions
 
 training_generator = None
 validation_generator = None
 test_generator = None
+
 
 @jax.tree_util.register_pytree_node_class
 class NeuronStates:
@@ -127,6 +130,7 @@ class ConvNeuronStates():
         pooling (str):                       "" = No pooling, "max" == Max pooling, "avg" == Average pooling
     """
     def __init__(self, neuron_state: NeuronStates,
+                 weight_res: jnp.ndarray,
                  kernel: tuple[int, int],
                  padding: tuple[int, int] | str, # Padding can be either a tuple for padding in each direction or a string, "SAME"=keep same size, "VALID"=No padding
                  stride: tuple[int, int],
@@ -137,6 +141,7 @@ class ConvNeuronStates():
                  pool_stride: tuple[int, int] = (2, 2)):
 
         self.neuron_state = neuron_state
+        self.weight_res = weight_res
         self.kernel = kernel
         self.padding = padding
         self.stride = stride
@@ -153,7 +158,8 @@ class ConvNeuronStates():
     # PyTree flatten/unflatten
     def tree_flatten(self):
         children = (self.neuron_state,
-                    self.previous_layer)
+                    self.previous_layer,
+                    self.weight_res)
         aux_data = (self.kernel,
                     self.padding,
                     self.stride,
@@ -166,8 +172,8 @@ class ConvNeuronStates():
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         kernel, padding, stride, is_conv, pooling, pool_size, pool_stride = aux_data
-        neuron_state, previous_layer = children
-        return cls(neuron_state, kernel, padding, stride, previous_layer, 
+        neuron_state, previous_layer, weight_res = children
+        return cls(neuron_state, weight_res, kernel, padding, stride, previous_layer, 
                    is_conv, pooling, pool_size, pool_stride)
 
 @dataclasses.dataclass(frozen=True)
@@ -298,6 +304,7 @@ class Network:
 
                 key, subkey = jax.random.split(key) 
                 thresholds = jax.random.normal(subkey, values.shape) * params.init_thresholds + th_bias
+                weights_shape = (out_chan, in_chan, kernel[0], kernel[1])
                 neuron_state = NeuronStates(
                     values=values,
                     thresholds=thresholds,
@@ -309,12 +316,13 @@ class Network:
                     last_sent_iteration=0,
                     input_vector=jnp.zeros(previous_layer.shape),
                     output_vector=jnp.zeros(values.shape),
-                    weights_shape=(out_chan, in_chan, kernel[0], kernel[1]),
+                    weights_shape=weights_shape,
                     is_conv=True
                 )
 
                 empty_conv_neuron = ConvNeuronStates(
                     neuron_state=neuron_state,
+                    weight_res=jnp.zeros(weights_shape),
                     kernel=kernel,
                     padding=padding,
                     stride=stride,
@@ -644,23 +652,24 @@ def unpool(input_matrix, pooled, shape, pool_size=(2, 2), pool_stride=(2, 2)):
     
     # Create mask for matching values
     mask = (input_matrix == matrix_upsampled)
-    # print(mask)
+    
     # Create priority matrix: prefer top-left positions
-    # This gives unique priorities to each position
-    priority = jnp.arange(H * W).reshape(1, H, W) * mask
+    priority_base = jnp.arange(H * W, dtype=jnp.float32).reshape(H, W)
+    priority = jnp.broadcast_to(priority_base[None, :, :], (C, H, W))
+    
+    # Apply mask: set non-matching positions to -inf (not 0!)
+    priority = jnp.where(mask, priority, -jnp.inf)
     
     # For each pooling window, keep only the position with highest priority
-    def keep_first_max(x):
-        return jax.lax.reduce_window(
-            x,
-            init_value=-jnp.inf,
-            computation=jax.lax.max,
-            window_dimensions=(1, kh, kw),
-            window_strides=(1, sh, sw),
-            padding="VALID",
-        )
+    max_priorities = jax.lax.reduce_window(
+        priority,
+        init_value=-jnp.inf,
+        computation=jax.lax.max,
+        window_dimensions=(1, kh, kw),
+        window_strides=(1, sh, sw),
+        padding="VALID",
+    )
     
-    max_priorities = keep_first_max(priority)
     max_priorities_upsampled = jnp.repeat(jnp.repeat(max_priorities, sh, axis=1), sw, axis=2)
     
     if pad_h > 0 or pad_w > 0:
@@ -672,6 +681,7 @@ def unpool(input_matrix, pooled, shape, pool_size=(2, 2), pool_stride=(2, 2)):
     unique_mask = (priority == max_priorities_upsampled) & mask
     unpooled = matrix_upsampled * unique_mask
 
+    # jax.debug.print("rank {}, input {}, pooled {}, unpooled {}", rank, jnp.count_nonzero(input_matrix), jnp.count_nonzero(pooled), jnp.count_nonzero(unpooled))
     return unpooled
 
 @partial(jax.jit, static_argnums=(1, 2, 3, 4,))
@@ -728,10 +738,8 @@ def full_matrix_to_event_array_with_pooling(matrix, shape, pooling="", pool_size
         # Update the shape for output computation
         H, W = matrix.shape[1:]
         shape = (C, H, W)
-        
-
+    
     N = C * H * W
-
     # Coordinate grid
     c_grid, x_grid, y_grid = jnp.meshgrid(
         jnp.arange(C), jnp.arange(H), jnp.arange(W), indexing='ij'
@@ -836,7 +844,8 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
         unpooled = jnp.zeros_like(values)
         unpooled = unpooled.at[argmax_idx].set(pooled_values)
         
-        unpooled_matrix = jnp.concatenate([coords, unpooled[:, None]], axis=-1)
+        # unpooled = jnp.concatenate([coords, unpooled[:, None]], axis=-1)
+        unpooled_vals = unpooled
     elif mode == "avg":
         # segment_sum returns 0 for empty segments
         sums = jax.ops.segment_sum(values, pooled_idx, num_segments=num_segments)
@@ -844,7 +853,7 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
         area = ph * pw
         pooled_values = sums / float(area)
         # jax.debug.print("after segment sum and avg {} {} ", sums, pooled_values)
-        unpooled_matrix = jnp.zeros(input_shape)
+        unpooled_vals = jnp.zeros(values.shape)
     else:
         raise ValueError("mode must be 'max' or 'avg'")
 
@@ -858,7 +867,7 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
 
     nb_valid_el, compact_out = compact_nonzero_and_pad(out)
 
-    return nb_valid_el, compact_out, unpooled_matrix
+    return nb_valid_el, compact_out, coords, unpooled_vals
 
 @partial(jax.jit, static_argnums=(2, 3, 4, 5,))
 def output_to_event_array_with_pooling(activated_output, start_indices, end_indices, pooling="", pool_size=(2,2), pool_stride=(2,2)):
@@ -903,18 +912,21 @@ def output_to_event_array_with_pooling(activated_output, start_indices, end_indi
     target_size = (end_indices[0]) * (end_indices[1]) * (end_indices[2])
     
     nb_valid_el = activated_output.size 
+
+    coords = out_events[:, :3].astype(jnp.int32)   # (N,3) integers
+    values = out_events[:, 3].astype(jnp.float32)  # (N,)
     # Step 6: Apply pooling if needed
     if pooling != "":
         # Combine with pooled values
-        nb_valid_el, padded_out_events, unpooled_matrix = sparse_pool(out_events, end_indices, pooling, pool_size, pool_stride)
+        nb_valid_el, padded_out_events, unpooled_coords, unpooled_vals = sparse_pool(out_events, end_indices, pooling, pool_size, pool_stride)
         # jax.debug.print("after pool el: {} and out shape: {}", nb_valid_el, padded_out_events.shape)
     else:
         pad_to_full_size = jnp.full((target_size-nb_valid_el, 4), -2)
         padded_out_events = jnp.concatenate([out_events, pad_to_full_size])
-        unpooled_matrix = out_events
+        unpooled_coords, unpooled_vals = coords, values
     # jax.debug.print("end indices: {}, target size: {}, pad to full size shape: {}, padded out events shape: {}", end_indices, target_size, pad_to_full_size.shape, padded_out_events.shape)
 
-    return nb_valid_el, padded_out_events, unpooled_matrix
+    return nb_valid_el, padded_out_events, unpooled_coords, unpooled_vals
     
 #region Conv computation
 @partial(jax.jit, static_argnames=['params'])
@@ -983,32 +995,37 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                                 )
 
         # Step 5: Apply pooling and compute the output events 
-        nb_valid_elements, out_events, unpooled_matrix = output_to_event_array_with_pooling(activated_output, 
+        nb_valid_elements, out_events, unpooled_coords, unpooled_vals = output_to_event_array_with_pooling(activated_output, 
                                                                        start_indices, 
                                                                        new_values.shape,
                                                                        neuron_states.pooling,
                                                                        neuron_states.pool_size,
                                                                        neuron_states.pool_stride)
-        # jax.debug.print("rank {}, unpooled matrix {}", rank, unpooled_matrix)
-        # jax.debug.print("out shape {}", out_events.shape)
-        # jax.debug.print("n state values before {}, after {}, activations {}", jnp.count_nonzero(neuron_states.values), jnp.count_nonzero(new_neuron_states.values), activations)
-        # jax.debug.print("rank {} has activated_output shape: {}, out_events shape: {}", rank, activated_output, out_events.shape)
-        # jax.debug.print("neuron states: {}, values padded: {}", neuron_states, values_padded)
-        
+
         # Step 6: Update the neuron state
-        new_layer_activity = neuron_states.layer_activity.at[   unpooled_matrix[:, 0].astype(jnp.int32), 
-                                                                unpooled_matrix[:, 1].astype(jnp.int32), 
-                                                                unpooled_matrix[:, 2].astype(jnp.int32)
-                                                            ].add(unpooled_matrix[:,3])
-        # new_layer_activity = neuron_states.layer_activity
+        valid_els = jnp.where(unpooled_vals != 0, 1, 0)
+        new_weight_res = neuron_states.weight_res.at[   unpooled_coords[:, 0], 
+                                                        c,
+                                                        unpooled_coords[:, 1]-x, 
+                                                        unpooled_coords[:, 2]-y
+                                                    ].add(valid_els)
+        # jax.debug.print("rank {} unpooled coords {}, unpooled vals {}", rank, unpooled_coords[:, 1]-x, unpooled_coords[:, 2]-y)
+        new_layer_activity = neuron_states.layer_activity.at[   unpooled_coords[:, 0], 
+                                                                unpooled_coords[:, 1], 
+                                                                unpooled_coords[:, 2]
+                                                            ].add(unpooled_vals[:])
+
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
+        
+        input_act = neuron_states.input_activity
+        new_input_activity = jax.lax.cond(nb_valid_elements > 0, lambda _: input_act.at[neuron_idx].add(1), lambda _: input_act, None)
 
         new_neuron_states = ConvNeuronStates(neuron_state=
                                             NeuronStates(values=new_values,
                                                 thresholds=neuron_states.thresholds,
                                                 input_residuals=neuron_states.input_residuals.at[neuron_idx].add(layer_input),
                                                 input_order=neuron_states.input_order,
-                                                input_activity=neuron_states.input_activity,
+                                                input_activity=new_input_activity,
                                                 layer_activity=new_layer_activity,
                                                 output_activity=neuron_states.output_activity,
                                                 last_sent_iteration=new_last_sent_iteration,
@@ -1017,6 +1034,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                                 weights_shape=neuron_states.weights_shape,
                                                 is_conv=neuron_states.is_conv,
                                             ),
+                                            weight_res=new_weight_res,
                                             kernel=neuron_states.kernel,
                                             padding=neuron_states.padding,
                                             stride=neuron_states.stride,
@@ -1044,18 +1062,29 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
         # jax.debug.print("valid el {}, out events {}", nb_valid_elements, jnp.count_nonzero(activated_output))
         # jax.debug.print("{}", iteration)
         # jax.debug.print("out shape {}", out_events.shape)
-        new_layer_activity = neuron_states.layer_activity.at[   unpooled[:, 0].astype(jnp.int32), 
-                                                                unpooled[:, 1].astype(jnp.int32), 
-                                                                unpooled[:, 2].astype(jnp.int32)
-                                                            ].add(unpooled[:,3])
-        # new_layer_activity = neuron_states.layer_activity
+        
+        valid_el_coords = jnp.nonzero(unpooled, size=unpooled.size)
+        unpooled = unpooled.at[0,0,0].set(0)
+        new_layer_activity = neuron_states.layer_activity.at[   valid_el_coords[0], 
+                                                                valid_el_coords[1], 
+                                                                valid_el_coords[2]
+                                                            ].add(unpooled[valid_el_coords])
+        # jax.debug.print("rank {} {} {}", rank, nb_valid_elements, out_events)
+        # jax.debug.print("rank {} {}", rank, unpooled)
+        # jax.debug.print("rank {} {}", rank, unpooled[:, 2].astype(jnp.int32))
 
+        new_weight_res = neuron_states.weight_res.at[   valid_el_coords[0], 
+                                                        valid_el_coords[1]-x, 
+                                                        valid_el_coords[2]-y
+                                                    ].add(1)
+        # new_weight_res = neuron_states.weight_res
+        
         new_neuron_states = ConvNeuronStates(neuron_state=
                                             NeuronStates(values=remaining_value,
                                                 thresholds=neuron_states.thresholds,
-                                                input_residuals=neuron_states.input_residuals,#.at[neuron_idx].add(layer_input),
+                                                input_residuals=neuron_states.input_residuals,
                                                 input_order=neuron_states.input_order,
-                                                input_activity=neuron_states.input_activity,
+                                                input_activity=jnp.ones(neuron_states.input_activity.shape, dtype=int),
                                                 layer_activity=new_layer_activity,
                                                 output_activity=neuron_states.output_activity,
                                                 last_sent_iteration=neuron_states.last_sent_iteration,
@@ -1064,6 +1093,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                                 weights_shape=neuron_states.weights_shape,
                                                 is_conv=neuron_states.is_conv,
                                             ),
+                                            weight_res=new_weight_res,
                                             kernel=neuron_states.kernel,
                                             padding=neuron_states.padding,
                                             stride=neuron_states.stride,
@@ -1117,6 +1147,19 @@ def conv_predict(params, key, weights, empty_neuron_states, layer_computation, b
 
         # Initial carry: (timestep=0)
         iteration = jax.lax.fori_loop(0, x_p.shape[0], send_input, (0))
+        # x_p = jnp.array(x)
+        # def send_input(i, carry):
+        #     count = carry
+        #     data = x_p[i]
+        #     send(data, dest=rank+process_per_layer, tag=0, comm=comm)
+        #     return i
+
+        # def first_not_minus2(row):
+        #     return (row != -2)
+        # mask = jax.vmap(first_not_minus2)(x_p)
+        # loop_iterations = (jnp.count_nonzero(mask)/2).astype(int)
+
+        # iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
 
         # Send end signal
         send(jnp.array([-1.0, -1.0, -1.0, -1.0]), dest=rank+process_per_layer, tag=0, comm=comm)
@@ -1152,9 +1195,7 @@ def conv_predict(params, key, weights, empty_neuron_states, layer_computation, b
                 return None
             
             # Receive neuron values from previous layers and compute the activations
-            # input_shape = params.max_kernel + 3
-            input_shape = 4 
-            input_data = recv(jnp.zeros(input_shape), source=rank-process_per_layer, tag=0, comm=comm)
+            input_data = recv(jnp.zeros(4), source=rank-process_per_layer, tag=0, comm=comm)
             # Unpack
             neuron_idx = input_data[:3].astype(jnp.int32) # channel, x, y
             layer_input = input_data[3] # value
@@ -1208,20 +1249,22 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     # next_grad = recv(jnp.zeros((batch_part, layer_sizes[split_rank])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_grad)
 
-    next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank][0], params.layer_sizes[split_rank+1][0])) # Shape: (B, 128, 10)
-    # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
-    (next_weight_res) = jax.lax.cond(split_rank < last_rank - 1, 
-                                   lambda _: recv(next_weight_res, source=rank + process_per_layer, tag=3, comm=comm),
-                                   lambda _: (next_weight_res), None) 
+    # next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank][0], params.layer_sizes[split_rank+1][0])) # Shape: (B, 128, 10)
+    # # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
+    # (next_weight_res) = jax.lax.cond(split_rank < last_rank - 1, 
+    #                                lambda _: recv(next_weight_res, source=rank + process_per_layer, tag=3, comm=comm),
+    #                                lambda _: (next_weight_res), None) 
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_weight_res)
 
-    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, next_weight_res, split_rank)
+    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, split_rank)
 
     if split_rank > 1:
         send_grad = jnp.dot(next_grad, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
+        # jax.debug.print("rank {} send grad hape {} wres shape {} mul shape {}", rank, send_grad.shape, weight_res.shape, (~jnp.all(weight_res == 0, axis=2)).shape )
+        send_grad *= (~jnp.all(weight_res == 0, axis=2)) 
 
         send(send_grad, dest=rank-process_per_layer, tag=2, comm=comm)
-        send(weight_res, dest=rank-process_per_layer, tag=3, comm=comm)
+        # send(weight_res, dest=rank-process_per_layer, tag=3, comm=comm)
     
     # Sparsity loss gradients 
     all_activations, all_iterations, sparsity_L = sparsity_loss(params, all_neuron_states, iterations)
@@ -1234,8 +1277,8 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     input_activity = jnp.sum(all_neuron_states.input_activity, axis=0) # Shape (784)
     layer_activity = jnp.sum(all_neuron_states.layer_activity, axis=0) # Shape (128)
     
-    layer_activity = gather_batch(layer_activity, average=False) # Gather the weight gradients from all ranks in the split rank
-    input_activity = gather_batch(input_activity, average=False)
+    layer_activity = gather_batch(layer_activity, mpi_config, average=False) # Gather the weight gradients from all ranks in the split rank
+    input_activity = gather_batch(input_activity, mpi_config, average=False)
     
     sparsity_residuals = scaling * layer_activity # Shape: (128,)
     # jax.debug.print("Rank {}, scaling mean: {}, sparsity_residuals mean: {}, sparsity_residuals sum: {}", rank, scaling, jnp.mean(sparsity_residuals), jnp.sum(sparsity_residuals))
@@ -1256,23 +1299,28 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     if empty_neuron_states.pooling != "":
         # Upsampling next_grad: from (B, 5, 14, 14) to (B, 5, 28, 28) by copying each element sh*sw number of times
         sh, sw = empty_neuron_states.pool_size
-        next_grad = jnp.repeat(next_grad, sh, axis=2)
-        next_grad = jnp.repeat(next_grad, sw, axis=3)
+        next_grad = jnp.repeat(jnp.repeat(next_grad, sh, axis=2), sw, axis=3)
+
+        # Pad to the correct size 17->8 : 8->17
+        target_size_h, target_size_w = params.flat_layer_sizes[split_rank-1][1], params.flat_layer_sizes[split_rank-1][2]
+        pad_h = target_size_h - next_grad.shape[2]
+        pad_w = target_size_w - next_grad.shape[3]
+        next_grad = jnp.pad(next_grad, ((0, 0), (0, 0), (0, max(0, pad_h)), (0, max(0, pad_w))))
         # jax.debug.print("rank {} upsampled weight grad: {}", rank, next_grad.shape)
 
-    if len(params.layer_sizes[split_rank+1]) != 1: # Next layer is convolution layer
-        next_weight_shape = (params.layer_sizes[split_rank+1][0], params.layer_sizes[split_rank][0], *params.layer_sizes[split_rank+1][1])
-    else:
-        next_weight_shape = (np.prod(params.flat_layer_sizes[split_rank]), params.layer_sizes[split_rank+1][0])    
+    # if len(params.layer_sizes[split_rank+1]) != 1: # Next layer is convolution layer
+    #     next_res_shape_ = next_grad.shape
+    #     next_res_shape = (params.layer_sizes[split_rank+1][0], params.layer_sizes[split_rank][0], *params.layer_sizes[split_rank+1][1])
+    # else:
+    #     next_res_shape = (np.prod(params.flat_layer_sizes[split_rank]), params.layer_sizes[split_rank+1][0])    
 
-    # jax.debug.print("rank {}, next weight shape: {}", rank, next_weight_shape)
-    next_weight_res = jnp.ones(((batch_part,) + next_weight_shape)) # Shape: (B, 128, 10)
+    # # jax.debug.print("rank {}, next weight shape: {}", rank, next_weight_shape)
+    # next_res = jnp.ones(((batch_part,) + next_res_shape)) # Shape: (B, 128, 10)
     
-    # jax.debug.print("rank {} in conv predict has next_weight_res shape: {}", rank, next_weight_res.shape)
-    (next_weight_res) = jax.lax.cond(split_rank < last_rank - 1, 
-                                    lambda _: recv(next_weight_res, source=rank + process_per_layer, tag=3, comm=comm),
-                                    lambda _: (next_weight_res), None) 
-    
+    # # jax.debug.print("rank {} in conv predict has next_weight_res shape: {}", rank, next_weight_res.shape)
+    # (next_res) = jax.lax.cond(split_rank < last_rank - 1, 
+    #                                 lambda _: recv(next_res, source=rank + process_per_layer, tag=3, comm=comm),
+    #                                 lambda _: (next_res), None) 
     
     pad_x, pad_y = params.layer_sizes[split_rank][2]
     strides = params.layer_sizes[split_rank][3]
@@ -1314,20 +1362,31 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
         )
         
     input_residuals = all_neuron_states.input_residuals # Shape: (B, 3, 28, 28) 
+    input_residuals *= jnp.where(all_neuron_states.input_activity > 0, 1, 0)
     # jax.debug.print("rank {} in conv predict has input residuals shape {}, next grad shape: {}, weights shape: {}", rank, input_residuals.shape, next_grad.shape, weights.shape)
 
-    weight_res = jnp.zeros((batch_part,) + weights.shape)
-
     weight_grad = jax.vmap(grad_w)(input_residuals, next_grad) # Shape: (5, 3, 3, 3)
+    
+    # l_s = params.layer_sizes
+    # if len(l_s[split_rank]) != 1:
+    #     weight_grad = jnp.zeros((batch_size, l_s[split_rank][0], l_s[split_rank-1][0], l_s[split_rank][1][0], l_s[split_rank][1][1]))
+    # else:
+    #     weight_grad = jnp.zeros((batch_size, np.prod(params.flat_layer_sizes[split_rank]), params.layer_sizes[split_rank+1][0]))         
+
+    weight_res = jnp.where(all_neuron_states.weight_res > 0, 1, 0)
+    # weight_res = jnp.ones((batch_part,) + weights.shape)
+
+    weight_grad = weight_grad * weight_res
 
     th_grad = jnp.zeros(all_neuron_states.values.shape)
     
     if split_rank > 1:
         # send_grad = jnp.zeros((batch_part, *empty_neuron_states.values.shape))
         send_grad = (grad_x)(next_grad, weights)
+        # send_grad *= all_neuron_states.input_activity 
         # jax.debug.print(f"rank {rank}, weight grad shape: {weight_grad.shape}, send grad shape: {send_grad.shape}")
         send(send_grad, dest=rank-process_per_layer, tag=2,comm=comm)
-        send(weight_res, dest=rank-process_per_layer, tag=3,comm=comm)
+        # send(weight_res, dest=rank-process_per_layer, tag=3,comm=comm)
 
     weight_sparsity_grad = jnp.zeros(weights.shape)
     th_sparsity_grad = jnp.zeros(conv_layer_sizes[split_rank])
@@ -1367,8 +1426,8 @@ def sparsity_loss(params, all_neuron_states, iterations):
     leader_rank = split_rank * process_per_layer
     # jax.debug.print("Rank {}, activations shape: {}, iterations shape: {}, last layer neuron values: {}", rank, (activations.shape), jnp.mean(iterations.shape), jnp.sum(all_neuron_states.values))
 
-    activations = gather_batch(all_neuron_states.input_residuals, average=False) # Gather the weight gradients from all ranks in the split rank
-    iterations = gather_batch(iterations, average=True) # Gather the iterations from all ranks in the split rank
+    activations = gather_batch(all_neuron_states.input_residuals, mpi_config, average=False) # Gather the weight gradients from all ranks in the split rank
+    iterations = gather_batch(iterations, mpi_config, average=True) # Gather the iterations from all ranks in the split rank
     # jax.debug.print("Rank {}, activations shape: {}, iterations shape: {}, last layer neuron values: {}", rank, (activations.shape), jnp.mean(iterations.shape), jnp.sum(all_neuron_states.values))
 
     all_iterations = 0.0
@@ -1395,86 +1454,6 @@ def sparsity_loss(params, all_neuron_states, iterations):
     all_iterations = bcast(all_iterations, root=last_rank*process_per_layer, comm=comm)
 
     return all_activations, all_iterations, sparsity_L
-
-def split_batch(batch_iterator):
-    if rank == 0:
-        all_batch_x, all_batch_y = next(batch_iterator)
-        all_batch_y = jnp.array(all_batch_y, dtype=jnp.float32)
-        all_batch_x = jnp.array(all_batch_x, dtype=jnp.float32)
-        # print('shape before pad batch: {}', all_batch_x.shape)
-        all_batch_x, all_batch_y = pad_batch(all_batch_x, all_batch_y, batch_part* process_per_layer)
-        
-        for process in range(process_per_layer):
-            if process == 0:
-                batch_x = all_batch_x[:batch_part]
-                batch_y = all_batch_y[:batch_part]
-            else:
-                batch_x_to_send = all_batch_x[batch_part*(process):batch_part*(process+1)]
-                batch_y_to_send = all_batch_y[batch_part*(process):batch_part*(process+1)]
-                # print(f"rank {rank}, Batch_x: {batch_x_to_send.shape}, Batch_y: {batch_y_to_send.shape}")
-                
-                send(batch_x_to_send, dest=process, tag=4, comm=comm)
-                send(batch_y_to_send, dest=process, tag=4, comm=comm)
-    else:
-        batch_x = recv(jnp.zeros((batch_part, layer_sizes[0])), source=0, tag=4, comm=comm)  
-        batch_y = recv(jnp.zeros((batch_part,)), source=0, tag=4, comm=comm) 
-    
-    return batch_x, batch_y
-
-def gather_batch(data, average=True):
-    '''
-    Gather all the data from one split_rank onto one rank and resharing the average result to the corresonding split_ranks
-    '''
-    data = jnp.array(data)
-    leader_rank = split_rank * process_per_layer
-    if rank == leader_rank:
-        avg = data
-        for i in range(process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
-            received_data = recv(data, source=rank+i+1, tag=20, comm=comm)
-            avg += received_data
-        if average:
-            avg = avg / process_per_layer
-        
-        for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
-            send(avg, dest=rank+i+1, tag=20, comm=comm)
-    else:
-        send(data, dest=leader_rank, tag=20, comm=comm)
-        avg = recv(data, source=leader_rank, tag=20, comm=comm)
-    return avg
-
-def combine_batch(data, average=False):
-    '''
-    Concatenate all the data from one split_rank onto one rank to reconstruct the batch and resharing the combined result to the corresonding split_ranks
-    '''
-    data = jnp.array(data)
-    # if len(data.shape) < 2:
-        
-            
-    leader_rank = split_rank * process_per_layer
-    if rank == leader_rank:
-        avg = data
-        for i in range(0, process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
-            received_data = recv(data, source=rank+i+1, tag=20, comm=comm)
-            avg = jnp.concatenate([avg, received_data], axis=0)
-            # if jnp.isnan(avg).any():
-            #     jax.debug.print("Rank {}: process: {} NaN detected in avg data: {}", rank, i, avg.shape)
-            
-        if average:
-            # print(f"Rank {rank} combining batches, avg shape: {avg.shape}")
-            avg = jnp.mean(avg, axis=0)
-            # if jnp.isnan(avg).any():
-            #     jax.debug.print("Rank {}: NaN detected in avg data after mean: {}", rank, avg.shape)
-            # print(f"Rank {rank} combining batches, avg shape: {avg.shape}")
-
-
-        for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
-            send(avg, dest=rank+i+1, tag=20, comm=comm)
-    else:
-        send(data, dest=leader_rank, tag=20, comm=comm)
-        avg = recv(jnp.zeros((data.shape[1], data.shape[2])), source=leader_rank, tag=20, comm=comm)
-        
-    return avg
-
 
 # region TRAINING
 def train(params: Params, key, network, weights, empty_neuron_states, layer_computation, opti):     
@@ -1543,7 +1522,7 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
             # threshold_grad = 0.0
             if split_rank == 0:
                 # print("batch", i)
-                batch_x, batch_y = split_batch(batch_iterator)
+                batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 4)
                 # print(batch_y.shape, type(batch_y), batch_y)
                 send(batch_y, dest=last_rank * process_per_layer + rank, tag=10,comm=comm) # Destination rank: last_rank * process_per_layer + rank
 
@@ -1559,16 +1538,17 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
 
                     epoch_loss.append(loss)
                     
-                    weight_grad = gradients[1]
-                                        
+                    weight_grad = gradients[0]
+                    # print(f"rank {rank}, weight grad shape: {weight_grad.shape}")
+
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, False)                 
                     
                     # print(f"Batch correct: {batch_correct}/{batch_size}")
 
                     epoch_correct += batch_correct
                     epoch_total += valid_y.shape[0]
-                    # weight_grad = gather_batch(weight_grad, average=True)
-                    weight_grad = combine_batch(weight_grad, average=True) # Gather the weight gradients from all ranks in the split rank
+                    # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
+                    weight_grad = combine_batch(weight_grad, mpi_config, average=True) # Gather the weight gradients from all ranks in the split rank
                 else:
                     bwd_fn = predict_bwd
                     if empty_neuron_states.is_conv:
@@ -1579,10 +1559,10 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
                     # print(f"rank {rank}, weight_res: {weight_res[0].tolist()}, shape: {weight_res.shape}")
                     # print("rank weight grad shape: ", rank, weight_grad.shape)
                     # print(f"Rank {rank} finished predict_bwd for batch {i}, outputs shape: {outputs.shape}, iterations: {iterations.shape}, weight_grad shape: {weight_grad.shape}")
-                    threshold_grad = gather_batch(threshold_grad, average=True) # Gather the weight gradients from all ranks in the split rank
+                    threshold_grad = gather_batch(threshold_grad, mpi_config, average=True) # Gather the weight gradients from all ranks in the split rank
 
-                    # weight_grad = gather_batch(weight_grad, average=True)
-                    weight_grad = combine_batch(weight_grad, average=True) # Gather the weight gradients from all ranks in the split rank
+                    # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
+                    weight_grad = combine_batch(weight_grad, mpi_config, average=True) # Gather the weight gradients from all ranks in the split rank
                     
                     if params.sparsity_impact[split_rank] > 0:
                         weight_grad = weight_grad + weight_sparsity_grad
@@ -1600,6 +1580,7 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
                 if solver is not None:
                     # Optax optimizer
                     # continue
+                    # print(f"rank {rank}, weight grad shape: {weight_grad.shape}, weight shape: {weights.shape}")
                     updates, opt_state = solver.update(weight_grad, opt_state, weights)
                     weights = optax.apply_updates(weights, updates)
                 else:                
@@ -1611,7 +1592,7 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
         epoch_iterations = jnp.array(epoch_iterations).flatten()
         mean = jnp.mean(epoch_iterations)
         all_mean_iterations.append(mean)
-        all_mean_iterations = gather_batch(all_mean_iterations)
+        all_mean_iterations = gather_batch(all_mean_iterations, mpi_config)
         all_mean_iterations = all_mean_iterations.tolist()
         
         if split_rank != 0:
@@ -1625,14 +1606,14 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
             # Store loss values
             mean_loss = jnp.mean(jnp.array(epoch_loss))
             all_loss.append(mean_loss)
-            mean_loss = gather_batch(mean_loss)
+            mean_loss = gather_batch(mean_loss, mpi_config)
 
             # Store training and validation accuracies
             epoch_accuracy = epoch_correct / epoch_total
             all_epoch_accuracies.append(epoch_accuracy)
             all_validation_accuracies.append(val_accuracy)
-            all_epoch_accuracies = gather_batch(all_epoch_accuracies)
-            all_validation_accuracies = gather_batch(all_validation_accuracies)
+            all_epoch_accuracies = gather_batch(all_epoch_accuracies, mpi_config)
+            all_validation_accuracies = gather_batch(all_validation_accuracies, mpi_config)
             all_epoch_accuracies, all_validation_accuracies = all_epoch_accuracies.tolist(), all_validation_accuracies.tolist()
             if rank == size-1:
                 jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, all_epoch_accuracies[-1] * 100, val_accuracy * 100, mean_loss, val_mean)
@@ -1766,7 +1747,7 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
     for i in tqdm(range(total_batches)):
         neuron_states = empty_neuron_states
         if split_rank == 0:                 
-            batch_x, batch_y = split_batch(batch_iterator)
+            batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 4)
             # print(f"batch {i}")
             # print(f"rank {rank} batch x shape: {batch_x.shape}, batch y shape: {batch_y.shape}, batch y: {batch_y}")
             
@@ -1822,7 +1803,7 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
     # print(f"Rank {rank} finished epoch with mean {mean} with {epoch_iterations.shape} iterations")
 
     if split_rank != 0:
-        mean = gather_batch(mean)
+        mean = gather_batch(mean, mpi_config)
     # jax.debug.print("Rank {}, all iterations shape: {}", rank, (epoch_iterations.shape[0]))
     
     if rank != 0 and debug:
@@ -1831,7 +1812,7 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
     epoch_accuracy = -1.0
     if split_rank == last_rank:
         epoch_accuracy = epoch_correct / epoch_total
-        epoch_accuracy = gather_batch(epoch_accuracy)
+        epoch_accuracy = gather_batch(epoch_accuracy, mpi_config)
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
@@ -1939,12 +1920,20 @@ def get_split_rank():
     global process_per_layer
     global last_rank
     global batch_part
-    
+    global mpi_config
+
     last_rank = len(layer_sizes)-1
     process_per_layer = size // (last_rank+1)
     split_rank = rank // process_per_layer
     batch_part = batch_size // process_per_layer
 
+    mpi_config = MPIConfig(
+        rank=rank,
+        split_rank=split_rank,
+        process_per_layer=process_per_layer,
+        batch_part=batch_part,
+        comm=comm
+    )
     print(f"Rank {rank}, split rank: {split_rank}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_rank}")
 
 if __name__ == "__main__":
@@ -1970,8 +1959,8 @@ if __name__ == "__main__":
     
     # NMNIST layers
     # all_layers.append(( (2, 34, 34), # (channel, height, width)
-    #                     (3, (3,3), (1,1), (1,1)), # (out_channel, kernel_size, padding, stride)
-    #                     # (2, (5,5), (2,2), (1,1)), 
+    #                     (3, (3,3), (1,1), (1,1), "max"), # (out_channel, kernel_size, padding, stride)
+    #                     (5, (3,3), (1,1), (1,1), "max"), 
     #                     # (64,),
     #                     (32,), # Fully connected layer
     #                     (10,)))
@@ -1985,7 +1974,7 @@ if __name__ == "__main__":
     #                     (10,)))
     
     all_layers.append(( (1, 28, 28),                                    # (channel, height, width)
-                        (3, (3,3), (1,1), (1,1), ""),                       # Conv layer                (out_channel, kernel_size, padding, stride)
+                        (3, (3,3), (1,1), (1,1), "max"),                       # Conv layer                (out_channel, kernel_size, padding, stride)
                         (5, (3,3), (1,1), (1,1), "max", (2,2), (2,2)),  # Conv layer With Pooling   (out_channel, kernel_size, padding, stride, pooling type, pool_size, pool_stride)
                         # (64,),
                         (128,), # Fully connected layer

@@ -5,18 +5,6 @@ import os
 import numpy as np
 import json
 
-def pad_batch(batch_x, batch_y, batch_size):
-    # Pad the x data with 0 and the y data with nan for the last batch
-    current_size = batch_y.shape[0]
-    if current_size < batch_size:
-        pad_amount = batch_size - current_size
-        pad_y = jnp.full((pad_amount,), -1.0, dtype=jnp.float32)
-        pad_x = jnp.zeros((pad_amount,) + batch_x.shape[1:], dtype=batch_x.dtype)  
-        # jax.debug.print("rank {}, has batch size: {} and pad batch size: {}", rank, current_size, pad_x.shape)
-        batch_y = jnp.concatenate([batch_y, pad_y], axis=0)
-        batch_x = jnp.concatenate([batch_x, pad_x], axis=0)
-    
-    return batch_x, batch_y
 
 def accuracy(batch_number, outputs, y, iterations, print):
     # Get predictions (indices of max values)

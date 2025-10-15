@@ -179,7 +179,6 @@ class VGG16(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-
                 
 # ==========================================================
 # TRAINING AND EVALUATION
