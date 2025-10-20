@@ -49,8 +49,8 @@ def basic_event_collate(batch):
     return list(events), np.array(labels)
 
 def custom_event_pad_collate(batch, max_len):
-    data, labels = zip(*batch)  # each d is a np structured array with dtype [('x', '<i8'), ('y', '<i8'), ('t', '<i8'), ('p', '<i8')]
-
+    data, labels = zip(*batch)  # each d is a np structured array with dtype [('t'), ('index'), ('p=1')]
+    # print(type(data[0]), data[0])
     padded_data = []
     for d in data:
         num_events = len(d)
@@ -60,7 +60,7 @@ def custom_event_pad_collate(batch, max_len):
             pad_len = max_len - num_events
             pad = np.zeros(pad_len, dtype=example_dtype)
             for name in example_dtype.names:
-                pad[name] = -2  # sentinel padding value, for example -1
+                pad[name] = -2  # sentinel padding value, for example -2
             d_padded = np.concatenate([d, pad], axis=0)
         else:
             d_padded = d[:max_len]
@@ -73,6 +73,7 @@ def custom_event_pad_collate(batch, max_len):
     # batch_tensor = torch.stack(padded_data)  # shape: (batch_size, max_len, 4)
     # labels_tensor = torch.tensor(labels)
     batch_array = jnp.stack([jnp.array(x) for x in padded_data])  # shape: (B, T, 3)
+    # print(batch_array[0])
     label_array = jnp.array(labels, dtype=jnp.int32)
     # print("type and shape", type(batch_array), batch_array.shape)
 

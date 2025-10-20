@@ -8,10 +8,13 @@ from tonic import DiskCachedDataset
 import tonic.transforms as transforms
 import numpy as np
 
-def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=False):
+def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=False, aggregate_time=True):
     '''
-    If not binned it returns the raw dataset in forms of tuples of 4 which correspond to (x, y, time, polarity),
+    If not binned it returns the raw dataset in forms of tuples of 4 which correspond to (x, y, time, polarity)=>(polarity, x, y, 1),
     x and y are comprised in [0,34] and polarity is 1 for positive spike and 0 for negative spike
+    
+    If binned and aggregate_time=True, returns (B, C, H, W) by summing across time.
+    If binned and aggregate_time=False, returns (B, T, C, H, W) with time preserved.
     '''
     sensor_size = tonic.datasets.NMNIST.sensor_size
 
@@ -33,13 +36,21 @@ def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=Fa
 
     transform = tonic.transforms.Compose([torch.from_numpy,
                                         torchvision.transforms.RandomRotation([-10,10])])
-    if augmentation:
-        cached_trainset = DiskCachedDataset(trainset, transform=transform, cache_path='./cache/nmnist/train')
+    
+    if binned:
+        train_cache_path = './cache/nmnist/binned/train'
+        test_cache_path = './cache/nmnist/binned/test'
     else:
-        cached_trainset = DiskCachedDataset(trainset, cache_path='./cache/nmnist/train') 
+        train_cache_path = './cache/nmnist/raw/train'
+        test_cache_path = './cache/nmnist/raw/test'
+        
+    if augmentation:
+        cached_trainset = DiskCachedDataset(trainset, transform=transform, cache_path=train_cache_path)
+    else:
+        cached_trainset = DiskCachedDataset(trainset, cache_path=train_cache_path) 
 
     # no augmentations for the testset
-    cached_testset = DiskCachedDataset(testset, cache_path='./cache/nmnist/test')
+    cached_testset = DiskCachedDataset(testset, cache_path=test_cache_path)
 
     # Train - validation - test split
     val_split = 0.2
@@ -51,9 +62,12 @@ def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=Fa
     maximum_time_steps = 314 # For binned data
 
     # Create DataLoaders
-    collate_fn = lambda batch: basic_event_collate(batch)
-    if binned:
-        collate_fn = lambda batch: custom_pad_collate(batch, maximum_time_steps) # For binned dataloader
+    # collate_fn = lambda batch: basic_event_collate(batch)
+    if binned: # For binned dataloader
+        if aggregate_time:
+            collate_fn = lambda batch: custom_pad_collate_aggregated(batch)
+        else:
+            collate_fn = lambda batch: custom_pad_collate(batch, maximum_time_steps)
     else:
         collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) # For raw dataloader
 
@@ -99,6 +113,27 @@ def get_max_timesteps(loaders_list):
     print(f"Maximum timesteps accros train, val and test: {max}")
     return max
 
+def custom_pad_collate_aggregated(batch):
+    '''
+    Collate function for binned data with time aggregation.
+    Returns: (B, C, H, W) by summing all time steps.
+    '''
+    batch_data, batch_targets = zip(*batch)
+
+    aggregated_data = []
+    for data in batch_data:
+        if not isinstance(data, torch.Tensor):
+            data = torch.from_numpy(data)
+        
+        # Sum across time dimension: (T, C, H, W) -> (C, H, W)
+        aggregated_frame = torch.sum(data, dim=0)
+        aggregated_data.append(aggregated_frame)
+
+    batch_tensor = torch.stack(aggregated_data)  # (B, C, H, W)
+    batch_targets = torch.tensor(batch_targets)
+
+    return batch_tensor, batch_targets
+
 def custom_pad_collate(batch, max_timesteps):
     '''
     Collate function for binned data
@@ -121,32 +156,50 @@ def custom_pad_collate(batch, max_timesteps):
 
 def basic_event_collate(batch):
     events, labels = zip(*batch)  # unzip list of tuples
+    print("events", events, events.shape)
     return list(events), np.array(labels)
 
 def custom_event_pad_collate(batch, max_len):
+    """
+    Collate function for raw event data.
+    Reshapes events from (x, y, t, p) to (p, x, y, 1) format.
+    """
     data, labels = zip(*batch)  # each d is a np structured array with dtype [('x', '<i8'), ('y', '<i8'), ('t', '<i8'), ('p', '<i8')]
-
+    
+    # print("data shape:", len(data), "first sample events:", len(data[0]))
+    
     padded_data = []
     for d in data:
         num_events = len(d)
         example_dtype = d.dtype
 
+        # Pad or truncate to max_len
         if num_events < max_len:
             pad_len = max_len - num_events
             pad = np.zeros(pad_len, dtype=example_dtype)
             for name in example_dtype.names:
-                pad[name] = -2  # sentinel padding value, for example -1
+                pad[name] = -2  # sentinel padding value
             d_padded = np.concatenate([d, pad], axis=0)
         else:
             d_padded = d[:max_len]
 
-        # Convert structured array to (max_len, 4) int64 numpy array
-        d_padded_2d = np.stack([d_padded[name] for name in example_dtype.names], axis=1).astype(np.int64)
-
-        padded_data.append(torch.from_numpy(d_padded_2d))
+        # Extract fields: (max_len,) arrays
+        p = d_padded['p']  # polarity
+        x = d_padded['x']  # x coordinate
+        y = d_padded['y']  # y coordinate
+        # t = d_padded['t']  # timestamp (not used in new format)
+        
+        # Reshape to (max_len, 4) where columns are [p, x, y, 1]
+        ones = np.concatenate([np.ones(num_events, dtype=np.int64), np.full(max_len-num_events, -2, dtype=np.int64)])
+        d_reshaped = np.stack([p, x, y, ones], axis=1).astype(np.int64)
+        
+        padded_data.append(torch.from_numpy(d_reshaped))
 
     batch_tensor = torch.stack(padded_data)  # shape: (batch_size, max_len, 4)
     labels_tensor = torch.tensor(labels)
+    
+    # print(f"Batch tensor shape: {batch_tensor.shape}")
+    # print(f"First event in batch: {batch_tensor[0, 0]}")  # Should be [p, x, y, 1]
 
     return batch_tensor, labels_tensor
 
@@ -154,17 +207,18 @@ if __name__ == "__main__":
     (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), maximum_time_steps = torch_nmnist_loader(128, shuffle=False, augmentation=False)
     print(f"Total train batches: {total_train_batches}, Total val batches: {total_val_batches}, Total test batches: {total_test_batches}, maximum time steps: {maximum_time_steps}")
     
-    # max = 0
-    # for data, y in trainloader:
-    #     for i, x in enumerate(data):
-    #         new_max = x.shape[0] 
-    #         if new_max > max:
-    #             max = new_max
-    #             # print(x.shape)
-    #             print(new_max)
-    #         # if i == 127:
-    #         #     print(i)
-    #     print(f"data shape: {(x.shape)}, \ndata[0]: {(x)}, label: {(y.shape)}")
-    # print("final max", max)
+    max = 0
+    for loader in [testloader]:
+        for data, y in loader:
+            for i, x in enumerate(data):
+                new_max = x.shape[0] 
+                if new_max > max:
+                    max = new_max
+                    # print(x.shape)
+                    print(new_max)
+                # if i == 127:
+                #     print(i)
+            # print(f"data shape: {(x.shape)}, \ndata[0]: {(x)}, label: {(y.shape)}")
+    print("final max", max)
 
 # CLEAR CACHE: rm -r ./cache/nmnist

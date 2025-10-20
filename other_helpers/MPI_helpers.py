@@ -8,6 +8,7 @@ from mpi4jax import send, recv
 class MPIConfig:
     rank: int
     split_rank: int
+    last_rank: int
     process_per_layer: int
     batch_part: int
     comm: object
@@ -102,6 +103,7 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
 
     if rank == 0:
         all_batch_x, all_batch_y = next(batch_iterator)
+        # print(all_batch_x)
         all_batch_y = jnp.array(all_batch_y, dtype=jnp.float32)
         all_batch_x = jnp.array(all_batch_x, dtype=jnp.float32)
         # print('shape before pad batch: {}', all_batch_x.shape)

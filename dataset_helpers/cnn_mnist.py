@@ -1,7 +1,9 @@
 try:
     from dataset_helpers.mnist_helper import mnist_loader_manual
+    from dataset_helpers.nmnist_helper import torch_nmnist_loader
 except ModuleNotFoundError:
     from mnist_helper import mnist_loader_manual
+    from nmnist_helper import torch_nmnist_loader
 
 import torch
 import torch.nn as nn
@@ -12,10 +14,19 @@ import numpy as np
 import time
 import matplotlib.pyplot as plt 
 import json
+from tqdm import tqdm
 
-save = False
+save = True
 epochs = 10
 batch_size = 36
+
+dataet = "mnist"
+dataset = "nmnist"
+
+if dataset == "mnist":
+    input_shape = (1, 28, 28)
+else:
+    input_shape = (2, 34, 34)
 # ==========================================================
 # CNN MODEL
 # ==========================================================
@@ -36,6 +47,69 @@ class SimpleCNN(nn.Module):
         # self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
         self.fc1 = nn.Linear((14 * 14 * 5), 128, bias=False)
         # self.fc1 = nn.Linear(28 * 28 * 64, 32, bias=False)
+        self.out = nn.Linear(128, 10, bias=False)
+
+        # Automatically collect all layers with parameters
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AvgPool2d))
+            },
+            "input": []
+        }
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        x = F.relu(self.conv1(x))
+        self._record_activation("conv1", x)
+        # print(x.shape)
+
+        # x = self.pool1(x)
+        # self._record_activation("pool1", x)
+        # print(x.shape)
+
+        x = F.relu(self.conv2(x))
+        self._record_activation("conv2", x)
+ 
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
+        
+        # print(x.shape)
+        x = x.view(x.size(0), -1)
+        # print(x.shape)
+
+        # fc1
+        x = F.relu(self.fc1(x))
+        self._record_activation("fc1", x)
+
+        # output layer
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        """Helper to record average nonzero activations per sample."""
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+
+class NmnistCNN(nn.Module):
+    def __init__(self):
+        super(NmnistCNN, self).__init__()
+
+        # Define your layers
+        self.conv1 = nn.Conv2d(2, 3, kernel_size=3, stride=1, padding=1, bias=False)
+        # self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+
+        self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # self.pool2 = nn.AvgPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+
+        # self.out = nn.Linear(28*28*3, 10, bias=False)
+
+        # self.fc1 = nn.Linear(34 * 34 * 5, 128, bias=False)
+        self.fc1 = nn.Linear((17 * 17 * 5), 128, bias=False)
         self.out = nn.Linear(128, 10, bias=False)
 
         # Automatically collect all layers with parameters
@@ -184,7 +258,15 @@ class VGG16(nn.Module):
 # TRAINING AND EVALUATION
 # ==========================================================
 def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
-    model = SimpleCNN().to(device)
+    if dataset == "mnist":
+        model = SimpleCNN().to(device)
+        # model = VGG16().to(device)
+    elif dataset == "nmnist":
+        model = NmnistCNN().to(device)
+    else:
+        print("Wrong dataset")
+        return
+
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
     
@@ -197,8 +279,8 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         model.train()
         running_loss, correct, total = 0, 0, 0
 
-        for batch_idx, (inputs, targets) in enumerate(iter(train_loader)):
-            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+        for batch_idx, (inputs, targets) in tqdm(enumerate(iter(train_loader))):
+            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
             targets = torch.tensor(targets, dtype=torch.long).to(device)
 
             # UNCOMMENT to check if the two dataloader implementation are equal
@@ -254,7 +336,7 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
     execution_time = end_time - start_time
     print(f"Execution Time: {execution_time:.6f} seconds")
     print(f"Inference Execution Time: {inference_time:.6f} seconds")
-    input_shape = (1, 28, 28)
+    
     if save: save_cnn_weights(model, input_shape, batch_size, epochs, train_accs, val_accs, test_acc, 
                      execution_time=execution_time, inference_time=inference_time)
 
@@ -262,7 +344,7 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
 
 
 def save_cnn_weights(network, input_shape, batch_size, epochs, train_accs, val_accs, test_acc, 
-                     execution_time=None, inference_time=None, plot=False, output_dir="tensor_data/CNN"):
+                     execution_time=None, inference_time=None, plot=False, output_dir=f"tensor_data/CNN/{dataset}"):
     os.makedirs(output_dir, exist_ok=True)
 
     # ----- Build architecture string -----
@@ -337,7 +419,7 @@ def evaluate(model, loader, total_batches, device):
     correct, total = 0, 0
     with torch.no_grad():
         for inputs, targets in iter(loader):
-            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, 1, 28, 28).to(device)
+            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
             targets = torch.tensor(targets, dtype=torch.long).to(device)
             outputs = model(inputs)
             _, predicted = outputs.max(1)
@@ -417,7 +499,10 @@ def get_weights_for_rank(filename, rank):
 # MAIN SCRIPT
 # ==========================================================
 if __name__ == "__main__":
-    (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, preprocess=False)
+    if dataset == "mnist":
+        (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, preprocess=False)
+    elif dataset == "nmnist":
+        (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = torch_nmnist_loader(batch_size, binned=True, aggregate_time=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
