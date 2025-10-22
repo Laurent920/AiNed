@@ -24,10 +24,11 @@ class MPIConfig:
                 self.split_rank == other.split_rank and 
                 self.process_per_layer == other.process_per_layer)
     
-@partial(jax.jit, static_argnames=['average', 'mpi_config',])
-def combine_batch(data, mpi_config, average=False):
+@partial(jax.jit, static_argnames=['mpi_config',])
+def combine_batch_avg(data, mpi_config):
     '''
-    Concatenate all the data from one split_rank onto one rank to reconstruct the batch and resharing the averaged result to the corresponding split_ranks
+    Concatenate all the data from one split_rank onto one rank to reconstruct the batch and 
+    resharing the averaged result to the corresponding split_ranks
     '''
     rank = mpi_config.rank
     split_rank = mpi_config.split_rank
@@ -43,9 +44,8 @@ def combine_batch(data, mpi_config, average=False):
         for i in range(0, process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
             received_data = recv(data, source=rank+i+1, tag=20, comm=comm)
             avg = jnp.concatenate([avg, received_data], axis=0)            
-        if average:
-            # print(f"Rank {rank} before combining batches, avg shape: {avg.shape}")
-            avg = jnp.mean(avg, axis=0)
+        # print(f"Rank {rank} before combining batches, avg shape: {avg.shape}")
+        avg = jnp.mean(avg, axis=0)
 
         for i in range(process_per_layer-1): # Resharing the average data to all the corresponding ranks
             send(avg, dest=rank+i+1, tag=20, comm=comm)

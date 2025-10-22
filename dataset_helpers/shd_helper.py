@@ -8,6 +8,7 @@ from tonic import DiskCachedDataset
 import tonic.transforms as transforms
 import numpy as np
 import jax.numpy as jnp
+from tqdm import tqdm
 
 def torch_SHD_loader(batch_size, shuffle=False):
     trainset = tonic.datasets.SHD(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
@@ -28,7 +29,7 @@ def torch_SHD_loader(batch_size, shuffle=False):
     val_len = len(cached_trainset) - train_len
     train_subset, val_subset = random_split(cached_trainset, [train_len, val_len])
 
-    max_data_length = 14917
+    max_data_length = 16257
     # Create DataLoaders
     collate_fn = lambda batch: basic_event_collate(batch)
     collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) 
@@ -41,7 +42,6 @@ def torch_SHD_loader(batch_size, shuffle=False):
     total_val_batches = len(valloader)
     total_test_batches = len(testloader)
 
-    # maximum_time_steps = get_max_timesteps([valloader])
     return (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_data_length
 
 def basic_event_collate(batch):
@@ -49,52 +49,47 @@ def basic_event_collate(batch):
     return list(events), np.array(labels)
 
 def custom_event_pad_collate(batch, max_len):
-    data, labels = zip(*batch)  # each d is a np structured array with dtype [('t'), ('index'), ('p=1')]
-    # print(type(data[0]), data[0])
+    data, labels = zip(*batch)  # each d is a np structured array with dtype [('t'), ('x'), ('p=1')]
     padded_data = []
+
     for d in data:
         num_events = len(d)
-        example_dtype = d.dtype
-
-        if num_events < max_len:
+        if num_events <= max_len:
             pad_len = max_len - num_events
-            pad = np.zeros(pad_len, dtype=example_dtype)
-            for name in example_dtype.names:
-                pad[name] = -2  # sentinel padding value, for example -2
-            d_padded = np.concatenate([d, pad], axis=0)
+
+            # Pre-allocate the output array directly
+            d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
+            
+            # Fill in the actual data (no need to create intermediate structured array)
+            d_padded_2d[:num_events, 0] = d['x'].astype(np.int32)  # p values
+            d_padded_2d[:num_events, 1] = 1  # ones for actual events
+            # Padding (-2) is already filled by np.full
         else:
-            d_padded = d[:max_len]
+            print(f"data size exceeds the max len: {num_events} {max_len}")
+            raise NotImplementedError
 
-        # Convert structured array to (max_len, 4) int64 numpy array
-        d_padded_2d = np.stack([d_padded[name] for name in example_dtype.names], axis=1).astype(np.int64)
+        padded_data.append(d_padded_2d)
 
-        padded_data.append(torch.from_numpy(d_padded_2d))
-
-    # batch_tensor = torch.stack(padded_data)  # shape: (batch_size, max_len, 4)
-    # labels_tensor = torch.tensor(labels)
-    batch_array = jnp.stack([jnp.array(x) for x in padded_data])  # shape: (B, T, 3)
-    # print(batch_array[0])
+    # Convert directly to JAX array
+    batch_array = jnp.array(padded_data, dtype=jnp.int32)  # shape: (B, max_len, 4)
     label_array = jnp.array(labels, dtype=jnp.int32)
-    # print("type and shape", type(batch_array), batch_array.shape)
 
-    return batch_array[:,:,-2:], label_array
+    return batch_array, label_array
 
 if __name__ == '__main__':
     batch_size = 128
     (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_nonzero = torch_SHD_loader(batch_size)
     batch_iterator = iter(trainloader)
     max_length = 0
-    for batch in batch_iterator:
-        data, labels = batch
-        print(data.shape, (data[0][0]), (labels))
-    
-        for d in data:
-            # last_el = d[:, -2:]
-            # print(last_el)
-            length = d.shape[0]
-            if length > max_length:
-                print('max length:', max_length)
-                max_length = length
-    # print(max_length)
-    
+    for loader in [trainloader, valloader, testloader]:
+        for batch in tqdm(iter(loader)):
+            data, labels = batch
+            # print(data.shape, (data[0][0]), (labels))
+        
+            for d in data:
+                length = d.shape[0]
+                if length > max_length:
+                    print('max length:', max_length)
+                    max_length = length
+    print(max_length)    
     # CLEAR CACHE: rm -r ./cache/SHD

@@ -74,7 +74,8 @@ def back_prop(params, all_neuron_states, next_grad, split_rank):
 
     layer_activity = jnp.where(all_neuron_states.layer_activity > 0, 1, 0)
     th_grad = -jnp.mean(next_grad * layer_activity, axis=0)  # Shape: (128)
-    thresholds = all_neuron_states.thresholds
+    thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
     th_grad = th_grad * thresholds * (thresholds - 1)
+    # jax.debug.print("{} {} {}", layer_activity.shape, thresholds, th_grad.shape)
 
     return mean_weight_grad, th_grad, weight_res

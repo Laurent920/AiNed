@@ -408,9 +408,8 @@ def process_history(history, index, target_labels):
     return acc_history, avg_rank
 
 def store_history(all_history, result_path, total_batches):
-    print(all_history, all_history.shape)
     all_history = all_history.transpose(1, 0, 2)
-    print("all history shape: ",all_history.shape)
+    # print("all history shape: ",all_history.shape)
 
     def flatten_history(history, batch_number):
         # shape (epoch * num_batches, 100) -> (epoch, num_batches, 100)
@@ -425,7 +424,7 @@ def store_history(all_history, result_path, total_batches):
                     flatten_history(arr_slice, total_batches)
                     for arr_slice in all_history  # arr is shape (2, T, H)
                     ])
-    print(f"Flattened shape: {flat_history[0].shape}, {flat_history[1].shape}")
+    # print(f"Flattened shape: {flat_history[0].shape}, {flat_history[1].shape}")
     
     # Create side-by-side subplots
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns

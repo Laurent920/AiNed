@@ -3,10 +3,12 @@ import torchvision
 from torch.utils.data import DataLoader, random_split
 from torch.nn.functional import pad
 
+import jax.numpy as jnp
 import tonic
 from tonic import DiskCachedDataset
 import tonic.transforms as transforms
 import numpy as np
+from tqdm import tqdm
 
 def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=False, aggregate_time=True):
     '''
@@ -165,60 +167,48 @@ def custom_event_pad_collate(batch, max_len):
     Reshapes events from (x, y, t, p) to (p, x, y, 1) format.
     """
     data, labels = zip(*batch)  # each d is a np structured array with dtype [('x', '<i8'), ('y', '<i8'), ('t', '<i8'), ('p', '<i8')]
-    
-    # print("data shape:", len(data), "first sample events:", len(data[0]))
-    
     padded_data = []
+
     for d in data:
         num_events = len(d)
-        example_dtype = d.dtype
 
-        # Pad or truncate to max_len
-        if num_events < max_len:
+        if num_events <= max_len:
             pad_len = max_len - num_events
-            pad = np.zeros(pad_len, dtype=example_dtype)
-            for name in example_dtype.names:
-                pad[name] = -2  # sentinel padding value
-            d_padded = np.concatenate([d, pad], axis=0)
+
+            # Pre-allocate the output array directly
+            d_padded_2d = np.full((max_len, 4), -2, dtype=np.int32)
+            
+            # Fill in the actual data (no need to create intermediate structured array)
+            d_padded_2d[:num_events, 0] = d['p'].astype(np.int32)  # p values
+            d_padded_2d[:num_events, 1] = d['x'].astype(np.int32)  # x values
+            d_padded_2d[:num_events, 2] = d['y'].astype(np.int32)  # y values
+            d_padded_2d[:num_events, 3] = 1  # ones for actual events
+            # Padding (-2) is already filled by np.full
         else:
-            d_padded = d[:max_len]
+            print(f"data size exceeds the max len: {num_events} {max_len}")
+            raise NotImplementedError
 
-        # Extract fields: (max_len,) arrays
-        p = d_padded['p']  # polarity
-        x = d_padded['x']  # x coordinate
-        y = d_padded['y']  # y coordinate
-        # t = d_padded['t']  # timestamp (not used in new format)
-        
-        # Reshape to (max_len, 4) where columns are [p, x, y, 1]
-        ones = np.concatenate([np.ones(num_events, dtype=np.int64), np.full(max_len-num_events, -2, dtype=np.int64)])
-        d_reshaped = np.stack([p, x, y, ones], axis=1).astype(np.int64)
-        
-        padded_data.append(torch.from_numpy(d_reshaped))
+        padded_data.append(d_padded_2d)
 
-    batch_tensor = torch.stack(padded_data)  # shape: (batch_size, max_len, 4)
-    labels_tensor = torch.tensor(labels)
+    # Convert directly to JAX array
+    batch_array = jnp.array(padded_data, dtype=jnp.int32)  # shape: (B, max_len, 4)
+    label_array = jnp.array(labels, dtype=jnp.int32)
     
-    # print(f"Batch tensor shape: {batch_tensor.shape}")
-    # print(f"First event in batch: {batch_tensor[0, 0]}")  # Should be [p, x, y, 1]
-
-    return batch_tensor, labels_tensor
+    return batch_array, label_array
 
 if __name__ == "__main__":
     (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), maximum_time_steps = torch_nmnist_loader(128, shuffle=False, augmentation=False)
     print(f"Total train batches: {total_train_batches}, Total val batches: {total_val_batches}, Total test batches: {total_test_batches}, maximum time steps: {maximum_time_steps}")
     
     max = 0
-    for loader in [testloader]:
-        for data, y in loader:
+    for loader in [trainloader, valloader, testloader]:
+        for batch in tqdm(iter(loader)):
+            data, labels = batch
             for i, x in enumerate(data):
                 new_max = x.shape[0] 
                 if new_max > max:
                     max = new_max
-                    # print(x.shape)
                     print(new_max)
-                # if i == 127:
-                #     print(i)
-            # print(f"data shape: {(x.shape)}, \ndata[0]: {(x)}, label: {(y.shape)}")
     print("final max", max)
 
 # CLEAR CACHE: rm -r ./cache/nmnist

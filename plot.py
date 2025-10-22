@@ -53,15 +53,17 @@ print(f"Input=600, AA=600: {input_600_aa_600}")
 
 # Stack all configurations by layer
 data = np.stack([mnist_avg_150, input_300_aa_300, input_600_aa_600], axis=1)  # shape (5 layers, 3 configs)
-
+print(data)
 x = [150, 300, 600]
 
 plt.figure(figsize=(8, 6))
 # for i, layer in enumerate(layers):
 #     plt.plot(x, data[i], marker='o', label=f'Layer {layer}')
-plt.plot(x, data[0], marker='o', linewidth=2, markersize=8, label='Input: 150, AA: 150')
-plt.plot(x, data[1], marker='D', linewidth=2, markersize=8, label='Input: 300, AA: 300')
-plt.plot(x, data[2], marker='*', linewidth=2, markersize=12, label='Input: 600, AA: 600', color='purple')
+plt.plot(x, data[0], marker='o', linewidth=2, markersize=8, label='3 layers')
+plt.plot(x, data[1], marker='s', linewidth=2, markersize=8, label='4 layers')
+plt.plot(x, data[2], marker='^', linewidth=2, markersize=8, label='5 layers')
+plt.plot(x, data[3], marker='D', linewidth=2, markersize=8, label='6 layers')
+plt.plot(x, data[4], marker='*', linewidth=2, markersize=12, label='7 layers')
 
 plt.xlabel('Number of Activations (AA)')
 plt.ylabel('Time')
