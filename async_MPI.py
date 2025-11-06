@@ -41,9 +41,10 @@ from other_helpers.helpers import accuracy, store_training_data, rerun_init
 from other_helpers.helpers import update_history, process_history
 from other_helpers.backpropagation import back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
-from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch
+from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 
 jax.config.update("jax_debug_nans", True)
+# jax.config.update("jax_disable_jit", True)
 
 TQDM_DISABLE = False
 
@@ -108,7 +109,7 @@ def process_activated_output(key, arr: jnp.ndarray, params):
 
     # indices of nonzero values (padded with -2)
     idx = jnp.nonzero(arr, size=max_len, fill_value=-2)[0]
-    vals = jnp.where(idx != -2, arr[idx], 0)
+    vals = jnp.where(idx != -2, arr[idx], -2)
 
     # stack before shuffle
     pairs = jnp.stack([idx, vals], axis=1)
@@ -135,8 +136,8 @@ def process_activated_output(key, arr: jnp.ndarray, params):
 
     return pairs_out
 
-@partial(jax.jit, static_argnames=['params'])
-def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0):    
+@partial(jax.jit, static_argnames=['params', 'grad'])
+def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False):    
     # activations = jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values
     activations = jax.lax.cond(neuron_idx < 0,
                             lambda _: neuron_states.values,
@@ -151,17 +152,21 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     #                 lambda _: None,
     #                 None)
 
+    if grad:
+        new_input_residuals = jax.lax.cond(neuron_idx < 0,
+                                lambda _: neuron_states.input_residuals,
+                                lambda _: neuron_states.input_residuals.at[neuron_idx].add(layer_input),
+                                None
+                                )
+        new_input_activity = jax.lax.cond(neuron_idx < 0,
+                                lambda _: neuron_states.input_activity,
+                                lambda _: neuron_states.input_activity.at[neuron_idx].add(1),
+                                None
+                                )
+    else:
+        new_input_residuals = neuron_states.input_residuals
+        new_input_activity = neuron_states.input_activity
 
-    new_input_residuals = jax.lax.cond(neuron_idx < 0,
-                            lambda _: neuron_states.input_residuals,
-                            lambda _: neuron_states.input_residuals.at[neuron_idx].add(layer_input),
-                            None
-                            )
-    new_input_activity = jax.lax.cond(neuron_idx < 0,
-                            lambda _: neuron_states.input_activity,
-                            lambda _: neuron_states.input_activity.at[neuron_idx].add(1),
-                            None
-                            )
     @jit
     def last_layer_case(_):
         new_values_history, new_history_index = neuron_states.values_history, neuron_states.history_index
@@ -203,37 +208,42 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
         penalty = jax.lax.cond(params.restrict[split_rank] <= 0,
                                lambda _: activated_output, 
                                lambda _: activated_output*params.restrict[split_rank], None)
-        
-        # Store the neurons that activated
-        active_indexes = jnp.where(activated_output > 0, 1, 0)
-        new_layer_activities = neuron_states.layer_activity + active_indexes # Update the layer activity by adding the active neurons
-        
-        
-        last_neuron_idx = jnp.argmax(neuron_states.input_order) # Last neuron index in the input order
-        new_neuron_idx = jax.lax.cond(neuron_idx < 0,
-                     lambda _: last_neuron_idx, 
-                     lambda _: neuron_idx,
-                     None)
-        
-        new_input_order = neuron_states.input_order.at[new_neuron_idx].set(iteration) # Update the input activity by setting the input neuron to the iteration number        
-        
-        # jax.debug.print("{} {}", active_indexes.shape, new_input_activities.shape)
-        new_output_activity = neuron_states.output_activity.at[new_neuron_idx].add(active_indexes)
-        
-        new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
+        if grad:
+            # Store the neurons that activated
+            active_indexes = jnp.where(activated_output > 0, 1, 0)
+            new_layer_activity = neuron_states.layer_activity + active_indexes # Update the layer activity by adding the active neurons
+            
+            
+            last_neuron_idx = jnp.argmax(neuron_states.input_order) # Last neuron index in the input order
+            new_neuron_idx = jax.lax.cond(neuron_idx < 0,
+                        lambda _: last_neuron_idx, 
+                        lambda _: neuron_idx,
+                        None)
+            
+            new_input_order = neuron_states.input_order.at[new_neuron_idx].set(iteration) # Update the input activity by setting the input neuron to the iteration number        
+            
+            # jax.debug.print("{} {}", active_indexes.shape, new_input_activities.shape)
+            new_output_activity = neuron_states.output_activity.at[new_neuron_idx].add(active_indexes)
+            
+            # Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1)
+            new_input_vector = neuron_states.input_vector.at[neuron_idx].set(iteration+1)   # Set the input neuron to the iteration at which the input was received
+            new_output_vector = jnp.where(activated_output > 0,                             # Set the output neuron to the last iteration at which it activated
+                                        iteration+1,
+                                        neuron_states.output_vector)
+        else:
+            new_layer_activity = neuron_states.layer_activity
+            new_input_order = neuron_states.input_order
+            new_output_activity = neuron_states.output_activity
+            new_input_vector = neuron_states.input_vector
+            new_output_vector = neuron_states.output_vector
 
-        # Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1)
-        new_input_vector = neuron_states.input_vector.at[neuron_idx].set(iteration+1)   # Set the input neuron to the iteration at which the input was received
-        new_output_vector = jnp.where(activated_output > 0,                             # Set the output neuron to the last iteration at which it activated
-                                    iteration+1,
-                                    neuron_states.output_vector)
-        
+        new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
         new_neuron_states = NeuronStates(   values=activations - penalty, 
                                             thresholds=neuron_states.thresholds, 
                                             input_residuals=new_input_residuals, 
                                             input_order=new_input_order, 
                                             input_activity=new_input_activity,
-                                            layer_activity=new_layer_activities,
+                                            layer_activity=new_layer_activity,
                                             output_activity=new_output_activity,
                                             last_sent_iteration=new_last_sent_iteration,
                                             input_vector=new_input_vector,
@@ -264,55 +274,55 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     return jax.lax.cond(rank == 1, first_hidden, other_hidden, (activations))
 
 #region Forward Pass
-@partial(jax.jit, static_argnames=['params'])
-def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray):
+@partial(jax.jit, static_argnames=['params', 'grad',])
+def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, grad=False):
     @jit
     def input_layer(args):
         neuron_states, x = args # x is shape (input_layer_size,)
         
-        x_p = x
-        @jit
-        def send_input(i, carry):
-            timestep = carry
-            data = x_p[i]
-            @jit
-            def send_data(t):
-                # combined = jnp.stack([data[3], data[0], data[1], 1.0]) # Sending format (c, x, y, v)
-                combined = data
-
-                # jax.debug.print("rank {} sending data {}", rank, combined)
-                send(combined, dest=rank+process_per_layer, tag=0, comm=comm)
-                return t+1
-            
-            timestep = jax.lax.cond(
-                jnp.any(data != -2),
-                send_data,
-                lambda _: timestep,
-                operand=timestep
-            )
-            return timestep
-
-        # Initial carry: (timestep=0)
-        iteration = jax.lax.fori_loop(0, x_p.shape[0], send_input, (0))
-        #________________________________________________________________________________
-        # x_p = jnp.array(x)
-        # if params.shuffle_input:
-        #     perm = jax.random.permutation(key, x_p.shape[0])
-        #     x_p = x_p[perm]
-            
+        # x_p = x
+        # @jit
         # def send_input(i, carry):
-        #     count = carry
+        #     timestep = carry
         #     data = x_p[i]
-        #     send(data, dest=rank+process_per_layer, tag=0, comm=comm)
-        #     return i
+        #     @jit
+        #     def send_data(t):
+        #         # combined = jnp.stack([data[3], data[0], data[1], 1.0]) # Sending format (c, x, y, v)
+        #         combined = data
 
-        # def first_not_minus2(row):
-        #     return (row != -2)
-        # mask = jax.vmap(first_not_minus2)(x_p)
-        # loop_iterations = (jnp.count_nonzero(mask)/2).astype(int)
-        # # loop_iterations = x_p.shape[0]
-        # # jax.debug.print("input data type {}, {} ", (loop_iterations), len(x_p))
-        # iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
+        #         # jax.debug.print("rank {} sending data {}", rank, combined)
+        #         send(combined, dest=rank+process_per_layer, tag=0, comm=comm)
+        #         return t+1
+            
+        #     timestep = jax.lax.cond(
+        #         jnp.any(data != -2),
+        #         send_data,
+        #         lambda _: timestep,
+        #         operand=timestep
+        #     )
+        #     return timestep
+
+        # # Initial carry: (timestep=0)
+        # iteration = jax.lax.fori_loop(0, x_p.shape[0], send_input, (0))
+        #________________________________________________________________________________
+        x_p = jnp.array(x)
+        if params.shuffle_input:
+            perm = jax.random.permutation(key, x_p.shape[0])
+            x_p = x_p[perm]
+            
+        def send_input(i, carry):
+            count = carry
+            data = x_p[i]
+            send(data, dest=rank+process_per_layer, tag=0, comm=comm)
+            return i
+
+        def first_not_minus2(row):
+            return (row != -2)
+        mask = jax.vmap(first_not_minus2)(x_p)
+        loop_iterations = (jnp.count_nonzero(mask)/2).astype(int)
+        # loop_iterations = x_p.shape[0]
+        # jax.debug.print("input data type {}, {} ", (loop_iterations), len(x_p))
+        iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
 
         # Send end signal
         send(jnp.array([-1.0, -1.0]), dest=rank+process_per_layer, tag=0, comm=comm)
@@ -344,7 +354,7 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray):
             
             # Receive neuron values from previous layers and compute the activations
             (neuron_idx, layer_input) = recv(jnp.zeros((2,)), source=rank-process_per_layer, tag=0, comm=comm)
-            loop_iterations, activated_output, new_neuron_states= layer_computation(params, key, neuron_idx.astype(int), layer_input, weights, neuron_states, iteration)
+            loop_iterations, activated_output, new_neuron_states= layer_computation(params, key, neuron_idx.astype(int), layer_input, weights, neuron_states, iteration, grad)
             
             neuron_states = new_neuron_states
             
@@ -372,12 +382,18 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray):
     # Loop over batches, accumulate output values and return them
     @jit
     def loop_over_batches(_, x):
-        neuron_states = empty_neuron_states  
+        neuron_states = empty_neuron_states
         layer_input, new_neuron_states, iterations = jax.lax.cond(split_rank==0, input_layer, other_layers, (neuron_states, x))
         
         return None, (new_neuron_states.values, iterations, new_neuron_states)
     
-    _, (all_outputs, all_iterations, all_neuron_states) = jax.lax.scan(loop_over_batches, None, batch_data)    
+    _, (all_outputs, all_iterations, all_neuron_states) = jax.lax.scan(loop_over_batches, None, batch_data)
+
+    # def parallel_batches(x):
+    #     layer_input, new_neuron_states, iterations = jax.lax.cond(split_rank==0, input_layer, other_layers, (empty_neuron_states, x))
+    #     return new_neuron_states.values, iterations, new_neuron_states
+    
+    # all_outputs, all_iterations, all_neuron_states = jax.vmap(parallel_batches, in_axes=(0))(batch_data)
     
     # Synchronize all ranks before starting the backward pass
     mpi4jax.barrier(comm=comm)
@@ -390,10 +406,11 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     '''
     B: batch_size
     '''
-    all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, batch_data)
+    all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, batch_data, grad=True)
+    w_sum = l2_weight_regularization(mpi_config, weights)
+
     next_grad = recv(jnp.zeros((batch_part, params.layer_sizes[split_rank])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_grad)
-
     # next_weight_res = jnp.ones((batch_part, params.layer_sizes[split_rank], params.layer_sizes[split_rank+1])) # Shape: (B, 128, 10)
     # # jax.debug.print("Rank {} received next_grad shape: {}, next_weight_res shape: {}", rank, next_grad.shape, next_weight_res.shape)
     # (next_weight_res) = jax.lax.cond(split_rank < last_rank - 1, 
@@ -402,6 +419,7 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_weight_res)
 
     weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, split_rank)
+    weight_grad += 2 * params.w_reg * weights
 
     if split_rank > 1:
         send_grad = jnp.dot(next_grad, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
@@ -437,19 +455,22 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
 # Define the loss function
 @partial(jax.jit, static_argnames=['params'])
 def loss_fn(params, key, weights, empty_neuron_states, target, batch_data):
-    all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, batch_data)
+    all_outputs, iterations, all_neuron_states = (predict)(params, key, weights, empty_neuron_states, batch_data, grad=True)
+    w_sum = l2_weight_regularization(mpi_config, weights)
 
     # Compute Loss and loss gradient
     loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target)
     loss_grad /= process_per_layer # Shape (B, 10)
+    loss += params.w_reg * w_sum
      
     # Compute output gradient and weight gradient
     out_grad, weight_grad = jax.vmap(loss_bpp, in_axes=(None, 0, 0))(weights, all_neuron_states, loss_grad) # Shape (B, 128), (B, 128, 10)
     mean_weight_grad = jnp.mean(weight_grad, axis=0) # Shape: (128, 10)
+    mean_weight_grad += 2 * params.w_reg * weights
     mean_weight_grad = jnp.expand_dims(mean_weight_grad, axis=0)  # Shape: (1, 128, 10)
     # Send gradient to previous layers                
     send(out_grad, dest=rank-process_per_layer, tag=2,comm=comm)
-    
+    # jax.debug.print("{} {} {}", out_grad.shape, weight_grad.shape, mean_weight_grad.shape)
     all_activations, all_iterations, sparsity_L = sparsity_loss(params, all_neuron_states, iterations)
 
     total_loss = loss + sparsity_L 
@@ -505,6 +526,7 @@ def sparsity_loss(params, all_neuron_states, iterations):
 # region TRAINING
 def train(params: Params, key, total_batches, weights, empty_neuron_states, opti, trial=None):     
     """
+    tag list:
     tag 0:  forward computation, data format: (previous_layer_neuron_index, neuron_value)
             end of input is encoded with the index -1
     tag 2: backward computation, last layer gradient shape: (layer_sizes[-1], 1)
@@ -512,6 +534,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
     tag 4: communication between processes to split the data
     tag 5: weights for storing
     tag 6: activations for sparsity loss
+    tag 7: compute weight regularization
     tag 10: data labels(y)
     tag 20: communications for gathering, sharing and averaging data across split ranks
     """   
@@ -591,7 +614,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                         all_history.append(history)
 
                     weight_grad = gradients[0]
-                                        
+                    
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, False)                 
                     
                     epoch_correct += batch_correct
@@ -682,15 +705,29 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         if trial is not None:
             all_mean_it = combine_batch_avg(all_mean_iterations, mpi_config) # Gather the weight gradients from all ranks in the split rank
             all_mean_it = mpi4jax.allgather(all_mean_it, comm=comm)
+
+            val_accuracy = bcast(val_accuracy, root=last_rank * process_per_layer, comm=comm)
             # jax.debug.print("all mean it: {} {}", all_mean_it, jnp.max(all_mean_it[process_per_layer*2:])/all_mean_it[0])
-            combined_acc_act = val_accuracy - (jnp.max(all_mean_it[1:])/all_mean_it[0])
+            normalized_it = (jnp.max(all_mean_it[1:])/all_mean_it[0])
+            combined_acc_act = val_accuracy*100 - normalized_it/10
+            if jnp.any(all_mean_it==0):
+                combined_acc_act = -10
+
+            prune = 0
             if rank == 0:
-                # report_val = combined_acc_act
-                report_val = val_accuracy
+                report_val = combined_acc_act
+                # report_val = val_accuracy
                 trial.report(report_val, epoch)
-                print("Should prune: ", trial.should_prune())
-                if trial.should_prune():
+                prune = int(trial.should_prune())
+                jax.debug.print("Should prune: {} with val {} (Acc: {}, max_it: {})", prune, report_val, val_accuracy, normalized_it)
+            
+            prune = bcast(jnp.array(prune), root=0, comm=comm)
+            if prune:
+                if rank == 0:
                     raise optuna.TrialPruned()
+                else:
+                    return val_accuracy, normalized_it
+                
     # Inference on the test set
     test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, weights, empty_neuron_states, dataset="test", save=False, debug=True)
     # test_accuracy = 0
@@ -706,7 +743,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
     if rank == last_rank * process_per_layer:
         # Execution time
         execution_time = end_time - start_time
-        print(f"Execution Time: {execution_time:.6f} seconds,{all_history}")
+        print(f"Execution Time: {execution_time:.6f} seconds")
         result_path_str = store_training_data(
                             size,
                             params, 
@@ -1192,54 +1229,54 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
     # layer_sizes = (28*28, 128, 10)
     all_layers = [] 
     
-    # MNIST layers
-    # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
-    # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
-    # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
+    match dataset:
+        case "mnist":
+            # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
+            # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
+            # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
 
-    # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 10))
-    # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 10))
-    # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 10))
+            # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 10))
+            # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 10))
+            # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 10))
 
-    # all_layers.append((28*28, 32, 32, 32, 32, 32, 10))
-    # all_layers.append((28*28, 64, 64, 64, 64, 64, 10))    
-    # all_layers.append((28*28, 128, 128, 128, 128, 128, 10))
+            # all_layers.append((28*28, 32, 32, 32, 32, 32, 10))
+            # all_layers.append((28*28, 64, 64, 64, 64, 64, 10))    
+            # all_layers.append((28*28, 128, 128, 128, 128, 128, 10))
 
-    # all_layers.append((28*28, 32, 32, 32, 32, 10))
-    # all_layers.append((28*28, 64, 64, 64, 64, 10))    
-    # all_layers.append((28*28, 128, 128, 128, 128, 10))
+            # all_layers.append((28*28, 32, 32, 32, 32, 10))
+            # all_layers.append((28*28, 64, 64, 64, 64, 10))    
+            # all_layers.append((28*28, 128, 128, 128, 128, 10))
 
-    # all_layers.append((28*28, 128, 64, 32, 10))    
-    # all_layers.append((28*28, 64, 64, 64, 10))
-    # all_layers.append((28*28, 128, 128, 128, 10))
-    
-    # all_layers.append((28*28, 32, 32, 10))
-    # all_layers.append((28*28, 64, 64, 10))    
-    all_layers.append((28*28, 128, 10))
+            # all_layers.append((28*28, 128, 64, 32, 10))    
+            # all_layers.append((28*28, 64, 64, 64, 10))
+            # all_layers.append((28*28, 128, 128, 128, 10))
+            
+            # all_layers.append((28*28, 32, 32, 10))
+            # all_layers.append((28*28, 64, 64, 10))    
+            all_layers.append((28*28, 128, 128, 10))
 
-    # all_layers.append((28*28, 32, 10))
-    # all_layers.append((28*28, 64, 10))    
-    # all_layers.append((28*28, 128, 10))    
-    
-    # SHD layers 
-    # all_layers.append((700, 128, 128, 128, 128, 20))    
+            # all_layers.append((28*28, 32, 10))
+            # all_layers.append((28*28, 64, 10))    
+            all_layers.append((28*28, 128, 10))    
+        case "shd":
+            # all_layers.append((700, 128, 128, 128, 128, 20))    
 
-    # all_layers.append((700, 128, 64, 32, 20))    
-    # all_layers.append((700, 64, 64, 64, 20))    
-    # all_layers.append((700, 32, 32, 32, 20))    
-    
-    # all_layers.append((700, 128, 128, 20))    
-    # all_layers.append((700, 64, 64, 20))    
-    # all_layers.append((700, 32, 32, 20))    
-    
-    # all_layers.append((700, 128, 20))    
-    # all_layers.append((700, 64, 20))    
-    # all_layers.append((700, 32, 20))    
+            # all_layers.append((700, 128, 64, 32, 20))    
+            # all_layers.append((700, 64, 64, 64, 20))    
+            # all_layers.append((700, 32, 32, 32, 20))    
+            
+            # all_layers.append((700, 128, 128, 20))    
+            # all_layers.append((700, 64, 64, 20))    
+            # all_layers.append((700, 32, 32, 20))    
+            
+            all_layers.append((700, 128, 20))    
+            # all_layers.append((700, 64, 20))    
+            # all_layers.append((700, 32, 20))    
     
     layer_sizes = all_layers[0]
     best = False
     # layer_sizes = [4, 5, 3]
-     
+    
     load_file = False
     batch_size = 36
     restrict = (0,) * len(layer_sizes)
@@ -1264,46 +1301,16 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
         sys.exit(1)
     
     for f_nb in [128]:
-        # restrict = (r,) * len(layer_sizes)    
-        key, subkey = jax.random.split(key) 
-        if init_thresholds is not None:
-            init_thresholds = 0.0
-            # thresholds = jax.random.uniform(subkey, layer_sizes[split_rank])
-            # thresholds = jax.nn.sigmoid(jax.random.normal(subkey, (layer_sizes[split_rank])))*init_thresholds
-        thresholds = jnp.full(layer_sizes[split_rank], init_thresholds)
-        
-        rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_10_acc0.936_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_10_acc0.920_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_128_10_acc0.955_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_128_128_10_acc0.948_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_128_128_128_10_acc0.940_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_128_128_128_128_10_acc0.933_adam_.json"
-        # rerun = "network_results/mnist/training/constant_layer_activation_test_with_fnb2/42_ep2_batch36_784_128_128_128_128_128_128_128_10_acc0.918_adam_.json"
-        # rerun = "network_results/shd/training/ReLu_threshold_trained/42_ep20_batch36_700_128_128_20_acc0.580_adam_.json"
+        # restrict = (r,) * len(layer_sizes)            
+       
         rerun = "network_results/mnist/training/MLP/basic/load_false/42_ep20_batch36_784_128_10_acc0.976_adam_.json"
-        # rerun = "network_results/mnist/training/basic/load_false/42_ep20_batch36_784_128_128_10_acc0.974_adam_.json"
-        
-        
-        # rerun = "network_results/shd/training/basic/42_ep40_batch36_700_32_20_acc0.577_adam_.json"
-        
-        # rerun = "network_results/shd/training/basic/42_ep40_batch36_700_64_20_acc0.563_adam_.json"
-        # rerun = "network_results/shd/training/sparsity_loss/42_ep10_batch36_700_128_128_128_20_acc0.048_adam_.json"
-        
-        # rerun = "network_results/shd/training/basic/42_ep10_batch36_700_32_32_20_acc0.520_adam_.json"
-        
-        # rerun = "network_results/shd/training/basic/42_ep10_batch36_700_64_64_20_acc0.572_adam_.json"
-        
-        
-        # rerun = "network_results/shd/training/5hidden_parameter_tuning/42_ep10_batch36_700_128_128_128_20_acc0.045_adam_(1).json"
-        # rerun = "network_results/shd/training/5hidden_parameter_tuning/42_ep10_batch36_700_128_128_128_20_acc0.522_adam_.json"
-        
-        # rerun = "network_results/shd/training/basic/42_ep20_batch36_700_128_128_20_acc0.580_adam_.json"
-        # rerun = "network_results/shd/training/basic/42_ep10_batch36_700_128_128_20_acc0.612_adam_.json"
-        # rerun = "network_results/shd/training/restrict/42_ep10_batch36_700_128_128_20_acc0.567_adam_.json"
-        
+        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.974_adam_.json"
+        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.972_adam_.json"
+        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.862_adam_.json"
+        # rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.865_adam_.json"
+
         # rerun = 'network_results/shd/training/basic/42_ep10_batch36_700_128_128_20_acc0.612_adam_.json'
-        # rerun = "network_results/shd/training/restrict/42_ep10_batch36_700_128_20_acc0.572_adam_.json"
-        # rerun = "network_results/shd/training/sparsity_loss/42_ep10_batch36_700_128_20_acc0.613_adam_.json"
+        rerun = "network_results/shd/training/MLP/sparsity_loss/42_ep10_batch36_700_128_20_acc0.613_adam_.json"
         rerun = None
         # range 4: 96.8 -> 75.9 -> 96.2 -> 49.6
         async_layer = -1
@@ -1338,22 +1345,30 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                     random_seed=random_seed,
                     layer_sizes=layer_sizes, 
                     init_thresholds=init_thresholds, 
-                    num_epochs=1, 
+                    num_epochs=2, 
                     learning_rate=0.0001, 
                     batch_size=batch_size,
                     load_file=load_file,
                     shuffle_activations=False,
                     restrict=restrict,
-                    firing_nb=f_nb,
-                    sync_rate=1000,
+                    firing_nb=128,
+                    sync_rate=1,
                     max_nonzero=max_nonzero,
                     shuffle_input=False,
-                    threshold_lr=0.01, 
-                    sparsity_impact=tuple([0.0000, 0.0000, 0.0000, 0.0000, 0.0000]), # Beta sparse
+                    threshold_lr=0.0, 
+                    sparsity_impact=tuple([0.000, 0.000, 0.000, 0.000, 0.0000]), # Beta sparse
+                    w_reg=0.0,
                     rerun="",
                     async_layer=async_layer,
-                    history_size=0
+                    history_size=1000
                 )
+                
+                key, subkey = jax.random.split(key) 
+                if init_thresholds is None:
+                    init_thresholds = 0.3
+                    # thresholds = jax.random.uniform(subkey, layer_sizes[split_rank])
+                    # thresholds = jax.nn.sigmoid(jax.random.normal(subkey, (layer_sizes[split_rank])))*init_thresholds
+                thresholds = jnp.full(layer_sizes[split_rank], init_thresholds)
                 
                 if trial is not None:
                     params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
@@ -1364,19 +1379,17 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                 # rerun = "42_ep1_batch36_784_128_64_10_acc0.799_adam_.json"
                 # rerun = None
                 if rerun is not None:
-                    new_epoch_number = 10 # Number of training epoch to run again
-                    th_lr, beta = 1, 0.0
-                    
+                    new_epoch_number = 10 # Number of training epoch to run again                    
                     params, weights, thresholds = rerun_init(folder+rerun, 
                                                              mpi_config, 
                                                              params, 
                                                              new_epoch_number, 
-                                                             threshold_lr=True, 
-                                                             sparsity_impact=True, 
-                                                             async_layer=True)
-                    if len(layer_sizes) != len(params.layer_sizes):
-                        print(f"Error: rerun file {rerun} has different layer sizes than the current network structure {layer_sizes}.")
-                        sys.exit(1)
+                                                             threshold_lr=False, 
+                                                             sparsity_impact=False, 
+                                                             async_layer=False,
+                                                             history_size=True,
+                                                             shuffle_activations=False,
+                                                             shuffle_input=False)
                 
                 if rank == 0:
                     print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
@@ -1405,8 +1418,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                 # print("average execution time : {}", all_time/t)
                 # batch_predict(params, key, total_batches, weights, empty_neuron_states, "test", save=True, debug=True)
                 result_path = train(params, key, total_batches, weights, empty_neuron_states, "adam", trial)
-                if trial is not None:
-                    return result_path
+                # if trial is not None:
                 # rerun = result_path
                 # print(rerun)
                 break

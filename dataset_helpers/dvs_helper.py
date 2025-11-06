@@ -15,10 +15,10 @@ def torch_DVSGesture_loader(batch_size, CNN_preproces=False, shuffle=False):
     trainset = tonic.datasets.DVSGesture(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
     testset = tonic.datasets.DVSGesture(save_to='./data', train=False)#, transform=transforms.NumpyAsType(float))
     
-    # data, label = trainset[0]
+    data, label = trainset[0]
     # print("Type of data:", type(data))
     # print("Label:", label)
-    # print(data.shape, data[0:200], (data.dtype))
+    # print(data.shape, data[0:200], (data[200:]))
     cache_dir = "./cache/DVSGesture"
 
     if CNN_preproces:
@@ -112,7 +112,7 @@ def custom_preprocess_event_pad_collate(batch, max_len):
         
         # Pre-allocate output array
         d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
-        
+
         # Compute neuron_idx only for actual events
         x = d["x"].astype(np.int32)
         y = d["y"].astype(np.int32)
@@ -146,6 +146,7 @@ if __name__ == '__main__':
         
             for d in batch_data:
                 length = d.shape[0]
+                # print(d[:100])
                 if length > max_length:
                     print('max length:, new_length', max_length, length)
                     max_length = length            

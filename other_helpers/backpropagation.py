@@ -52,16 +52,30 @@ def compute_full_bpp(params, all_neuron_states, next_grad, split_rank):
     a = params.restrict[split_rank]
     new_layer_activity = jnp.where(a > 0, (1-jnp.power((1-a), layer_activity+1))/a, 1) # Shape (128,)
     mul_res = jnp.broadcast_to(new_layer_activity, weight_res.shape) 
-    weight_res = weight_res * mul_res
+    # weight_res = weight_res * mul_res
 
     # (4) Shape: (784, 128)
     next_grad_expanded = jnp.expand_dims(next_grad, axis=0)  # Shape: (1, 128)
+    # jax.debug.print("shapes {} {}", weight_res.shape, next_grad_expanded.shape)
     z_grad = weight_res * next_grad_expanded
 
     # (5) Shape: (784, 128)
     x = all_neuron_states.input_residuals # Shape (784,)
     x_reshaped = x[..., jnp.newaxis]      # Shape becomes (784, 1)
 
+    # Debug prints
+    # jax.debug.print("new_layer_activity has NaN: {} shape: {}", jnp.any(jnp.isnan(new_layer_activity)), output_vector.shape)
+    # jax.debug.print("new_layer_activity stats: min={}, max={}, mean={} shape: {}", 
+    #                 jnp.min(new_layer_activity), jnp.max(new_layer_activity), jnp.mean(new_layer_activity), output_vector.shape)
+    # jax.debug.print("layer_activity has NaN: {} shape: {}", jnp.any(jnp.isnan(layer_activity)), output_vector.shape)
+    # jax.debug.print("layer_activity stats: min={}, max={}, mean={} shape: {}", 
+    #                 jnp.min(layer_activity), jnp.max(layer_activity), jnp.mean(layer_activity), output_vector.shape)
+    # jax.debug.print("x_reshaped has NaN: {} shape: {}", jnp.any(jnp.isnan(x_reshaped)), output_vector.shape)
+    # jax.debug.print("z_grad has NaN: {} shape: {}", jnp.any(jnp.isnan(z_grad)), output_vector.shape)
+    # jax.debug.print("x_reshaped stats: min={}, max={}, mean={} shape: {}", 
+    #                 jnp.min(x_reshaped), jnp.max(x_reshaped), jnp.mean(x_reshaped), output_vector.shape)
+    # jax.debug.print("z_grad stats: min={}, max={}, mean={} shape: {}", 
+    #                 jnp.min(z_grad), jnp.max(z_grad), jnp.mean(z_grad), output_vector.shape)
     weight_grad = x_reshaped * z_grad # (784, 128)
 
     return weight_grad, weight_res

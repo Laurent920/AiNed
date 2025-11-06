@@ -17,11 +17,11 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 10
+epochs = 20
 batch_size = 36
 
-dataet = "mnist"
-dataset = "nmnist"
+dataset = "mnist"
+# dataset = "nmnist"
 
 if dataset == "mnist":
     input_shape = (1, 28, 28)
@@ -45,9 +45,10 @@ class SimpleCNN(nn.Module):
         # self.out = nn.Linear(28*28*3, 10, bias=False)
 
         # self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
-        self.fc1 = nn.Linear((14 * 14 * 5), 128, bias=False)
+        # self.fc1 = nn.Linear((14 * 14 * 5), 128, bias=False)
         # self.fc1 = nn.Linear(28 * 28 * 64, 32, bias=False)
-        self.out = nn.Linear(128, 10, bias=False)
+        self.out = nn.Linear(14 * 14 * 5, 10, bias=False)
+        # self.out = nn.Linear(128, 10, bias=False)
 
         # Automatically collect all layers with parameters
         self.activation_stats = {
@@ -80,8 +81,8 @@ class SimpleCNN(nn.Module):
         # print(x.shape)
 
         # fc1
-        x = F.relu(self.fc1(x))
-        self._record_activation("fc1", x)
+        # x = F.relu(self.fc1(x))
+        # self._record_activation("fc1", x)
 
         # output layer
         x = self.out(x)
@@ -157,11 +158,11 @@ class NmnistCNN(nn.Module):
         self.activation_stats[layer_name].append(nonzero)
 
 class VGG16(nn.Module):
-    def __init__(self, num_classes=1000):
+    def __init__(self, num_classes=10, in_channels=1):
         super(VGG16, self).__init__()
 
         # ----- Block 1 -----
-        self.conv1_1 = nn.Conv2d(1, 64, kernel_size=3, padding=1, bias=False)
+        self.conv1_1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False)
         self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
         self.pool1   = nn.MaxPool2d(kernel_size=2, stride=2)
 
@@ -186,19 +187,21 @@ class VGG16(nn.Module):
         self.conv5_1 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
         self.conv5_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
         self.conv5_3 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
-        self.pool5   = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool5   = nn.AdaptiveAvgPool2d((1, 1))  # Changed to adaptive pooling
 
         # ----- Fully Connected Layers -----
-        self.fc1 = nn.Linear(512 * 7 * 7, 4096, bias=False)
+        self.fc1 = nn.Linear(512, 4096, bias=False)
         self.fc2 = nn.Linear(4096, 4096, bias=False)
         self.out = nn.Linear(4096, num_classes, bias=False)
 
-        # ----- Activation Stats -----
+        # ----- Activation Stats (matching your format) -----
         self.activation_stats = {
-            name: [] for name, module in self.named_children()
-            if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d))
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
         }
-        self.activation_stats["input"] = []
 
         # ----- Weight Initialization -----
         self._initialize_weights()
@@ -244,7 +247,7 @@ class VGG16(nn.Module):
         return x
 
     def _record_activation(self, layer_name, x):
-        """Record average nonzero activations per sample."""
+        """Helper to record average nonzero activations per sample."""
         nonzero = (x != 0).sum().item() / x.size(0)
         self.activation_stats[layer_name].append(nonzero)
 
@@ -253,16 +256,199 @@ class VGG16(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                
+
+
+class VGG8(nn.Module):
+    def __init__(self, num_classes=10, in_channels=1):
+        """
+        VGG8 architecture with 8 convolutional layers.
+        Suitable for small images like NMNIST (34x34) or MNIST (28x28).
+        """
+        super(VGG8, self).__init__()
+        
+        # Block 1: 64 filters
+        self.conv1_1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 2: 128 filters
+        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 3: 256 filters
+        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 4: 512 filters
+        self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False)
+        self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        # self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
+        # self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.pool4 = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(512, 512, bias=False)
+        self.out = nn.Linear(512, num_classes, bias=False)
+        
+        # Activation stats (matching your format)
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AvgPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
+        }
+        
+        # Weight initialization
+        self._initialize_weights()
+        
+    def _record_activation(self, layer_name, x):
+        """Helper to record average nonzero activations per sample."""
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+    
+    def forward(self, x):
+        self._record_activation("input", x)
+        
+        # Block 1
+        x = F.relu(self.conv1_1(x)); self._record_activation("conv1_1", x)
+        x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
+        x = self.pool1(x);           self._record_activation("pool1", x)
+        
+        # Block 2
+        x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
+        x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        x = self.pool2(x);           self._record_activation("pool2", x)
+        
+        # Block 3
+        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        x = self.pool3(x);           self._record_activation("pool3", x)
+        
+        # Block 4
+        x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
+        x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
+        x = self.pool4(x);           self._record_activation("pool4", x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # FC layers
+        x = F.relu(self.fc1(x));     self._record_activation("fc1", x)
+        x = self.out(x);             self._record_activation("out", x)
+        
+        return x
+    
+    def _initialize_weights(self):
+        """He (Kaiming) initialization for all conv and linear layers."""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+
+class VGG8Light(nn.Module):
+    def __init__(self, num_classes=10, in_channels=1):
+        """
+        Lighter VGG8 with fewer filters, better for small datasets.
+        """
+        super(VGG8Light, self).__init__()
+        
+        # Block 1: 32 filters
+        self.conv1_1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 2: 64 filters
+        self.conv2_1 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False)
+        self.conv2_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 3: 128 filters
+        self.conv3_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.conv3_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # Block 4: 256 filters
+        self.conv4_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        self.conv4_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
+        
+        # FC layers
+        self.fc1 = nn.Linear(256, 256, bias=False)
+        self.out = nn.Linear(256, num_classes, bias=False)
+        
+        # Activation stats (matching your format)
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
+        }
+        
+        # Weight initialization
+        self._initialize_weights()
+        
+    def _record_activation(self, layer_name, x):
+        """Helper to record average nonzero activations per sample."""
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+    
+    def forward(self, x):
+        self._record_activation("input", x)
+        
+        # Block 1
+        x = F.relu(self.conv1_1(x)); self._record_activation("conv1_1", x)
+        x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
+        x = self.pool1(x);           self._record_activation("pool1", x)
+        
+        # Block 2
+        x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
+        x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        x = self.pool2(x);           self._record_activation("pool2", x)
+        
+        # Block 3
+        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        x = self.pool3(x);           self._record_activation("pool3", x)
+        
+        # Block 4
+        x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
+        x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
+        x = self.pool4(x);           self._record_activation("pool4", x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # FC
+        x = F.relu(self.fc1(x));     self._record_activation("fc1", x)
+        x = self.out(x);             self._record_activation("out", x)
+        
+        return x
+    
+    def _initialize_weights(self):
+        """He (Kaiming) initialization for all conv and linear layers."""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 # ==========================================================
 # TRAINING AND EVALUATION
 # ==========================================================
 def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
     if dataset == "mnist":
+        # Choose one:
         model = SimpleCNN().to(device)
-        # model = VGG16().to(device)
+        # model = VGG16(num_classes=10, in_channels=1).to(device)
+        # model = VGG8(num_classes=10, in_channels=1).to(device)
+        # model = VGG8Light(num_classes=10, in_channels=1).to(device)
     elif dataset == "nmnist":
-        model = NmnistCNN().to(device)
+        # Choose one:
+        # model = NmnistCNN().to(device)
+        # model = VGG16(num_classes=10, in_channels=2).to(device)
+        # model = VGG8(num_classes=10, in_channels=2).to(device)
+        model = VGG8Light(num_classes=10, in_channels=2).to(device)
     else:
         print("Wrong dataset")
         return
@@ -279,7 +465,7 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         model.train()
         running_loss, correct, total = 0, 0, 0
 
-        for batch_idx, (inputs, targets) in tqdm(enumerate(iter(train_loader))):
+        for batch_idx, (inputs, targets) in enumerate(tqdm(iter(train_loader))):
             inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
             targets = torch.tensor(targets, dtype=torch.long).to(device)
 
@@ -351,11 +537,20 @@ def save_cnn_weights(network, input_shape, batch_size, epochs, train_accs, val_a
     layers_repr = ["C" + "x".join(map(str, input_shape))]
     for layer in network.children():
         if isinstance(layer, nn.Conv2d):
-            layers_repr.append(f"C{layer.out_channels}x{layer.in_channels}x{layer.kernel_size[0]}x{layer.kernel_size[1]}")
+            try:
+                layers_repr.append(f"C{layer.out_channels}x{layer.in_channels}x{layer.kernel_size[0]}x{layer.kernel_size[1]}")
+            except TypeError:
+                layers_repr.append(f"C{layer.out_channels}x{layer.in_channels}x{layer.kernel_size}x{layer.kernel_size}")
         elif isinstance(layer, nn.MaxPool2d):
-            layers_repr.append(f"P{layer.kernel_size[0]}x{layer.kernel_size[0]}")
+            try:
+                layers_repr.append(f"P{layer.kernel_size[0]}x{layer.kernel_size[0]}")
+            except TypeError:
+                layers_repr.append(f"P{layer.kernel_size}x{layer.kernel_size}")
         elif isinstance(layer, nn.AvgPool2d):
-            layers_repr.append(f"AvgP{layer.kernel_size[0]}x{layer.kernel_size[0]}")
+            try:
+                layers_repr.append(f"AvgP{layer.kernel_size[0]}x{layer.kernel_size[0]}")
+            except TypeError:
+                layers_repr.append(f"AvgP{layer.kernel_size}x{layer.kernel_size}")
         elif isinstance(layer, nn.Linear):
             layers_repr.append(f"L{layer.out_features}")
 
@@ -508,5 +703,3 @@ if __name__ == "__main__":
     print("Using device:", device)
 
     train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=epochs)
-
-    

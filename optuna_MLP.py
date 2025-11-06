@@ -20,6 +20,7 @@ from optuna.visualization.matplotlib import plot_param_importances
 from optuna.visualization.matplotlib import plot_rank
 from optuna.visualization.matplotlib import plot_slice
 from optuna.visualization.matplotlib import plot_timeline
+from optuna.pruners import MedianPruner, BasePruner
 
 # from optuna.integration.wandb import WeightsAndBiasesCallback
 # import wandb
@@ -32,28 +33,61 @@ rank = comm.Get_rank()      # Real rank
 size = comm.Get_size()
 
 name = "mnist_mlp"
-# name = "shd_mlp"
+name = "shd_mlp"
 # name = "nmnist_mlp"
 
 random_seed = 42
 key = jax.random.key(random_seed)
+continuous = False
 
-PARAM_RANGES = {
-    'num_hidden_layers':{'type': 'int', 'low': 1, 'high': 2, 'step': 1},
-    'n_units':          {'type': 'categorical', 'choices': [64, 128, 256]},
-    'restrict':         {'type': 'float', 'low': 1.0, 'high': 3.0, 'step': 0.1},
-    'learning_rate':    {'type': 'float', 'low': 1e-4, 'high': 1e-4, 'log': True},
-    'firing_nb':        {'type': 'int', 'low': 1, 'high': 128, 'log': True},
-    'init_thresholds':  {'type': 'float', 'low': 0.0, 'high': 0.1},
-    'threshold_lr':     {'type': 'float', 'low': 0.0, 'high': 1e-1},
-    'sparsity_impact':  {'type': 'float', 'low': 0.0, 'high': 1e-3},
-}
+# mnist
+match name:
+    case "mnist_mlp":
+        PARAM_RANGES = {
+            'num_hidden_layers':{'type': 'int', 'low': 1, 'high': 2, 'step': 1},
+            'n_units':          {'type': 'categorical', 'choices': [64, 128, 256]},
+            'restrict':         {'type': 'float', 'low': 1.0, 'high': 3.0, 'step': 0.1},
+            'learning_rate':    {'type': 'float', 'low': 1e-4, 'high': 1e-4, 'log': True},
+            'firing_nb':        {'type': 'int', 'low': 1, 'high': 128, 'log': True},
+            'init_thresholds':  {'type': 'float', 'low': 0.0, 'high': 0.1},
+            'threshold_lr':     {'type': 'float', 'low': 0.0, 'high': 1e-1},
+            'sparsity_impact':  {'type': 'float', 'low': 0.0, 'high': 1e-3},
+        }
+    case "shd_mlp":
+        PARAM_RANGES = {
+            'num_hidden_layers':{'type': 'int', 'low': 2, 'high': 2, 'step': 1},
+            'n_units':          {'type': 'categorical', 'choices': [64, 128]},
+            'restrict':         {'type': 'float', 'low': 1.0, 'high': 2.0, 'step': 0.1},
+            'learning_rate':    {'type': 'float', 'low': 1e-4, 'high': 1e-4, 'log': True},
+            'firing_nb':        {'type': 'int', 'low': 1, 'high': 128, 'log': True},
+            'init_thresholds':  {'type': 'float', 'low': 0.0, 'high': 1.0, 'step': 0.01},
+            'threshold_lr':     {'type': 'float', 'low': 0.0, 'high': 1e-1, 'step': 1e-6},
+            'sparsity_impact':  {'type': 'float', 'low': 0.0, 'high': 1e-3, 'step': 1e-6},
+        }
+        PARAM_RANGES = {
+            'num_hidden_layers':{'low': 1.9, 'high': 2.0},
+            'n_units_l1':          {'low': 128, 'high': 128.9},
+            'n_units_l2':          {'low': 128, 'high': 128.9},
+            'restrict':         {'low': 1.0, 'high': 2.0},
+            'learning_rate':    {'low': 1e-5, 'high': 1e-3},
+            'firing_nb':        {'low': 1.0, 'high': 128.0},
+            'init_thresholds':  {'low': 0.0, 'high': 1.0},
+            'threshold_lr':     {'low': 0.0, 'high': 1e-1},
+            'sparsity_impact':  {'low': 0.0, 'high': 1e-3},
+        }
+        continuous = True
+    case _:
+        print("Dataset name is not supported, format: dataset_network where dataset is mnist/shd and network is either mlp or cnn")
+        sys.exit(1)
 
 def objective(trial):
     if rank == 0:
         optimizer = trial.suggest_categorical("optimizer", ["adam"])
 
-        num_hidden_layers = trial.suggest_int("num_hidden_layers", **{k:v for k,v in PARAM_RANGES['num_hidden_layers'].items() if k != 'type'})
+        if continuous:
+            num_hidden_layers = int(trial.suggest_float("num_hidden_layers", **PARAM_RANGES["num_hidden_layers"]))
+        else:
+            num_hidden_layers = trial.suggest_int("num_hidden_layers", **{k:v for k,v in PARAM_RANGES['num_hidden_layers'].items() if k != 'type'})
         dataset = name.split("_")[0]
         match dataset:
             case "mnist":
@@ -63,22 +97,34 @@ def objective(trial):
             case _:
                 print("Study name need to start with the dataset name")
                 sys.exit(1) 
-        for i in range(num_hidden_layers):
-            hidden_l_size = trial.suggest_categorical("n_units_l{}".format(i+1), PARAM_RANGES['n_units']['choices'])
-            layer_sizes.append(hidden_l_size)
+        if continuous:
+            hidden_l1_size = int(trial.suggest_float("n_units_l1", **PARAM_RANGES["n_units_l1"]))
+            hidden_l2_size = int(trial.suggest_float("n_units_l2", **PARAM_RANGES["n_units_l2"]))
+            layer_sizes.append(hidden_l1_size)
+            layer_sizes.append(hidden_l2_size)
+        else:
+            for i in range(num_hidden_layers):
+                hidden_l_size = trial.suggest_categorical("n_units_l{}".format(i+1), PARAM_RANGES['n_units']['choices'])            
+                layer_sizes.append(hidden_l_size)
         match dataset:
             case "mnist":
                 layer_sizes.append(10)
             case "shd":
                 layer_sizes.append(20)
-
-        
-        restrict = trial.suggest_float("restrict", **{k:v for k,v in PARAM_RANGES['restrict'].items() if k != 'type'})
-        learning_rate = trial.suggest_float("learning_rate", **{k:v for k,v in PARAM_RANGES['learning_rate'].items() if k != 'type'})
-        firing_nb = trial.suggest_int("firing_nb", **{k:v for k,v in PARAM_RANGES['firing_nb'].items() if k != 'type'})
-        init_thresholds = trial.suggest_float("init_thresholds", **{k:v for k,v in PARAM_RANGES['init_thresholds'].items() if k != 'type'})
-        threshold_lr = trial.suggest_float("threshold_lr", **{k:v for k,v in PARAM_RANGES['threshold_lr'].items() if k != 'type'})
-        sparsity_impact = trial.suggest_float("sparsity_impact", **{k:v for k,v in PARAM_RANGES['sparsity_impact'].items() if k != 'type'})
+        if continuous:
+            restrict = round(trial.suggest_float("restrict", **PARAM_RANGES["restrict"]), 1)
+            learning_rate = round(trial.suggest_float("learning_rate", **PARAM_RANGES["learning_rate"]), 6)
+            firing_nb = int(trial.suggest_float("firing_nb", **PARAM_RANGES["firing_nb"]))
+            init_thresholds = round(trial.suggest_float("init_thresholds", **PARAM_RANGES["init_thresholds"]), 6)
+            threshold_lr = round(trial.suggest_float("threshold_lr", **PARAM_RANGES["threshold_lr"]), 6)
+            sparsity_impact = round(trial.suggest_float("sparsity_impact", **PARAM_RANGES["sparsity_impact"]), 6)
+        else:
+            restrict = round(trial.suggest_float("restrict", **{k:v for k,v in PARAM_RANGES['restrict'].items() if k != 'type'}), 6)
+            learning_rate = round(trial.suggest_float("learning_rate", **{k:v for k,v in PARAM_RANGES['learning_rate'].items() if k != 'type'}), 6)
+            firing_nb = trial.suggest_int("firing_nb", **{k:v for k,v in PARAM_RANGES['firing_nb'].items() if k != 'type'})
+            init_thresholds = round(trial.suggest_float("init_thresholds", **{k:v for k,v in PARAM_RANGES['init_thresholds'].items() if k != 'type'}), 6)
+            threshold_lr = round(trial.suggest_float("threshold_lr", **{k:v for k,v in PARAM_RANGES['threshold_lr'].items() if k != 'type'}), 6)
+            sparsity_impact = round(trial.suggest_float("sparsity_impact", **{k:v for k,v in PARAM_RANGES['sparsity_impact'].items() if k != 'type'}), 6)
     else:
         dataset = num_hidden_layers = layer_sizes = None
         restrict = learning_rate = firing_nb = init_thresholds = threshold_lr = sparsity_impact = None
@@ -121,46 +167,67 @@ def objective(trial):
     # trial threshold_lr, sparsity_impact
 
     val_acc, max_it_normalized = main(random_seed, key, rank, size, comm, trial, params)
-    trial_output = (val_acc*100)-max_it_normalized
+    trial_output = (val_acc*100)-max_it_normalized/10
+
+    if rank == 0: # Store the val acc and it separately 
+        trial.set_user_attr("val_acc", val_acc)
+        trial.set_user_attr("max_it_normalized", max_it_normalized)
     if rank == 0: print(f"Validation acc: {val_acc*100}%, normalized max iterations: {max_it_normalized}, trial output val: {trial_output}")
     return trial_output
-
 
 def main_optuna():
     n_trials = 20
     read_data = False
+    add_trial = False
 
     if rank == 0:
-        # wandb.init(
-        #     project="AiNed",  # choose your project name
-        #     entity="Laurent", 
-        #     config={},           # will be updated automatically by Optuna
-        # )
-        # wandb_callback = WeightsAndBiasesCallback(metric_name="loss")
-
         optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
         db_dir = "optuna/db/"         
         os.makedirs(db_dir, exist_ok=True)
+        storage_url = f"sqlite:///{db_dir}{name}.db"
 
+        # List all studies currently in the storage
+        existing = [s.study_name for s in optuna.get_all_study_summaries(storage=storage_url)]
+
+        if name not in existing:
+            print(f"🆕 Study '{name}' does not exist — will be created — Adding existing trials.")
+            add_trial = True
+
+        pruner = HybridPruner(10, MedianPruner(n_startup_trials=5))
+        if continuous:
+            sampler = optuna.samplers.CmaEsSampler(
+                        sigma0=0.5,             # initial search radius
+                        restart_strategy="ipop",# improves convergence robustness
+                        # seed=42
+                    )
+        else:
+            sampler = optuna.samplers.TPESampler(
+                        n_startup_trials=0,         # number of random initial trials
+                        n_ei_candidates=24,          # more exploration candidates (default 24)
+                        # multivariate=True,           # model interactions between params
+                        # group=True,                  # optimize related parameters together
+                        # seed=42                      # reproducibility
+                    )
+        
         study = optuna.create_study(study_name=name, 
                                     directions=["maximize"], 
-                                    pruner=optuna.pruners.MedianPruner(),
-                                    storage=f"sqlite:///{db_dir}{name}.db",
-                                    load_if_exists=True) #sampler=optuna.samplers.TPESampler()
+                                    sampler=sampler,
+                                    pruner=pruner,
+                                    storage=storage_url,
+                                    load_if_exists=True) 
         print(f"Sampler is {study.sampler.__class__.__name__}")
 
         # study.enqueue_trial({   "bagging_fraction": 0.75,
         #                         "bagging_freq": 5,
         #                         "min_child_samples": 20,
         #                     })
-        add_trial = 1
+        
         if add_trial:
             base_path = f"network_results/{name.split('_')[0]}/training/MLP"
             trials_data = parse_json_files(base_path, name.split('_')[0])
             added, skipped = add_trials_to_study(study, trials_data)
             print(f"Added {added} existing trials, skipped {skipped}")
         
-        # study.optimize(objective, n_trials=n_trials, callbacks=[wandb_callback],) # , timeout=300
         if not read_data:
             study.optimize(objective, n_trials=n_trials) # , timeout=300
         
@@ -169,58 +236,55 @@ def main_optuna():
         print(study.best_value)
         print(study.best_trial)
 
+        savedir = f"optuna/plots/{name}/" 
+
         # Visualize the optimization history.
-        fig = plot_optimization_history(study)
-        plt.savefig("optuna/plots/history.png") 
+        plot_optimization_history(study)
+        plt.savefig(savedir+"history.png") 
 
         # Visualize the learning curves of the trials. 
         plot_intermediate_values(study)
-        plt.savefig("optuna/plots/intermediate_vals.png") 
+        plt.savefig(savedir+"intermediate_vals.png") 
 
         # Visualize high-dimensional parameter relationships.
         plot_parallel_coordinate(study)
-        plt.savefig("optuna/plots/parallel_coords_all.png") 
+        plt.savefig(savedir+"parallel_coords_all.png") 
 
         # Select parameters to visualize.
         plot_parallel_coordinate(study, params=["sparsity_impact", "n_units_l1"])
-        plt.savefig("optuna/plots/parallel_coords.png") 
+        plt.savefig(savedir+"parallel_coords.png") 
 
         # Visualize hyperparameter relationships.
         plot_contour(study)
-        plt.savefig("optuna/plots/contour_all.png") 
+        plt.savefig(savedir+"contour_all.png") 
 
         # Select parameters to visualize.
         plot_contour(study, params=["sparsity_impact", "n_units_l1"])
-        plt.savefig("optuna/plots/contour.png") 
+        plt.savefig(savedir+"contour.png") 
         
         # Visualize individual hyperparameters as slice plot.
         plot_slice(study)
-        plt.savefig("optuna/plots/slice_all.png") 
+        plt.savefig(savedir+"slice_all.png") 
 
         # Select parameters to visualize.
         plot_slice(study, params=["sparsity_impact", "n_units_l1"])
-        plt.savefig("optuna/plots/slice.png") 
+        plt.savefig(savedir+"slice.png") 
 
         # Visualize parameter importances.
         plot_param_importances(study)
-        plt.savefig("optuna/plots/param_importances.png") 
-        
-        # Learn which hyperparameters are affecting the trial duration with hyperparameter importance.
-        optuna.visualization.plot_param_importances(
-            study, target=lambda t: t.duration.total_seconds(), target_name="duration"
-        )
+        plt.savefig(savedir+"param_importances.png") 
 
         # Visualize empirical distribution function. 
         plot_edf(study)
-        plt.savefig("optuna/plots/edf.png") 
+        plt.savefig(savedir+"edf.png") 
 
         # Visualize parameter relations with scatter plots colored by objective values.
         plot_rank(study)
-        plt.savefig("optuna/plots/rank.png") 
+        plt.savefig(savedir+"rank.png") 
 
         # Visualize the optimization timeline of performed trials. 
         plot_timeline(study)
-        plt.savefig("optuna/plots/timeline.png") 
+        plt.savefig(savedir+"timeline.png") 
 
         
         # Customize generated figures
@@ -243,6 +307,20 @@ def main_optuna():
             for i in range(n_trials):
                 objective(1)
 
+
+class HybridPruner(BasePruner):
+    def __init__(self, threshold, base_pruner):
+        self.threshold = threshold
+        self.base_pruner = base_pruner
+
+    def prune(self, study, trial):
+        # Absolute rule
+        if trial.intermediate_values:
+            latest = trial.intermediate_values[max(trial.intermediate_values.keys())]
+            if latest < self.threshold:
+                return True
+        # Otherwise fallback to base pruner
+        return self.base_pruner.prune(study, trial)
 
 def parse_json_files(base_path, dataset_name):
     """
@@ -288,7 +366,7 @@ def parse_json_files(base_path, dataset_name):
                     
                     normalized_it = max(last_it_mean[1:]) / last_it_mean[0]
                     last_val_acc = validation_accuracy[epoch_eval-1]
-                    trial_value = (last_val_acc * 100) - normalized_it
+                    trial_value = (last_val_acc * 100) - normalized_it/10
                     
                     intermediate_values = {}
                     # Calculte intermediate values
@@ -388,6 +466,49 @@ def check_params_in_range(params, study):
     
     return len(out_of_range) == 0, out_of_range
 
+def check_params_in_range_cont(params, study=None):
+    """
+    Check if given parameters fall within the defined PARAM_RANGES.
+
+    Args:
+        params (dict): Dictionary of parameter names and their values.
+        study (optuna.Study, optional): Unused, kept for compatibility.
+
+    Returns:
+        (bool, list): Tuple where
+            - bool indicates whether all parameters are within range,
+            - list contains details of parameters that are out of range.
+    """
+    out_of_range = []
+
+    for param_name, param_value in params.items():
+
+        # Handle layer-specific parameters (e.g., n_units_l1, n_units_l2, ...)
+        if param_name.startswith('n_units_l'):
+            low, high = PARAM_RANGES['n_units_l1']['low'], PARAM_RANGES['n_units_l1']['high']
+            try:
+                value_to_check = float(param_value)
+                if not (low <= value_to_check <= high):
+                    out_of_range.append(f"{param_name}={param_value} not in [{low}, {high}]")
+            except (ValueError, TypeError):
+                out_of_range.append(f"{param_name}={param_value} is not a valid number")
+            continue
+
+        # Skip parameters not in the defined range dictionary
+        if param_name not in PARAM_RANGES:
+            continue
+
+        param_config = PARAM_RANGES[param_name]
+        low, high = param_config['low'], param_config['high']
+
+        try:
+            value_to_check = float(param_value)
+            if not (low <= value_to_check <= high):
+                out_of_range.append(f"{param_name}={param_value} not in [{low}, {high}]")
+        except (ValueError, TypeError):
+            out_of_range.append(f"{param_name}={param_value} is not a valid number")
+
+    return len(out_of_range) == 0, out_of_range
 
 def add_trials_to_study(study, trials_data):
     """
@@ -410,7 +531,12 @@ def add_trials_to_study(study, trials_data):
         intermediate_values = trial_data['intermediate']
 
         # Check if parameters are in range
-        in_range, out_of_range = check_params_in_range(params, study)
+        if continuous:
+            params_range_f = check_params_in_range_cont
+        else:
+            params_range_f = check_params_in_range
+
+        in_range, out_of_range = params_range_f(params, study)
         
         if not in_range:
             print(f"Skipping {file_path}: Parameters out of range")
@@ -420,47 +546,87 @@ def add_trials_to_study(study, trials_data):
             continue
         
         # Create distributions for the parameters
-        distributions = {
-            'optimizer': optuna.distributions.CategoricalDistribution(['adam']),
-            'num_hidden_layers': optuna.distributions.IntDistribution(
-                PARAM_RANGES['num_hidden_layers']['low'], 
-                PARAM_RANGES['num_hidden_layers']['high'], 
-                step=PARAM_RANGES['num_hidden_layers']['step']
-            ),
-            'restrict': optuna.distributions.FloatDistribution(
-                PARAM_RANGES['restrict']['low'], 
-                PARAM_RANGES['restrict']['high'], 
-                step=PARAM_RANGES['restrict']['step']
-            ),
-            'learning_rate': optuna.distributions.FloatDistribution(
-                PARAM_RANGES['learning_rate']['low'], 
-                PARAM_RANGES['learning_rate']['high'], 
-                log=PARAM_RANGES['learning_rate']['log']
-            ),
-            'firing_nb': optuna.distributions.IntDistribution(
-                PARAM_RANGES['firing_nb']['low'], 
-                PARAM_RANGES['firing_nb']['high'], 
-                log=PARAM_RANGES['firing_nb']['log']
-            ),
-            'init_thresholds': optuna.distributions.FloatDistribution(
-                PARAM_RANGES['init_thresholds']['low'], 
-                PARAM_RANGES['init_thresholds']['high']
-            ),
-            'threshold_lr': optuna.distributions.FloatDistribution(
-                PARAM_RANGES['threshold_lr']['low'], 
-                PARAM_RANGES['threshold_lr']['high']
-            ),
-            'sparsity_impact': optuna.distributions.FloatDistribution(
-                PARAM_RANGES['sparsity_impact']['low'], 
-                PARAM_RANGES['sparsity_impact']['high']
-            ),
-        }
+        if continuous:
+            distributions = {
+                'optimizer': optuna.distributions.CategoricalDistribution(['adam']),
+                'num_hidden_layers': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['num_hidden_layers']['low'], 
+                    PARAM_RANGES['num_hidden_layers']['high'], 
+                ),
+                'restrict': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['restrict']['low'], 
+                    PARAM_RANGES['restrict']['high'], 
+                ),
+                'learning_rate': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['learning_rate']['low'], 
+                    PARAM_RANGES['learning_rate']['high'], 
+                ),
+                'firing_nb': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['firing_nb']['low'], 
+                    PARAM_RANGES['firing_nb']['high'], 
+                ),
+                'init_thresholds': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['init_thresholds']['low'], 
+                    PARAM_RANGES['init_thresholds']['high']
+                ),
+                'threshold_lr': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['threshold_lr']['low'], 
+                    PARAM_RANGES['threshold_lr']['high']
+                ),
+                'sparsity_impact': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['sparsity_impact']['low'], 
+                    PARAM_RANGES['sparsity_impact']['high']
+                ),
+            }
+        else:
+            distributions = {
+                'optimizer': optuna.distributions.CategoricalDistribution(['adam']),
+                'num_hidden_layers': optuna.distributions.IntDistribution(
+                    PARAM_RANGES['num_hidden_layers']['low'], 
+                    PARAM_RANGES['num_hidden_layers']['high'], 
+                    step=PARAM_RANGES['num_hidden_layers']['step']
+                ),
+                'restrict': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['restrict']['low'], 
+                    PARAM_RANGES['restrict']['high'], 
+                    step=PARAM_RANGES['restrict']['step']
+                ),
+                'learning_rate': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['learning_rate']['low'], 
+                    PARAM_RANGES['learning_rate']['high'], 
+                    log=PARAM_RANGES['learning_rate']['log']
+                ),
+                'firing_nb': optuna.distributions.IntDistribution(
+                    PARAM_RANGES['firing_nb']['low'], 
+                    PARAM_RANGES['firing_nb']['high'], 
+                    log=PARAM_RANGES['firing_nb']['log']
+                ),
+                'init_thresholds': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['init_thresholds']['low'], 
+                    PARAM_RANGES['init_thresholds']['high']
+                ),
+                'threshold_lr': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['threshold_lr']['low'], 
+                    PARAM_RANGES['threshold_lr']['high']
+                ),
+                'sparsity_impact': optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['sparsity_impact']['low'], 
+                    PARAM_RANGES['sparsity_impact']['high']
+                ),
+            }
 
         # Add distributions for hidden layers
         for i in range(params['num_hidden_layers']):
-            distributions[f'n_units_l{i+1}'] = optuna.distributions.CategoricalDistribution(
-                PARAM_RANGES['n_units']['choices']
-            )
+            if continuous:
+                distributions[f'n_units_l{i+1}'] = optuna.distributions.FloatDistribution(
+                    PARAM_RANGES['n_units_l1']['low'], 
+                    PARAM_RANGES['n_units_l1']['high']
+                )
+            else:
+                distributions[f'n_units_l{i+1}'] = optuna.distributions.CategoricalDistribution(
+                    PARAM_RANGES['n_units']['choices']
+                )
+
         try:
             study.add_trial(
                 optuna.trial.create_trial(

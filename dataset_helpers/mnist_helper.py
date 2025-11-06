@@ -2,9 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
-import random
-from PIL import Image
-import math
+import jax.numpy as jnp
 from abc import ABC, abstractmethod
 try:
     import dataset_helpers.network_helper as network_helper
@@ -267,7 +265,7 @@ def mnist_loader_preprocessed_single(x, max_nonzero):
             j += 1
             if j >= max_nonzero:  # stop if full
                 break
-    return processed_data
+    return jnp.array(processed_data)
 
 def preprocess_dataset(dataset_x, max_nonzero):
     """
@@ -279,7 +277,7 @@ def preprocess_dataset(dataset_x, max_nonzero):
     processed_dataset = np.zeros((N, max_nonzero, 2), dtype=np.float32)
     for n in range(N):
         processed_dataset[n] = mnist_loader_preprocessed_single(dataset_x[n], max_nonzero)
-    return processed_dataset
+    return jnp.array(processed_dataset)
 
 def mnist_loader_preprocessed_single_CNN(x, max_nonzero, input_dimension=28):
     """

@@ -121,6 +121,7 @@ class Params:
     shuffle_input:bool          # Shuffle the input data 
     threshold_lr: float
     sparsity_impact: float
+    w_reg: float                # Weight regularization factor
     rerun: str
     async_layer: int            # The layer that is training asynchronously while all other layers are training sync, if -1 then all layers are async
     history_size: int = 0       # Size of history you want to store
@@ -141,14 +142,19 @@ def rerun_init(data_file_path,
                init_thresholds=False,
                restrict=False,
                sparsity_impact=False,
+               w_reg=False,
                threshold_lr=False,
                async_layer=False,
+               history_size=False
                ):
     '''
     Rerun from an existing file by replacing the fields marked as True with the values of new params 
     '''
-    split_rank = mpi_config.split_rank
-    last_rank = mpi_config.last_rank
+    
+    split_rank = mpi_config.layer_idx
+    last_rank = mpi_config.last_layer_idx
+    # split_rank = mpi_config.split_rank
+    # last_rank = mpi_config.last_rank
 
     path = os.path.normpath(data_file_path).split(os.sep)
     assert path[1] == new_params.dataset, f"Rerun can only be used on the same dataset, got {path[1]} and {new_params.dataset}"
@@ -170,10 +176,11 @@ def rerun_init(data_file_path,
     init_thresholds_val = new_params.init_thresholds if init_thresholds else extract_scalar(stored_data["thresholds"]["thresholds_1"])
     
     restrict_val = new_params.restrict if restrict else tuple(stored_data["restrict"])
-    sparsity_impact_val = new_params.sparsity_impact if sparsity_impact else stored_data.get("sparsity impact", 0)
+    sparsity_impact_val = new_params.sparsity_impact if sparsity_impact else tuple(stored_data.get("sparsity impact", 0))
     threshold_lr_val = new_params.threshold_lr if threshold_lr else stored_data["threshold lr"]
     async_layer_val = new_params.async_layer if async_layer else stored_data.get("async layer", False)
-    
+    history_size = new_params.history_size if history_size else 0
+
     threshold_dict = stored_data["thresholds"]
     weights_dict = stored_data["weights"]
 
@@ -196,6 +203,7 @@ def rerun_init(data_file_path,
         sparsity_impact=sparsity_impact_val,
         rerun=data_file_path,
         async_layer=async_layer_val,
+        history_size=history_size,
         max_kernel=new_params.max_kernel
     )
     
@@ -299,7 +307,8 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "synchronization rate": params.sync_rate,
         "async layer": params.async_layer,
         "restrict": params.restrict,
-        "threshold impact": params.sparsity_impact,
+        "sparsity impact": params.sparsity_impact,
+        "weight regularization": params.w_reg,
         "threshold lr": params.threshold_lr,
         "test accuracy": test_accuracy,
         "layer_sizes": params.layer_sizes,

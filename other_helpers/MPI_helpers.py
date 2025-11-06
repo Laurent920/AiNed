@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from functools import partial
 import jax
 import jax.numpy as jnp
+
+from mpi4py import MPI
 from mpi4jax import send, recv
 
 @dataclass(frozen=True)  # Makes it immutable and hashable
@@ -125,3 +127,24 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
         batch_y = recv(jnp.zeros((batch_part,)), source=0, tag=4, comm=comm) 
     
     return batch_x, batch_y
+
+def l2_weight_regularization(mpi_config, weights):
+    rank = mpi_config.rank
+    split_rank = mpi_config.split_rank
+    last_rank = mpi_config.last_rank
+    process_per_layer = mpi_config.process_per_layer
+    comm = mpi_config.comm
+    leader_rank = split_rank * process_per_layer
+    
+    weights_sum = jnp.sum(weights**2)
+
+    if split_rank != last_rank and rank == leader_rank:
+        if split_rank != 0:
+            send(weights_sum, dest=last_rank * process_per_layer, tag=7,comm=comm)
+    elif split_rank == last_rank and rank == leader_rank:
+        for i in range(1, last_rank):
+            # Storing mean iterations
+            sum = recv(weights_sum, source=i * process_per_layer, tag=7, comm=comm)
+            weights_sum += sum
+            
+    return weights_sum
