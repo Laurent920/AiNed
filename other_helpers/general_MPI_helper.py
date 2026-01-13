@@ -8,10 +8,11 @@ from mpi4jax import send, recv
 import mpi4jax
 
 try:
-    from other_helpers.helpers import NeuronStates
+    from other_helpers.helpers_MPI_general import NeuronStates
 except ModuleNotFoundError:
-    from helpers import NeuronStates
+    from helpers_MPI_general import NeuronStates
 
+#region combine_batch_avg
 @partial(jax.jit, static_argnames=['mpi_config',])
 def combine_batch_avg(data, mpi_config):
     '''
@@ -42,6 +43,7 @@ def combine_batch_avg(data, mpi_config):
     # jax.debug.print(f"Rank {rank} finished combining batch avg shape: {avg.shape}")
     return avg
 
+#region gather_batch
 # @partial(jax.jit, static_argnames=['mpi_config',])
 def gather_batch(data, mpi_config, average=True):
     '''
@@ -82,7 +84,7 @@ def pad_batch(batch_x, batch_y, batch_size):
     
     return batch_x, batch_y
 
-
+#region split_batch
 def split_batch(params, batch_iterator, mpi_config, tuple_size):
     # tuple_size =2 for MLP and =4 for CNN 
     rank = mpi_config.rank
@@ -90,6 +92,8 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
     batch_part = mpi_config.batch_part
     batch_size = batch_part.total_size
     batch_distrib = mpi_config.batch_distribution
+
+    # jax.debug.print("rank {} batch distrib {}", rank, batch_distrib)
 
     if rank == 0:
         all_batch_x, all_batch_y = next(batch_iterator)
@@ -115,10 +119,168 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
         # print(f"rank {rank} waiting for shape {(batch_part.get_size, params.max_nonzero, tuple_size)}")
         batch_x = recv(jnp.zeros((batch_part.get_size, params.max_nonzero, tuple_size)), source=0, tag=4, comm=comm)  
         batch_y = recv(jnp.zeros((batch_part.get_size,)), source=0, tag=4, comm=comm) 
+    # jax.debug.print("rank {} batch y {}", rank, batch_y)
     # print(f'rank {rank} finished splitting batch')
     return batch_x, batch_y
 
+def gather_model_partition(mpi_config, data):
+    """
+    Gather all the model partitions of the current layer and reconstruct the full layer data and share the full data to all 
+    processes of the current layer.
+    E.g. last layer with 2 processes and 10 neurons: Gather partitions [0-4] and [5-9] to reconstruct the full layer [0-9]
+    """
 
+    batch_size = mpi_config.batch_part.get_size
+    full_layer_data = jnp.zeros((batch_size, mpi_config.current_layer[0][1].total_size))
+    leader = mpi_config.get_current_group_leader
+    rank = mpi_config.rank
+    # print(f"rank {rank} has full layer data shape {full_layer_data.shape} and data shape {data.shape}")
+    if rank == leader: 
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            start, end = partition.start_idx, partition.end_idx+1
+            
+            if process != rank: 
+                rcv_data = recv(jnp.zeros((batch_size, mpi_config.current_layer[i][1].get_size)), source=process, tag=21, comm=mpi_config.comm)
+            else:
+                rcv_data = data 
+            # print(f"rank {rank} received shape {rcv_data.shape}, second dim {mpi_config.current_layer[i][1].get_size}")
+            full_layer_data = full_layer_data.at[:, start:end].set(rcv_data)
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            if process == rank: continue
+            send(full_layer_data, dest=process, tag=21, comm=mpi_config.comm)
+    else:
+        send(data, dest=leader, tag=21, comm=mpi_config.comm)
+        full_layer_data = recv(full_layer_data, source=leader, tag=21, comm=mpi_config.comm)
+    return full_layer_data
+
+def concatenate_model_partition(mpi_config, data, dim):
+    """
+    Concatenate all the data from the model partitions of the current layer and share the resulting data to all 
+    processes of the current layer within the same batch partition.
+    E.g. hidden layer with 2 processes and weights of shape (128, 5): Reconstruct the full weights as (128, 10)
+    """
+    full_data_shape = data.shape
+    if dim == 1:
+        full_data_shape = mpi_config.current_layer[0][1].total_size
+    elif dim == 2:
+        full_data_shape = (data.shape[0], mpi_config.current_layer[0][1].total_size)
+    full_layer_data = jnp.zeros(full_data_shape)
+    
+    leader = mpi_config.get_current_group_leader
+    rank = mpi_config.rank
+    # print(f"rank {rank} has full layer data shape {full_layer_data.shape} and data shape {data.shape}")
+    if rank == leader: 
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            start, end = partition.start_idx, partition.end_idx+1
+            
+            if process != rank: 
+                if dim == 2:
+                    rcv_data = recv(jnp.zeros((data.shape[0], mpi_config.current_layer[i][1].get_size)), source=process, tag=21, comm=mpi_config.comm)
+                elif dim == 1:
+                    rcv_data = recv(jnp.zeros((mpi_config.current_layer[i][1].get_size,)), source=process, tag=21, comm=mpi_config.comm)
+            else:
+                rcv_data = data 
+            # print(f"rank {rank} received shape {rcv_data.shape}, second dim {mpi_config.current_layer[i][1].get_size}")
+            if dim == 2:
+                full_layer_data = full_layer_data.at[:, start:end].set(rcv_data)
+            elif dim == 1:
+                full_layer_data = full_layer_data.at[start:end].set(rcv_data)
+
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            if process == rank: continue
+            send(full_layer_data, dest=process, tag=21, comm=mpi_config.comm)
+    else:
+        send(data, dest=leader, tag=21, comm=mpi_config.comm)
+        full_layer_data = recv(full_layer_data, source=leader, tag=21, comm=mpi_config.comm)
+    return full_layer_data
+
+def leader_share_to_whole_layer(mpi_config, data):
+    leader = mpi_config.get_current_group_leader
+    rank = mpi_config.rank
+
+    if rank == leader:
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            if process != rank: 
+                send(data, dest=process, tag=21, comm=mpi_config.comm)
+    else:
+        data = recv(data, source=leader, tag=21, comm=mpi_config.comm)
+    return data
+
+def share_iteration_to_whole_layer(mpi_config, data):
+    full_layer_data = jnp.zeros(data.shape)
+    leader = mpi_config.get_current_group_leader
+    rank = mpi_config.rank
+    # print(f"rank {rank} has data {data} and data shape {data.shape}")
+    if rank == leader: 
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            start, end = partition.start_idx, partition.end_idx+1
+            
+            if process != rank: 
+                rcv_data = recv(full_layer_data, source=process, tag=21, comm=mpi_config.comm)
+            else:
+                rcv_data = data 
+            # print(f"rank {rank} received shape {rcv_data.shape}, second dim {mpi_config.current_layer[i][1].get_size}")
+            full_layer_data += rcv_data
+        for i, (process, partition) in enumerate(mpi_config.current_layer):
+            if process == rank: continue
+            send(full_layer_data, dest=process, tag=21, comm=mpi_config.comm)
+    else:
+        send(jnp.array(data), dest=leader, tag=21, comm=mpi_config.comm)
+        full_layer_data = recv(full_layer_data, source=leader, tag=21, comm=mpi_config.comm)
+    return full_layer_data
+
+def gather_w_it_th(mpi_config, params, weights, mean_iterations, thresholds):
+    """ 
+    Gather all the weights, iteration values and thresholds at the last layer's leader rank to store them
+    """
+    rank = mpi_config.rank
+    layer_idx = mpi_config.layer_idx
+    last_layer = mpi_config.last_layer_idx
+    comm = mpi_config.comm
+    weights_dict = {}
+    all_iteration_mean = []
+    thresholds_dict = {}    
+
+    if layer_idx == 0:
+        mean_iterations = share_iteration_to_whole_layer(mpi_config, mean_iterations)
+    weights = concatenate_model_partition(mpi_config, weights, dim=len(weights.shape))
+    thresholds = concatenate_model_partition(mpi_config, thresholds, dim=len(thresholds.shape))
+
+    # print(rank, thresholds.shape, mean_iterations)
+    if not mpi_config.is_last_layer and mpi_config.is_batch_leader:
+        dest = mpi_config.get_last_layer_batch_leader
+
+        # print(f"rank {rank}, iterations: {mean_iterations}")
+        send(jnp.array(mean_iterations), dest=dest, tag=5,comm=comm)
+        if layer_idx != 0:
+            send(weights, dest=dest, tag=5,comm=comm)
+            send(thresholds, dest=dest, tag=5,comm=comm)
+
+    elif mpi_config.is_last_layer and mpi_config.is_batch_leader:
+        for i, leader_rank in enumerate(mpi_config.all_leader_ranks):
+            if rank == leader_rank: continue
+            # Storing mean iterations
+            it_mean = recv(mean_iterations, source=leader_rank, tag=5, comm=comm)
+            all_iteration_mean.append(it_mean)
+            if leader_rank==0: 
+                continue
+
+            # Storing the weights 
+            w = recv(jnp.zeros((params.layer_sizes[i-1], params.layer_sizes[i])), source=leader_rank, tag=5, comm=comm)   
+            weights_dict[f"layer_{i}"] = w.tolist()
+            
+            # Storing the thresholds
+            thr = recv(jnp.zeros(params.layer_sizes[i]), source=leader_rank, tag=5, comm=comm)
+            thresholds_dict[f"thresholds_{i}"]= thr.tolist()
+            
+        all_iteration_mean.append(mean_iterations)  # Append the mean iterations of the last layer
+        weights_dict[f"layer_{last_layer}"] = weights.tolist()
+
+        print("all iteration mean: rank", rank, all_iteration_mean)
+
+    return weights_dict, all_iteration_mean, thresholds_dict
+
+#region Partition
 @dataclass(frozen=True)
 class Partition:
     start_idx: int
@@ -144,6 +306,7 @@ class Partition:
         print(f"{prefix}  Size: {self.get_size}/{self.total_size}")
         print(f"{prefix}  Coverage: {(self.get_size/self.total_size)*100:.1f}%")
 
+#region MPIConfig
 @dataclass(frozen=True)  # Makes it immutable and hashable
 class MPIConfig:
     rank: int
@@ -230,10 +393,6 @@ class MPIConfig:
         return self.all_leader_ranks[self.layer_idx]
 
     @property
-    def get_current_group_leader(self):
-        return min(self.get_current_layer_ranks)
-
-    @property
     def get_last_layer_batch_leader(self):
         return max(self.all_leader_ranks)
 
@@ -260,7 +419,11 @@ class MPIConfig:
                                                 output_vector=empty_neuron_states.output_vector[start:end],
                                                 values_history=empty_neuron_states.values_history[:, start:end],
                                                 history_index=jnp.array(0, dtype=jnp.int32))
-        part_weights = weights[:,start:end]
+        # print(f"weights shape: {weights.shape}, resulting size s-e: {start}-{end}")
+        try:
+            part_weights = weights[:,start:end]
+        except:
+            part_weights = weights[start:end]
         return part_weights, part_empty_neuron_states
 
     def print(self):
@@ -293,6 +456,7 @@ jax.tree_util.register_pytree_node(
     _mpiconfig_unflatten
 )
 
+#region MPI Build
 class MPIProcessDistribution:
     """Builder for creating flexible MPI topologies for 
     - Model parallelism (splitting each layer across processes)
@@ -340,8 +504,9 @@ class MPIProcessDistribution:
     
     def model_split_uniform(self):
         """
-        Model parallelism: Splits the processes as uniformely as possible by sharing to the deeper layers first
-        mapping scheme: 
+        Model parallelism: Splits the processes as uniformely as possible by sharing to the deeper layers first 
+        (excluding the last layer because it only needs to integrate the values, less computation required)
+        Mapping scheme: 
         |6 processes, 3 layers
             0&1 -> 2&3 -> 4&5
         |7 processes, 3 layers
@@ -384,13 +549,15 @@ class MPIProcessDistribution:
     def build(self, rank, comm):
         """
             Builds the partitions according to the specifications in self.layer_assignments
+            - Batch partition refers to the splitting of a batch across processes (See data_split_uniform)
+            - Model partition refers to the splitting of a layer across processes (See model_split_uniform)
         """
+        # Creating batch and model partitions
         layer_idx, batch_parts, model_parts = self.layer_assignments[rank]
-        # print(rank, self.layer_assignments)
+        print(rank, self.layer_assignments)
         batch_part = Partition(start_idx=batch_parts[0],
                                end_idx=batch_parts[1],
                                total_size=self.batch_size)
-        
         model_part = Partition(start_idx=model_parts[0],
                                end_idx=model_parts[1],
                                total_size=self.layer_sizes[layer_idx])
@@ -404,25 +571,27 @@ class MPIProcessDistribution:
 
         b_first_rank, b_last_rank = self.mpi_size, 0
         for r in self.layer_assignments.keys():
-            l_idx, b_parts, m_parts = self.layer_assignments[r]
+            l_idx, b_parts, m_parts = self.layer_assignments[r] # Layer index, batch parts, model parts
             all_leaders[l_idx].append(r)
 
-            if b_parts[0] == batch_part.start_idx and b_parts[1] == batch_part.end_idx:
-                b_last_rank = max(b_last_rank, r)
-                b_first_rank = min(b_first_rank, r)
+            if b_parts[0] == batch_part.start_idx and b_parts[1] == batch_part.end_idx: # Check if the rank belongs to the same batch partition
+                if m_parts[0] == 0: # Only consider the first model partition of the layer (leader ranks)
+                    b_last_rank = max(b_last_rank, r)   # Last rank of the batch partition where to send the labels
+                    b_first_rank = min(b_first_rank, r) # First rank of the batch partition from which we receive the labels
+                
                 # print(rank, r, b_parts, batch_part)
                 m_part = Partition(start_idx=m_parts[0],
                                     end_idx=m_parts[1],
                                     total_size=self.layer_sizes[l_idx])
                 
                 info = (r, m_part)
-                if l_idx == layer_idx-1:
+                if l_idx == layer_idx-1:    # Previous layer model parts where we receive the data from
                     prev.append(info)
-                elif l_idx == layer_idx:
+                elif l_idx == layer_idx:    # Current layer model parts 
                     if rank == 0:
                         print(f"r {r}, l_idx {l_idx}, layer_index {layer_idx}")
                     curr.append(info)
-                elif l_idx == layer_idx+1:
+                elif l_idx == layer_idx+1:  # Next layer model parts where we send the data to
                     next.append(info)
             if l_idx == layer_idx:
                 b_part = Partition(start_idx=b_parts[0],
@@ -451,30 +620,51 @@ class MPIProcessDistribution:
             res_connect_prev=()
         )
 
-def forward_send(mpi_config: MPIConfig, data):    
+#region Send and Rcv
+def forward_send(mpi_config: MPIConfig, data, it=0):    
     for process, partition in mpi_config.next_layer:
-        cond = jnp.logical_and(mpi_config.rank != -1, jnp.any(data==-1))
+        # cond = jnp.logical_and(mpi_config.layer_idx == 1, jnp.any(data!=-2))
         # jax.lax.cond(cond,
-        #              lambda _: jax.debug.print("rank {} sending {} to rank {}", mpi_config.rank, data, process),
+        #              lambda _: jax.debug.print("rank {} sending {} to rank {}, it {}", mpi_config.rank, data, process, it),
         #              lambda _: None, None)
         send(data, dest=process, tag=0, comm=mpi_config.comm)
 
 @partial(jax.jit, static_argnums=(1, 2))
-def forward_rcv(mpi_config: MPIConfig, num_prev, input_shape):
+def forward_recv(mpi_config: MPIConfig, num_prev, input_shape, finished):
     # num_prev = mpi_config.nb_previous  
     data = jnp.zeros((num_prev, input_shape))
     for i, (process, partition) in enumerate(mpi_config.previous_layer):
-        recv_data= recv(jnp.zeros((input_shape)), source=process, tag=0, comm=mpi_config.comm)
+        recv_data = jax.lax.cond(finished[i] <= -1, # If previous layer finished sending don't call receive anymore
+                                 lambda _: jnp.array([-1.0, -1.0]),
+                                 lambda _: recv(jnp.zeros((input_shape)), source=process, tag=0, comm=mpi_config.comm),
+                                 None)
+        # recv_data= recv(jnp.zeros((input_shape)), source=process, tag=0, comm=mpi_config.comm)
         data = data.at[i].set(recv_data)
         # jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data[i], data.shape)       
 
-    jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data, data.shape)
+    # cond = jnp.logical_and(mpi_config.layer_idx == 2, jnp.any(data!=-10))
+    # jax.lax.cond(cond,
+    #             lambda _: jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data, data.shape),
+    #             lambda _: None, None)
     # data = jax.lax.fori_loop(0, num_prev, body_fn, data)
     # cond = jnp.logical_and(True, True)
     # jax.lax.cond(cond,
     #                 lambda _: jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data[0], data.shape),
     #                 lambda _: None, None)
     return data
+
+@partial(jax.jit, static_argnums=(2))
+def send_labels(mpi_config: MPIConfig, labels, source):
+    if mpi_config.rank == source:
+        send(labels, dest=mpi_config.batch_first_and_last_rank[1], tag=10, comm=mpi_config.comm)
+
+def recv_labels(mpi_config: MPIConfig):
+    y = jnp.zeros((mpi_config.batch_part.get_size,))
+    if mpi_config.rank == mpi_config.batch_first_and_last_rank[1]:
+        y = recv(y, source=mpi_config.batch_first_and_last_rank[0], tag=10, comm=mpi_config.comm)
+    
+    y = leader_share_to_whole_layer(mpi_config, y)
+    return y
 
 def backward_send(mpi_config: MPIConfig, data):
     for process, partition in mpi_config.previous_layer:
@@ -484,17 +674,20 @@ def backward_send(mpi_config: MPIConfig, data):
         #              lambda _: None, None)
         send(data, dest=process, tag=2, comm=mpi_config.comm)
 
-def backward_rcv(mpi_config: MPIConfig, data_like):
-    data = data_like
-    for process, partition in mpi_config.next_layer:
+def backward_recv(mpi_config: MPIConfig):
+    data_shape = (mpi_config.batch_part.get_size, mpi_config.model_part.total_size)
+    data = jnp.zeros(data_shape)
+    for process, model_partition in mpi_config.next_layer:
         # jax.debug.print("rank {} waiting to receive from {}", mpi_config.rank, process)
-        data = recv(data_like, source=process, tag=2, comm=mpi_config.comm)
+        data_part = recv(jnp.zeros(data_shape), source=process, tag=2, comm=mpi_config.comm)
+        data += data_part
         # cond = jnp.logical_and(process != -1, jnp.any(data!=-1))
         # jax.lax.cond(cond,
         #              lambda _: jax.debug.print("rank {} received {}", mpi_config.rank, data.shape),
         #              lambda _: None, None)
     return data
 
+#region Splitting func
 def data_split(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...]):
     mpi_process_distribution = MPIProcessDistribution(mpi_size, batch_size, layer_sizes)
     mpi_process_distribution.data_split_uniform()
@@ -507,6 +700,7 @@ def model_split(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...]):
     mpi_config = mpi_process_distribution.build(rank, comm)
     return mpi_config
 
+#region main
 if __name__ == "__main__":
     # Initialize MPI
     comm = MPI.COMM_WORLD

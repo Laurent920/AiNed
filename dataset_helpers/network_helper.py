@@ -502,6 +502,64 @@ class SGDOptimizer:
         for param in self.parameters:
             param.grad = 0  # Reset the gradient for each parameter to zero
 
+class AdamOptimizer:
+    """
+    Implements the Adam optimization algorithm.
+    Drop-in replacement for SGDOptimizer.
+    """
+
+    def __init__(self, parameters, lr=0.001, betas=(0.9, 0.999), eps=1e-8):
+        """
+        Args:
+            parameters (list): List of parameters (objects with .data and .grad).
+            lr (float): Learning rate.
+            betas (tuple): Coefficients for exponential moving averages.
+            eps (float): Small term to avoid division by zero.
+        """
+        self.parameters = parameters
+        self.lr = lr
+        self.beta1, self.beta2 = betas
+        self.eps = eps
+
+        # Initialize moment buffers (same shape as parameters)
+        self.m = [np.zeros_like(p.data) for p in parameters]
+        self.v = [np.zeros_like(p.data) for p in parameters]
+
+        # Time step used for bias correction
+        self.t = 0
+
+    def step(self):
+        """
+        Performs a single optimization step using Adam.
+        """
+        self.t += 1  # Increasing time step
+
+        for i, param in enumerate(self.parameters):
+
+            # Handle bias-like parameters where gradient needs summing
+            if param.data.shape[0] == 1 and param.grad.shape[0] > 1:
+                grad = np.sum(param.grad, axis=0, keepdims=True)
+            else:
+                grad = param.grad
+
+            # Update biased first and second moment estimates
+            self.m[i] = self.beta1 * self.m[i] + (1 - self.beta1) * grad
+            self.v[i] = self.beta2 * self.v[i] + (1 - self.beta2) * (grad ** 2)
+
+            # Compute bias-corrected moments
+            m_hat = self.m[i] / (1 - self.beta1 ** self.t)
+            v_hat = self.v[i] / (1 - self.beta2 ** self.t)
+
+            # Update parameters
+            param.data -= self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+    def zero_grad(self):
+        """
+        Sets gradients of all parameters to zero.
+        """
+        for param in self.parameters:
+            param.grad = 0
+            
 class SoftmaxCrossEntropy(TensorFunction):
     """
     Implements the softmax activation followed by the cross-entropy loss function.

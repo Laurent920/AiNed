@@ -34,10 +34,13 @@ def loss_bpp(weights, all_neuron_states, loss_grad):
         weight_grad, shape: (128, 10)
     '''
     out_grad = jnp.dot(weights, loss_grad) # Shape: (128,)
-    
-    loss_grad_expanded = jnp.expand_dims(loss_grad, axis=1)  # Shape: (10, 1)
-    all_residuals = all_neuron_states.input_residuals # Shape: (128,)
+    # out_grad *= all_neuron_states.input_activity
+    # jax.debug.print("{}, mean outgrad {}", all_neuron_states.input_activity, jnp.mean(out_grad))
+    # jax.debug.print("out grad shape: {}, layer activity shape: {}", out_grad.shape, all_neuron_states.input_activity.shape)
 
-    weight_grad = loss_grad_expanded * all_residuals  # Shape: (10, 128)
+    loss_grad_expanded = jnp.expand_dims(loss_grad, axis=1)  # Shape: (10, 1)
+    all_input_residuals = all_neuron_states.input_residuals # Shape: (128,)
+
+    weight_grad = loss_grad_expanded * all_input_residuals  # Shape: (10, 128)
     
     return out_grad, weight_grad.T

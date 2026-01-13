@@ -10,7 +10,7 @@ import numpy as np
 import jax.numpy as jnp
 from tqdm import tqdm
 
-def torch_SHD_loader(batch_size, shuffle=False):
+def torch_SHD_loader(batch_size, shuffle=False, downsample=False):
     trainset = tonic.datasets.SHD(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
     testset = tonic.datasets.SHD(save_to='./data', train=False)#, transform=transforms.NumpyAsType(float))
     

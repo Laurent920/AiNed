@@ -89,7 +89,7 @@ def pad_batch(batch_x, batch_y, batch_size):
     if current_size < batch_size:
         pad_amount = batch_size - current_size
         pad_y = jnp.full((pad_amount,), -1.0, dtype=jnp.float32)
-        pad_x = jnp.zeros((pad_amount,) + batch_x.shape[1:], dtype=batch_x.dtype)  
+        pad_x = jnp.full((pad_amount,) + batch_x.shape[1:], -2.0, dtype=batch_x.dtype)  
         # jax.debug.print("rank {}, has batch size: {} and pad batch size: {}", rank, current_size, pad_x.shape)
         batch_y = jnp.concatenate([batch_y, pad_y], axis=0)
         batch_x = jnp.concatenate([batch_x, pad_x], axis=0)

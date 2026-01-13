@@ -25,7 +25,6 @@ def compute_full_bpp(params, all_neuron_states, next_grad, split_rank):
         Basically if one row (neuron) in the next layer's weights residuals is all zeros (=neuron never activated), then the corresponding column in the current layer should be set to zero. 
     (3) Apply restrict to the weight_res:
         Apply [1-(1-alpha)^n]/alpha, the result of the finite geometric series where n is the number of times a neuron activated in the layer and alpha is the restrict parameter
-        Previous computation: 1+(1-alpha)^(n*(n+1)/2)
     (4) Compute the partial gradient w.r.t the weights by integrating the next layer's gradient:
         z_grad = weights_residuals * next_grad
     (5) Compute the full gradient w.r.t the weights by multiplying with the input residuals:
@@ -47,12 +46,10 @@ def compute_full_bpp(params, all_neuron_states, next_grad, split_rank):
     #     weight_res = weight_res * (~jnp.all(next_weight_res == 0, axis=1))[None, :]
 
     # (3) Shape: (784, 128)
-    # exponent = (layer_activity*(layer_activity+1)/2).astype(jnp.int32)
-    # new_layer_activity = jnp.where(params.restrict[split_rank] > 0, 1+jnp.power((1-params.restrict[split_rank]), exponent), 1)
     a = params.restrict[split_rank]
     new_layer_activity = jnp.where(a > 0, (1-jnp.power((1-a), layer_activity+1))/a, 1) # Shape (128,)
     mul_res = jnp.broadcast_to(new_layer_activity, weight_res.shape) 
-    # weight_res = weight_res * mul_res
+    weight_res = weight_res * mul_res
 
     # (4) Shape: (784, 128)
     next_grad_expanded = jnp.expand_dims(next_grad, axis=0)  # Shape: (1, 128)

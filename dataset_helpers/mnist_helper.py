@@ -159,28 +159,27 @@ def average_active_inputs(train_dataloader):
     return total_active_features / total_samples
 
 #region MANUAL LOADER
-def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproces=False, cache_dir='./cache/mnist'):
+def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproces=False, downsample=False, cache_dir='./cache/mnist'):
     max_nonzero = 351
     dataset_folder = "data/mnist/"
 
     if not preprocess:
-        os.makedirs(cache_dir, exist_ok=True)
-        train_cache_path = os.path.join(cache_dir, '/train.npz')
-        test_cache_path  = os.path.join(cache_dir, '/test.npz')
-
+        pass
     else:
-        if CNN_preproces:
-            cache_dir += "/async_CNN"
-            os.makedirs(cache_dir, exist_ok=True)
-
-            train_cache_path = os.path.join(cache_dir, 'train.npz')
-            test_cache_path  = os.path.join(cache_dir, 'test.npz')
+        if downsample:
+            if CNN_preproces:
+                cache_dir += "/async_CNN_14"
+            else:
+                cache_dir += "/async_MLP_14"
         else:
-            cache_dir += "/async_MLP"
-            os.makedirs(cache_dir, exist_ok=True)
-
-            train_cache_path = os.path.join(cache_dir, 'train.npz')
-            test_cache_path  = os.path.join(cache_dir, 'test.npz')
+            if CNN_preproces:
+                cache_dir += "/async_CNN"
+            else:
+                cache_dir += "/async_MLP"
+            
+    os.makedirs(cache_dir, exist_ok=True)
+    train_cache_path = os.path.join(cache_dir, 'train.npz')
+    test_cache_path  = os.path.join(cache_dir, 'test.npz')
 
     if preprocess and os.path.exists(train_cache_path):
         print("Loading cached MNIST dataset")
@@ -201,6 +200,11 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
         mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv')
         mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
         mnist_data_y_test = mnist_data.iloc[:, 0].values
+
+        if downsample:
+            print("Downsampling MNIST images to 14x14")
+            mnist_data_x = downsample_14x14(mnist_data_x)
+            mnist_data_x_test = downsample_14x14(mnist_data_x_test)
 
         if preprocess:
             if CNN_preproces:
@@ -251,6 +255,11 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
     #         max_nonzero = max(n_nonzeros, max_nonzero)
     
     return (train_dataloader, total_train_batches), (val_dataloader, total_val_batches), (test_dataloader, total_test_batches), max_nonzero
+
+def downsample_14x14(x):
+        x = x.reshape(-1, 28, 28)
+        x = x.reshape(-1, 14, 2, 14, 2).mean(axis=(2, 4))
+        return x.reshape(-1, 196)
 
 def mnist_loader_preprocessed_single(x, max_nonzero):
     """
@@ -311,7 +320,7 @@ def preprocess_dataset_CNN(dataset_x, max_nonzero):
 
 if __name__ == "__main__":
     torch_load = False
-    torch_load = True
+    # torch_load = True
 
     if torch_load:
         layer_sizes = [784, 512, 512, 10]
@@ -340,7 +349,11 @@ if __name__ == "__main__":
         #     batchx, batchy = next(d)
         #     print(jnp.array(batchx).shape)
 
-        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=False, CNN_preproces=False)
+        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, 
+                                                                                                                                                                      shuffle=False, 
+                                                                                                                                                                      preprocess=False, 
+                                                                                                                                                                      CNN_preproces=False, 
+                                                                                                                                                                      downsample=False)
 
         avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
@@ -368,8 +381,12 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 128, 128, 128, 128, 128, 10))
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
-        layer_size.append((28*28, 128, 10))
+        
+        layer_size.append((28*28, 256, 10))
+        # layer_size.append((28*28, 256, 256, 10))
+        # layer_size.append((28*28, 128, 10))
         # layer_size.append((28*28, 128, 128, 10))
+        # layer_size.append((14*14, 128, 10))
         
         epoch_num = 20
         for layer_dims in layer_size:
@@ -394,7 +411,8 @@ if __name__ == "__main__":
                     param_tensor.data[:] = loaded_array
 
             # Define optimizer
-            optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
+            # optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
+            optimizer = network_helper.AdamOptimizer(network.param, lr=0.0001)
             # Define loss function
             loss_func = network_helper.SoftmaxCrossEntropy()
 
@@ -420,7 +438,7 @@ if __name__ == "__main__":
 
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')
-            plt.title(f"Final Val Acc: {val_accuracy_list[-1]:.4f} | Final Train Acc: {train_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
+            plt.title(f"Final Train Acc: {train_accuracy_list[-1]:.4f} | Final Val Acc: {val_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")
             plt.legend()
             plt.grid(True)
             

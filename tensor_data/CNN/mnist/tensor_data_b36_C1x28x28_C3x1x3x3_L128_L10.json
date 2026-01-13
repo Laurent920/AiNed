@@ -1,0 +1,20 @@
+{
+    "epochs": 1,
+    "batch_size": 36,
+    "train_accuracy": [
+        88.59886676110324
+    ],
+    "validation_accuracy": [
+        93.74791597199066
+    ],
+    "test_accuracy": 93.91,
+    "final_train_accuracy": 88.59886676110324,
+    "final_val_accuracy": 93.74791597199066,
+    "execution_time_sec": 2.580522298812866,
+    "inference_time_sec": 0.33313560485839844,
+    "average_activations": {
+        "conv1": 379.0269162221243,
+        "fc1": 37.93823767516599,
+        "input": 150.0766228853652
+    }
+}

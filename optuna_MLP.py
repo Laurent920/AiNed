@@ -26,7 +26,7 @@ from optuna.pruners import MedianPruner, BasePruner
 # import wandb
 
 from other_helpers.helpers import Params
-from async_MPI import batch_predict, train, main
+from async_MLP import batch_predict, train, main
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()      # Real rank

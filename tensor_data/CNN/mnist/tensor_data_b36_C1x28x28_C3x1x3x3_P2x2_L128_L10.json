@@ -1,0 +1,21 @@
+{
+    "epochs": 1,
+    "batch_size": 36,
+    "train_accuracy": [
+        83.7430214148821
+    ],
+    "validation_accuracy": [
+        91.76392130710236
+    ],
+    "test_accuracy": 91.76,
+    "final_train_accuracy": 83.7430214148821,
+    "final_val_accuracy": 91.76392130710236,
+    "execution_time_sec": 2.074671983718872,
+    "inference_time_sec": 0.46273064613342285,
+    "average_activations": {
+        "conv1": 327.74304739881563,
+        "pool1": 114.74748466532895,
+        "fc1": 50.967979697874355,
+        "input": 150.0777525938433
+    }
+}

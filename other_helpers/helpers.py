@@ -103,6 +103,53 @@ class NeuronStates:
             is_conv=updates.get("is_conv", self.is_conv),
         )
     
+    def print_state_info(self, print_values=False):
+        """
+        Prints the shape and dtype of every JAX array field, and the value/type of scalar fields.
+
+        Args:
+            print_values (bool): If True, prints the full values of the arrays and scalars.
+        """
+        print(f"## 🧠 NeuronStates Information (is_conv: {self.is_conv}, weights_shape: {self.weights_shape})")
+        print("---")
+
+        # Dictionary of fields to inspect
+        fields = {
+            "values": self.values,
+            "thresholds": self.thresholds,
+            "input_residuals": self.input_residuals,
+            "input_order": self.input_order,
+            "input_activity": self.input_activity,
+            "layer_activity": self.layer_activity,
+            "output_activity": self.output_activity,
+            "last_sent_iteration": self.last_sent_iteration,
+            "input_vector": self.input_vector,
+            "output_vector": self.output_vector,
+            "values_history": self.values_history,
+            "history_index": self.history_index,
+            "weights_shape": self.weights_shape,
+            "is_conv": self.is_conv
+        }
+
+        for name, field in fields.items():
+            if field is None:
+                print(f"* **{name}**: **None**")
+            elif isinstance(field, jnp.ndarray):
+                print(f"* **{name}**: **Shape**={field.shape}, **Dtype**={field.dtype}")
+                if print_values:
+                    print(f"  * **Values**:")
+                    print(field)
+            elif isinstance(field, (int, float, bool, tuple, list)):
+                # Handle scalar-like types (like last_sent_iteration, is_conv, weights_shape)
+                print(f"* **{name}**: **Type**={type(field).__name__}")
+                if print_values:
+                    # Always show non-array values for context
+                    print(f"  * **Value**: {field}")
+            else:
+                print(f"* **{name}**: **Type**={type(field).__name__}")
+                if print_values:
+                    print(f"  * **Value**: {field}")
+        
 @dataclasses.dataclass(frozen=True)
 class Params:
     dataset: str 
@@ -151,10 +198,10 @@ def rerun_init(data_file_path,
     Rerun from an existing file by replacing the fields marked as True with the values of new params 
     '''
     
-    split_rank = mpi_config.layer_idx
-    last_rank = mpi_config.last_layer_idx
-    # split_rank = mpi_config.split_rank
-    # last_rank = mpi_config.last_rank
+    # split_rank = mpi_config.layer_idx
+    # last_rank = mpi_config.last_layer_idx
+    split_rank = mpi_config.split_rank
+    last_rank = mpi_config.last_rank
 
     path = os.path.normpath(data_file_path).split(os.sep)
     assert path[1] == new_params.dataset, f"Rerun can only be used on the same dataset, got {path[1]} and {new_params.dataset}"
@@ -164,7 +211,7 @@ def rerun_init(data_file_path,
 
     load_file = stored_data["loadfile"]
     layer_sizes = list_to_tuple_deep(stored_data["layer_sizes"])
-    assert layer_sizes == new_params.layer_sizes, f"Network structure must be the same to rerun, got {layer_sizes} and {new_params.layer_sizes}"
+    # assert layer_sizes == new_params.layer_sizes, f"Network structure must be the same to rerun, got {layer_sizes} and {new_params.layer_sizes}"
     
     # Use stored value if flag is False, otherwise use new_params value
     shuffle_activations_val = new_params.shuffle_activations if shuffle_activations else stored_data["shuffle activations"]
@@ -177,12 +224,16 @@ def rerun_init(data_file_path,
     
     restrict_val = new_params.restrict if restrict else tuple(stored_data["restrict"])
     sparsity_impact_val = new_params.sparsity_impact if sparsity_impact else tuple(stored_data.get("sparsity impact", 0))
+    w_reg_val = new_params.w_reg if w_reg else stored_data.get("weight regularization", 0.0)
     threshold_lr_val = new_params.threshold_lr if threshold_lr else stored_data["threshold lr"]
     async_layer_val = new_params.async_layer if async_layer else stored_data.get("async layer", False)
     history_size = new_params.history_size if history_size else 0
 
     threshold_dict = stored_data["thresholds"]
     weights_dict = stored_data["weights"]
+
+    if isinstance(firing_nb_val, list):
+        firing_nb_val = tuple(firing_nb_val)
 
     params = Params(
         dataset=new_params.dataset,  # Assuming you want to keep the dataset from new_params
@@ -201,6 +252,7 @@ def rerun_init(data_file_path,
         shuffle_input=shuffle_input_val,
         threshold_lr=threshold_lr_val,
         sparsity_impact=sparsity_impact_val,
+        w_reg=w_reg_val,
         rerun=data_file_path,
         async_layer=async_layer_val,
         history_size=history_size,
@@ -216,7 +268,7 @@ def rerun_init(data_file_path,
     else:
         l = layer_sizes[split_rank]
         if isinstance(l, int) or len(l) == 1:
-            weights = thresholds = thresholds = jnp.zeros(layer_sizes[split_rank])
+            weights = thresholds = jnp.zeros(layer_sizes[split_rank])
         else:
             weights = thresholds = jnp.zeros((1,1,1,1))
     return params, weights, thresholds

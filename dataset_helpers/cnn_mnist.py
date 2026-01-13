@@ -39,16 +39,16 @@ class SimpleCNN(nn.Module):
         # self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
         self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
-        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
         # self.pool2 = nn.AvgPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
         # self.out = nn.Linear(28*28*3, 10, bias=False)
 
-        # self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
+        self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
         # self.fc1 = nn.Linear((14 * 14 * 5), 128, bias=False)
         # self.fc1 = nn.Linear(28 * 28 * 64, 32, bias=False)
-        self.out = nn.Linear(14 * 14 * 5, 10, bias=False)
-        # self.out = nn.Linear(128, 10, bias=False)
+        # self.out = nn.Linear(14 * 14 * 5, 10, bias=False)
+        self.out = nn.Linear(128, 10, bias=False)
 
         # Automatically collect all layers with parameters
         self.activation_stats = {
@@ -73,16 +73,16 @@ class SimpleCNN(nn.Module):
         x = F.relu(self.conv2(x))
         self._record_activation("conv2", x)
  
-        x = self.pool2(x)
-        self._record_activation("pool2", x)
+        # x = self.pool2(x)
+        # self._record_activation("pool2", x)
         
         # print(x.shape)
         x = x.view(x.size(0), -1)
         # print(x.shape)
 
         # fc1
-        # x = F.relu(self.fc1(x))
-        # self._record_activation("fc1", x)
+        x = F.relu(self.fc1(x))
+        self._record_activation("fc1", x)
 
         # output layer
         x = self.out(x)
@@ -94,6 +94,68 @@ class SimpleCNN(nn.Module):
         nonzero = (x != 0).sum().item() / x.size(0)
         self.activation_stats[layer_name].append(nonzero)
 
+class LeNet5(nn.Module):
+    def __init__(self):
+        super(LeNet5, self).__init__()
+
+        # Define your layers
+        self.conv1 = nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=0, bias=False)
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+
+        self.conv2 = nn.Conv2d(6, 16, kernel_size=5, stride=1, padding=0, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+    
+        self.fc1 = nn.Linear((16 * 4 * 4), 120, bias=False)
+        self.fc2 = nn.Linear(120, 84, bias=False)
+        self.out = nn.Linear(84 , 10, bias=False)
+
+        # Automatically collect all layers with parameters
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AvgPool2d))
+            },
+            "input": []
+        }
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        x = F.relu(self.conv1(x))
+        self._record_activation("conv1", x)
+        # print(x.shape)
+
+        x = self.pool1(x)
+        self._record_activation("pool1", x)
+        # print(x.shape)
+
+        x = F.relu(self.conv2(x))
+        self._record_activation("conv2", x)
+ 
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
+        
+        # print(x.shape)
+        x = x.view(x.size(0), -1)
+        # print(x.shape)
+
+        # fc1
+        x = F.relu(self.fc1(x))
+        self._record_activation("fc1", x)
+
+        # fc2
+        x = F.relu(self.fc2(x))
+        self._record_activation("fc2", x)
+
+        # output layer
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        """Helper to record average nonzero activations per sample."""
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
 
 class NmnistCNN(nn.Module):
     def __init__(self):
@@ -440,6 +502,8 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
     if dataset == "mnist":
         # Choose one:
         model = SimpleCNN().to(device)
+        # model = LeNet5().to(device)
+
         # model = VGG16(num_classes=10, in_channels=1).to(device)
         # model = VGG8(num_classes=10, in_channels=1).to(device)
         # model = VGG8Light(num_classes=10, in_channels=1).to(device)
@@ -494,8 +558,9 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
-
+            corrects = predicted.eq(targets).sum().item()
+            # print(f"Batch {batch_idx}, Accuracy {corrects}/{targets.size(0)}")
+            correct += corrects
         train_acc = 100. * correct / total
         train_accs.append(train_acc)
         print(f"Epoch [{epoch+1}/{epochs}] Loss: {running_loss/total_train_batches:.4f} Train Acc: {train_acc:.2f}%")
