@@ -31,3 +31,9 @@ Parallel computation:
 1. flax.jax_utils.prefetch_to_device to place the initial data on the devices (contrary to shard map which put all the data on one device then transfer it)
 
 
+Tips on JAX Behavior:
+- When calling an array with an out-of-bound index or negative index JAX will silently skip that computation
+- Do not use array as indexes (or it's going to update the whole matrix):                  
+    matrix.at[array([0,1,2])].add(something)   X
+    matrix.at[tuple(0,1,2)].add(something)     V
+- Use floats when sending information via mpi4jax otherwise it will truncate it and send the wrong value

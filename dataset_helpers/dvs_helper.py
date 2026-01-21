@@ -11,7 +11,7 @@ import tonic.transforms as transforms
 import numpy as np
 import jax.numpy as jnp
 
-def torch_DVSGesture_loader(batch_size, CNN_preproces=False, shuffle=False):
+def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, downsample=False):
     trainset = tonic.datasets.DVSGesture(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
     testset = tonic.datasets.DVSGesture(save_to='./data', train=False)#, transform=transforms.NumpyAsType(float))
     
@@ -21,7 +21,7 @@ def torch_DVSGesture_loader(batch_size, CNN_preproces=False, shuffle=False):
     # print(data.shape, data[0:200], (data[200:]))
     cache_dir = "./cache/DVSGesture"
 
-    if CNN_preproces:
+    if CNN_preprocess:
         cache_dir += "/CNN"
         os.makedirs(cache_dir, exist_ok=True)
 
@@ -44,7 +44,7 @@ def torch_DVSGesture_loader(batch_size, CNN_preproces=False, shuffle=False):
     max_data_length = 1594557
     # Create DataLoaders
     # collate_fn = lambda batch: basic_event_collate(batch)
-    if CNN_preproces:
+    if CNN_preprocess:
         collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) 
     else:
         collate_fn = lambda batch: custom_preprocess_event_pad_collate(batch, max_data_length) 
@@ -135,7 +135,8 @@ def custom_preprocess_event_pad_collate(batch, max_len):
 
 if __name__ == '__main__':
     batch_size = 128
-    (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_nonzero = torch_DVSGesture_loader(batch_size, CNN_preproces=True)
+    (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_nonzero = torch_DVSGesture_loader(batch_size, 
+                                                                                                                                                CNN_preprocess=True)
     print(total_train_batches, total_val_batches, total_test_batches)
 
     max_length = 0

@@ -10,7 +10,7 @@ import tonic.transforms as transforms
 import numpy as np
 from tqdm import tqdm
 
-def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=False, aggregate_time=True):
+def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmentation=False, binned=False, aggregate_time=True, downsample=False):
     '''
     If not binned it returns the raw dataset in forms of tuples of 4 which correspond to (x, y, time, polarity)=>(polarity, x, y, 1),
     x and y are comprised in [0,34] and polarity is 1 for positive spike and 0 for negative spike
@@ -19,7 +19,7 @@ def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=Fa
     If binned and aggregate_time=False, returns (B, T, C, H, W) with time preserved.
     '''
     sensor_size = tonic.datasets.NMNIST.sensor_size
-
+    print(f"NMNIST sensor size: {sensor_size}")
     frame_transform = transforms.Denoise(filter_time=10000) # Raw data
     if binned:
         # Denoise removes isolated, one-off events time_window
@@ -71,7 +71,10 @@ def torch_nmnist_loader(batch_size, shuffle=False, augmentation=False, binned=Fa
         else:
             collate_fn = lambda batch: custom_pad_collate(batch, maximum_time_steps)
     else:
-        collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) # For raw dataloader
+        if CNN_preprocess:
+            collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) # For events in format (c, x, y, 1)
+        else:
+            collate_fn = lambda batch: custom_event_flatten_collate(batch, max_data_length, sensor_size) # For events in format (index, 1)
 
     trainloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=shuffle)
     valloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
@@ -196,8 +199,61 @@ def custom_event_pad_collate(batch, max_len):
     
     return batch_array, label_array
 
+def custom_event_flatten_collate(batch, max_len, sensor_size):
+    """
+    Collate function for raw event data when CNN_preprocess=False.
+    Converts events from (x, y, t, p) to (neuron_index, 1) format.
+    
+    neuron_index is computed as: p * H * W + x * W + y
+    where H, W are sensor dimensions and p is polarity (0 or 1).
+    
+    Returns: (B, max_len, 2) array where each event is [neuron_index, 1]
+    """
+    data, labels = zip(*batch)
+    padded_data = []
+    
+    # Get sensor dimensions
+    H, W, C = sensor_size  # (34, 34, 2) for NMNIST
+    
+    for d in data:
+        num_events = len(d)
+        
+        if num_events <= max_len:
+            # Pre-allocate the output array
+            d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
+            
+            # Convert (p, x, y) to flattened neuron index
+            # neuron_index = p * (H * W) + x * W + y
+            p = d['p'].astype(np.int32)
+            x = d['x'].astype(np.int32)
+            y = d['y'].astype(np.int32)
+            
+            neuron_indices = p * (H * W) + x * W + y
+            
+            # Fill in the actual data
+            d_padded_2d[:num_events, 0] = neuron_indices  # neuron index
+            d_padded_2d[:num_events, 1] = 1  # ones for actual events
+            # Padding (-2) is already filled by np.full
+        else:
+            print(f"data size exceeds the max len: {num_events} {max_len}")
+            raise NotImplementedError
+        
+        padded_data.append(d_padded_2d)
+    
+    # Convert directly to JAX array
+    batch_array = jnp.array(padded_data, dtype=jnp.int32)  # shape: (B, max_len, 2)
+    label_array = jnp.array(labels, dtype=jnp.int32)
+    
+    return batch_array, label_array
+
 if __name__ == "__main__":
-    (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), maximum_time_steps = torch_nmnist_loader(128, shuffle=False, augmentation=False)
+    train, val, test, maximum_time_steps = torch_nmnist_loader( 128, 
+                                                                CNN_preprocess=False,
+                                                                shuffle=False, 
+                                                                augmentation=False)
+    (trainloader, total_train_batches) = train
+    (valloader, total_val_batches) = val
+    (testloader, total_test_batches) = test
     print(f"Total train batches: {total_train_batches}, Total val batches: {total_val_batches}, Total test batches: {total_test_batches}, maximum time steps: {maximum_time_steps}")
     
     max = 0
@@ -208,7 +264,7 @@ if __name__ == "__main__":
                 new_max = x.shape[0] 
                 if new_max > max:
                     max = new_max
-                    print(new_max)
+                    print(new_max, x)
     print("final max", max)
 
 # CLEAR CACHE: rm -r ./cache/nmnist

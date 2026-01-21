@@ -1,7 +1,7 @@
 {
     "time": 144328.02922940254,
     "loadfile": false,
-    "shuffle data": false,
+    "shuffle activations": false,
     "shuffle input": false,
     "rerun": "",
     "processes": 4,

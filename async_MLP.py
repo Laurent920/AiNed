@@ -33,6 +33,8 @@ from mpi4jax import send, recv, bcast
 
 from dataset_helpers.mnist_helper import mnist_loader_manual
 from dataset_helpers.shd_helper import torch_SHD_loader
+from dataset_helpers.nmnist_helper import torch_nmnist_loader
+from dataset_helpers.dvs_helper import torch_DVSGesture_loader
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.network_helper import one_hot_encode
 
@@ -451,6 +453,8 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
         # jax.debug.print("rank {} send grad hape {} wres shape {} mul shape {}", rank, send_grad.shape, weight_res.shape, (~jnp.all(weight_res == 0, axis=2)).shape )
 
         send_grad *= (~jnp.all(weight_res == 0, axis=2)) 
+
+        # jax.debug.print("rank {} send grad {}/{}", rank, jnp.count_nonzero(send_grad), send_grad.size)
         send(send_grad, dest=rank-process_per_layer, tag=2, comm=comm)
         # send(weight_res, dest=rank-process_per_layer, tag=3, comm=comm)
     
@@ -582,7 +586,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
     elif opti == "adamw":        
         solver = optax.adam(learning_rate=params.learning_rate)
     elif opti == "sgd":
-        solver = optax.sgd(learning_rate=params.learning_rate)
+        solver = optax.sgd(learning_rate=params.learning_rate, momentum=0.9)
     elif opti == "rmsprop":
         solver = optax.rmsprop(learning_rate=params.learning_rate, decay=0.9, eps=1e-8)
         print("amsgrad optimizer selected")
@@ -1305,7 +1309,9 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
         TQDM_DISABLE = True
 
     dataset = 'mnist'
-    dataset = 'shd'
+    # dataset = 'shd'
+    # dataset = 'nmnist'
+    dataset = 'dvs'
     
     # Network structure and parameters
     # layer_sizes = (28*28, 512, 256, 128, 64, 32, 16, 10)
@@ -1342,7 +1348,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
             # all_layers.append((28*28, 32, 32, 10))
             # all_layers.append((28*28, 64, 64, 10))    
             # all_layers.append((28*28, 128, 128, 10))
-            # all_layers.append((28*28, 256, 256, 10))
+            all_layers.append((28*28, 256, 256, 10))
 
             # all_layers.append((14*14, 32, 10))
             # all_layers.append((28*28, 32, 10))
@@ -1358,7 +1364,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
             # all_layers.append((700, 64, 64, 64, 20))    
             # all_layers.append((700, 32, 32, 32, 20))  
               
-            all_layers.append((700, 256, 256, 20))                
+            # all_layers.append((700, 256, 256, 20))                
             # all_layers.append((700, 128, 128, 20))    
             # all_layers.append((700, 64, 64, 20))    
             # all_layers.append((700, 32, 32, 20))    
@@ -1367,6 +1373,11 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
             # all_layers.append((700, 128, 20))    
             # all_layers.append((700, 64, 20))    
             # all_layers.append((700, 32, 20))    
+        case "nmnist":
+            all_layers.append((34*34*2, 256, 10))   
+        case "dvs":
+            all_layers.append((128*128*2, 256, 11))   
+
     
     layer_sizes = all_layers[0]
     best = False
@@ -1457,10 +1468,16 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                                 downsample = True
                         case "shd":
                             loader = torch_SHD_loader
+                        case "nmnist":
+                            loader = partial(torch_nmnist_loader, CNN_preprocess=False)
+                        case "dvs":
+                            loader = partial(torch_DVSGesture_loader, CNN_preprocess=False)                            
                         case _:
                             raise ValueError(f"Unknown dataset: {dataset}")
         
-                    (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = loader(batch_size, shuffle=False, downsample=downsample)
+                    (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = loader(batch_size=batch_size, 
+                                                                                                                                                                     shuffle=False, 
+                                                                                                                                                                     downsample=downsample)
                 
                 # Broadcast total_batches to all other ranks
                 total_train_batches, total_val_batches, total_test_batches = bcast(jnp.array([total_train_batches, total_val_batches, total_test_batches]), root=0 , comm=comm)
@@ -1472,8 +1489,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                     random_seed=random_seed,
                     layer_sizes=layer_sizes, 
                     init_thresholds=init_thresholds, 
-                    num_epochs=2, 
-                    learning_rate=0.1, 
+                    num_epochs=20, 
+                    learning_rate=0.0001, 
                     batch_size=batch_size,
                     load_file=load_file,
                     shuffle_activations=False,
@@ -1540,7 +1557,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                 #     all_time += ex_time
                 # print("average execution time : {}", all_time/t)
                 # batch_predict(params, key, total_batches, weights, empty_neuron_states, "test", save=True, debug=True)
-                result_path = train(params, key, total_batches, weights, empty_neuron_states, "sgd", trial)
+                result_path = train(params, key, total_batches, weights, empty_neuron_states, "adam", trial)
                 # if trial is not None:
                 # rerun = result_path
                 # print(rerun)

@@ -15,6 +15,7 @@ def softmax_cross_entropy_with_logits(logits, labels):
 def mean_loss(logits, labels):
     batched_softmax_cross_entropy = jax.vmap(softmax_cross_entropy_with_logits, in_axes=(0, 0))
     losses = batched_softmax_cross_entropy(logits, labels)
+    # jax.debug.print("Losses per batch element: {}", jnp.mean(losses))
     return jnp.mean(losses)
 
 @jax.jit

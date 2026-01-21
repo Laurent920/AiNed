@@ -100,12 +100,13 @@ class LeNet5(nn.Module):
 
         # Define your layers
         self.conv1 = nn.Conv2d(1, 6, kernel_size=5, stride=1, padding=0, bias=False)
-        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
         self.conv2 = nn.Conv2d(6, 16, kernel_size=5, stride=1, padding=0, bias=False)
-        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        # self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
     
-        self.fc1 = nn.Linear((16 * 4 * 4), 120, bias=False)
+        self.fc1 = nn.Linear((16 * 20 * 20), 120, bias=False)
+        # self.fc1 = nn.Linear((16 * 4 * 4), 120, bias=False)
         self.fc2 = nn.Linear(120, 84, bias=False)
         self.out = nn.Linear(84 , 10, bias=False)
 
@@ -125,15 +126,15 @@ class LeNet5(nn.Module):
         self._record_activation("conv1", x)
         # print(x.shape)
 
-        x = self.pool1(x)
-        self._record_activation("pool1", x)
+        # x = self.pool1(x)
+        # self._record_activation("pool1", x)
         # print(x.shape)
 
         x = F.relu(self.conv2(x))
         self._record_activation("conv2", x)
  
-        x = self.pool2(x)
-        self._record_activation("pool2", x)
+        # x = self.pool2(x)
+        # self._record_activation("pool2", x)
         
         # print(x.shape)
         x = x.view(x.size(0), -1)
@@ -495,14 +496,15 @@ class VGG8Light(nn.Module):
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
 # ==========================================================
-# TRAINING AND EVALUATION
+# region TRAINING AND EVALUATION 
 # ==========================================================
 def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
     if dataset == "mnist":
         # Choose one:
-        model = SimpleCNN().to(device)
-        # model = LeNet5().to(device)
+        # model = SimpleCNN().to(device)
+        model = LeNet5().to(device)
 
         # model = VGG16(num_classes=10, in_channels=1).to(device)
         # model = VGG8(num_classes=10, in_channels=1).to(device)
@@ -756,7 +758,7 @@ def get_weights_for_rank(filename, rank):
     return w 
 
 # ==========================================================
-# MAIN SCRIPT
+# region MAIN SCRIPT
 # ==========================================================
 if __name__ == "__main__":
     if dataset == "mnist":

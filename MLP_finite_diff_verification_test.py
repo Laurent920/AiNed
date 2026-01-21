@@ -862,7 +862,7 @@ def init_params(key, batch_size, layer_sizes, load_file=False, best=False):
         weights = scale * jax.random.normal(keys[split_rank], (layer_sizes[split_rank-1], layer_sizes[split_rank]))
         key, subkey = jax.random.split(keys[split_rank]) 
         # weights += 1e-5 * jax.random.normal(subkey, weights.shape)
-        print(f"Rank {rank} weights {weights}")
+        # print(f"Rank {rank} weights: {weights}")
         return weights
     else:
         weights = jnp.zeros((layer_sizes[-1], layer_sizes[0]))
@@ -1342,7 +1342,7 @@ def gradient_check_report(loss_matrix, epsilon, w_grad, threshold=1e-4):
         # Flatten to find worst indices based on relative error
         errors_flat = relative_errors.flatten()
 
-        worst_indices = np.argsort(errors_flat)[-5:]  # Top 5 worst
+        worst_indices = np.argsort(errors_flat)[-25:]  # Top 5 worst
         
         for idx in worst_indices[::-1]:  # Print from worst to best
             x = idx // w_grad.shape[1]
@@ -1361,6 +1361,9 @@ def gradient_check_report(loss_matrix, epsilon, w_grad, threshold=1e-4):
         print(f"✓ GRADIENT CHECK PASSED! (max error < {threshold})")
     else:
         print(f"✗ GRADIENT CHECK FAILED! (max error > {threshold})")
+        print("If Backprop grad is != 0 and Finite diff is == 0, acceptable result due to numerical precision.")
+        print("If Backprop grad is == 0 and Finite diff is != 0, gradient computation went wrong.")
+        print("If Backprop grad has the opposite sign of Finite diff, acceptable if the values have the same order of magnitude.")
     print("=" * 60)
     
     return g_num, max_error, mean_error
@@ -1463,13 +1466,14 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
             # all_layers.append((28*28, 64, 64, 64, 10))
             # all_layers.append((28*28, 128, 128, 128, 10))
 
+            # all_layers.append((28*28, 10, 10, 10, 10, 10))
+            # all_layers.append((28*28, 32, 32, 10))
             all_layers.append((28*28, 10, 10, 10, 10))
-            all_layers.append((28*28, 32, 32, 10))
-            # all_layers.append((28*28, 10, 10, 10))
             # all_layers.append((28*28, 32, 32, 10))
             # all_layers.append((28*28, 64, 64, 10))    
             # all_layers.append((28*28, 128, 128, 10))
 
+            all_layers.append((28*28, 10, 10))
             all_layers.append((14*14, 32, 10))
             all_layers.append((28*28, 32, 10))
             # all_layers.append((28*28, 64, 10))    
@@ -1544,8 +1548,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
     rerun = None
     async_layer = -1
     
-    verification_w_layer = 3
-    epsilon = 1e-4
+    verification_w_layer = 4
+    epsilon = 1e-3
 
     if rank == 0:
         print(f"Computing the finite difference for the gradients of the weights of layer {verification_w_layer}...")
@@ -1647,7 +1651,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                 # Run gradient check
                 if rank == verification_w_layer and eps == 0 :
                     print("loss matrix: ", loss_matrix)
-                    g_num, max_error, mean_error = gradient_check_report(loss_matrix, epsilon, w_grad)
+                    g_num, max_error, mean_error = gradient_check_report(loss_matrix, epsilon, w_grad, threshold=epsilon/10)
     
                     # Plot comparison
                     plot_gradient_comparison(w_grad, g_num)
