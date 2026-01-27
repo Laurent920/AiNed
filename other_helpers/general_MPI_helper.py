@@ -8,9 +8,9 @@ from mpi4jax import send, recv
 import mpi4jax
 
 try:
-    from other_helpers.helpers_MPI_general import NeuronStates
+    from other_helpers.helpers import NeuronStates
 except ModuleNotFoundError:
-    from helpers_MPI_general import NeuronStates
+    from helpers import NeuronStates
 
 #region combine_batch_avg
 @partial(jax.jit, static_argnames=['mpi_config',])

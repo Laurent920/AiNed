@@ -182,7 +182,7 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
     return nb_valid_el, compact_out, coords, unpooled_vals
 
 @partial(jax.jit, static_argnums=(2, 3, 4, 5, 6))
-def output_to_event_array_with_pooling(activated_output, start_indices, end_indices, kernel_span, pooling="", pool_size=(2,2), pool_stride=(2,2), rank=None):
+def output_to_event_array_with_pooling(activated_output, start_indices, end_indices, event_padding, pooling="", pool_size=(2,2), pool_stride=(2,2), rank=None):
     '''
     Transforms the activated output matrix into a list with format (c, x, y, value)
     to send to the next layer. And apply pooling if required.
@@ -193,7 +193,7 @@ def output_to_event_array_with_pooling(activated_output, start_indices, end_indi
     kernel_padding: (c, k_h_pad, k_w_pad) - the padding of the kernel
     '''
     c, h, w = activated_output.shape
-    kernel_h_span, kernel_w_span = kernel_span
+    event_pad_h, event_pad_w = event_padding
     
     # Step 1: Create coordinate grid
     c_grid, x_grid, y_grid = jnp.meshgrid(
@@ -206,7 +206,7 @@ def output_to_event_array_with_pooling(activated_output, start_indices, end_indi
     coords = jnp.stack([c_grid.ravel(), x_grid.ravel(), y_grid.ravel()], axis=-1)
 
     # Step 2: Adjust coordinates with start indices and kernel span for padding offset
-    adjusted_coords = coords + jnp.array(start_indices) + jnp.array([0, -kernel_h_span, -kernel_w_span]) 
+    adjusted_coords = coords + jnp.array(start_indices) + jnp.array([0, -event_pad_h, -event_pad_w]) 
     # jax.debug.print("coords {}, start indices {}, adjusted coords: {}", coords, start_indices, adjusted_coords)
 
     # Step 3: Filter out-of-bounds coordinates

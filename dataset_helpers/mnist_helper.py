@@ -159,7 +159,7 @@ def average_active_inputs(train_dataloader):
     return total_active_features / total_samples
 
 #region MANUAL LOADER
-def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproces=False, downsample=False, cache_dir='./cache/mnist'):
+def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preprocess=False, downsample=False, cache_dir='./cache/mnist'):
     max_nonzero = 351
     dataset_folder = "data/mnist/"
 
@@ -167,12 +167,12 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
         pass
     else:
         if downsample:
-            if CNN_preproces:
+            if CNN_preprocess:
                 cache_dir += "/async_CNN_14"
             else:
                 cache_dir += "/async_MLP_14"
         else:
-            if CNN_preproces:
+            if CNN_preprocess:
                 cache_dir += "/async_CNN"
             else:
                 cache_dir += "/async_MLP"
@@ -207,7 +207,7 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
             mnist_data_x_test = downsample_14x14(mnist_data_x_test)
 
         if preprocess:
-            if CNN_preproces:
+            if CNN_preprocess:
                 print("Preprocess MNIST dataset for CNN")                    
                 mnist_data_x = preprocess_dataset_CNN(mnist_data_x, max_nonzero)
                 mnist_data_x_test = preprocess_dataset_CNN(mnist_data_x_test, max_nonzero)

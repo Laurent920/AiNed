@@ -1,3 +1,5 @@
+# TODO Keep it up to date with async CNN's code
+
 import os
 from tqdm import tqdm
 

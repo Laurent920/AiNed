@@ -9,38 +9,46 @@ from mpi4jax import send, recv
 @dataclass(frozen=True)  # Makes it immutable and hashable
 class MPIConfig:
     rank: int
-    split_rank: int
-    last_rank: int
+    layer_idx: int
+    last_layer: int
     process_per_layer: int
     batch_part: int
     comm: object
     
+    '''
+    Holds the configurations for each MPI process:
+    - layer_idx:            Which layer the MPI process belongs to
+    - process_per_layer:    How many MPI processes there are per layer
+    - last_layer:           The index of the last layer
+    - batch_part:           The size of the batch each rank has to process        
+    '''
+
     def __hash__(self):
         # Custom hash that excludes non-hashable fields like comm
-        return hash((self.rank, self.split_rank, self.process_per_layer))
+        return hash((self.rank, self.layer_idx, self.process_per_layer))
     
     def __eq__(self, other):
         if not isinstance(other, MPIConfig):
             return False
         return (self.rank == other.rank and 
-                self.split_rank == other.split_rank and 
+                self.layer_idx == other.layer_idx and 
                 self.process_per_layer == other.process_per_layer)
     
 @partial(jax.jit, static_argnames=['mpi_config',])
 def combine_batch_avg(data, mpi_config):
     '''
-    Concatenate all the data from one split_rank onto one rank to reconstruct the batch and 
-    resharing the averaged result to the corresponding split_ranks
+    Concatenate all the data from one layer_idx onto one rank to reconstruct the batch and 
+    resharing the averaged result to the corresponding layer_idxs
     '''
     rank = mpi_config.rank
-    split_rank = mpi_config.split_rank
+    layer_idx = mpi_config.layer_idx
     process_per_layer = mpi_config.process_per_layer
     comm = mpi_config.comm
 
     data = jnp.array(data)        
     # jax.debug.print("rank {} data shape {}", rank, data.shape)
 
-    leader_rank = split_rank * process_per_layer
+    leader_rank = layer_idx * process_per_layer
     if rank == leader_rank:
         avg = data
         for i in range(0, process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
@@ -59,15 +67,15 @@ def combine_batch_avg(data, mpi_config):
 # @partial(jax.jit, static_argnames=['mpi_config',])
 def gather_batch(data, mpi_config, average=True):
     '''
-    Gather all the data from one split_rank onto one rank and resharing the average result to the corresonding split_ranks
+    Gather all the data from one layer_idx onto one rank and resharing the average result to the corresonding layer_idxs
     '''
     rank = mpi_config.rank
-    split_rank = mpi_config.split_rank
+    layer_idx = mpi_config.layer_idx
     process_per_layer = mpi_config.process_per_layer
     comm = mpi_config.comm
 
     data = jnp.array(data)
-    leader_rank = split_rank * process_per_layer
+    leader_rank = layer_idx * process_per_layer
     if rank == leader_rank:
         avg = data
         for i in range(process_per_layer-1): # Receive the data from all the corresponding ranks in one split rank
@@ -130,19 +138,19 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
 
 def l2_weight_regularization(mpi_config, weights):
     rank = mpi_config.rank
-    split_rank = mpi_config.split_rank
-    last_rank = mpi_config.last_rank
+    layer_idx = mpi_config.layer_idx
+    last_layer = mpi_config.last_layer
     process_per_layer = mpi_config.process_per_layer
     comm = mpi_config.comm
-    leader_rank = split_rank * process_per_layer
+    leader_rank = layer_idx * process_per_layer
     
     weights_sum = jnp.sum(weights**2)
 
-    if split_rank != last_rank and rank == leader_rank:
-        if split_rank != 0:
-            send(weights_sum, dest=last_rank * process_per_layer, tag=7,comm=comm)
-    elif split_rank == last_rank and rank == leader_rank:
-        for i in range(1, last_rank):
+    if layer_idx != last_layer and rank == leader_rank:
+        if layer_idx != 0:
+            send(weights_sum, dest=last_layer * process_per_layer, tag=7,comm=comm)
+    elif layer_idx == last_layer and rank == leader_rank:
+        for i in range(1, last_layer):
             # Storing mean iterations
             sum = recv(weights_sum, source=i * process_per_layer, tag=7, comm=comm)
             weights_sum += sum

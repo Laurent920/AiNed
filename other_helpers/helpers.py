@@ -6,7 +6,7 @@ import numpy as np
 import json
 import dataclasses
 
-def accuracy(batch_number, outputs, y, iterations, print):
+def accuracy(batch_number, outputs, y, iterations, rank=None, print=False):
     # Get predictions (indices of max values)
     predictions = jnp.argmax(outputs, axis=-1)
     
@@ -17,8 +17,8 @@ def accuracy(batch_number, outputs, y, iterations, print):
 
     batch_correct = jnp.sum(valid_predictions == valid_y)
     if print:
-        jax.debug.print("Batch {}: Predictions: {}, True: {}, Iterations avg: {}, Correct: {}/{}, last network output: {}",
-                batch_number, valid_predictions, valid_y, jnp.mean(iterations), batch_correct, valid_y.shape[0], outputs[-1])
+        jax.debug.print("Batch {}, rank {}:  Predictions: {}, True: {}, Iterations avg: {}, Correct: {}/{}, last network output: {}",
+                batch_number, rank, valid_predictions, valid_y, jnp.mean(iterations), batch_correct, valid_y.shape[0], outputs[-1])
     return valid_y, batch_correct
 
 #region DATACLASSES
@@ -46,7 +46,7 @@ class NeuronStates:
         thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
         input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
         input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
-        input activity                  # Count the number of times a input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
+        input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
         layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
         output activity                 # For each input neuron stores the hidden neurons that fire, shape: (layer_sizes[rank-1], layer_sizes[rank]) __ (784, 128)  
         
@@ -149,7 +149,7 @@ class NeuronStates:
                 print(f"* **{name}**: **Type**={type(field).__name__}")
                 if print_values:
                     print(f"  * **Value**: {field}")
-        
+
 @dataclasses.dataclass(frozen=True)
 class Params:
     dataset: str 
@@ -197,11 +197,8 @@ def rerun_init(data_file_path,
     '''
     Rerun from an existing file by replacing the fields marked as True with the values of new params 
     '''
-    
-    # split_rank = mpi_config.layer_idx
-    # last_rank = mpi_config.last_layer_idx
-    split_rank = mpi_config.split_rank
-    last_rank = mpi_config.last_rank
+    layer_idx = mpi_config.layer_idx
+    last_layer_idx = mpi_config.last_layer_idx
 
     path = os.path.normpath(data_file_path).split(os.sep)
     assert path[1] == new_params.dataset, f"Rerun can only be used on the same dataset, got {path[1]} and {new_params.dataset}"
@@ -259,16 +256,16 @@ def rerun_init(data_file_path,
         max_kernel=new_params.max_kernel
     )
     
-    if split_rank > 0:
-        weights = jnp.array(weights_dict["layer_"+str(split_rank)])
-        if split_rank < last_rank:
-            thresholds = jnp.array(threshold_dict["thresholds_"+str(split_rank)])
+    if layer_idx > 0:
+        weights = jnp.array(weights_dict["layer_"+str(layer_idx)])
+        if layer_idx < last_layer_idx:
+            thresholds = jnp.array(threshold_dict["thresholds_"+str(layer_idx)])
         else:
-            thresholds = jnp.zeros(layer_sizes[split_rank])
+            thresholds = jnp.zeros(layer_sizes[layer_idx])
     else:
-        l = layer_sizes[split_rank]
+        l = layer_sizes[layer_idx]
         if isinstance(l, int) or len(l) == 1:
-            weights = thresholds = jnp.zeros(layer_sizes[split_rank])
+            weights = thresholds = jnp.zeros(layer_sizes[layer_idx])
         else:
             weights = thresholds = jnp.zeros((1,1,1,1))
     return params, weights, thresholds
