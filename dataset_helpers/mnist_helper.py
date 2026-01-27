@@ -209,8 +209,8 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
         if preprocess:
             if CNN_preprocess:
                 print("Preprocess MNIST dataset for CNN")                    
-                mnist_data_x = preprocess_dataset_CNN(mnist_data_x, max_nonzero)
-                mnist_data_x_test = preprocess_dataset_CNN(mnist_data_x_test, max_nonzero)
+                mnist_data_x = preprocess_dataset_CNN(mnist_data_x, max_nonzero, downsample)
+                mnist_data_x_test = preprocess_dataset_CNN(mnist_data_x_test, max_nonzero, downsample)
 
                 # Save cached dataset
                 np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
@@ -288,11 +288,14 @@ def preprocess_dataset(dataset_x, max_nonzero):
         processed_dataset[n] = mnist_loader_preprocessed_single(dataset_x[n], max_nonzero)
     return jnp.array(processed_dataset)
 
-def mnist_loader_preprocessed_single_CNN(x, max_nonzero, input_dimension=28):
+def mnist_loader_preprocessed_single_CNN(x, max_nonzero, downsample=False):
     """
     Preprocess a single MNIST sample (1D vector).
     Stores (0, x, y, value) for non-zero pixels up to max_nonzero.
     """
+    input_dimension = 28
+    if downsample:
+        input_dimension = 14
     processed_data = np.full((max_nonzero, 4), -2.0, dtype=np.float32)
     j = 0
     for i, val in enumerate(x):
@@ -306,7 +309,7 @@ def mnist_loader_preprocessed_single_CNN(x, max_nonzero, input_dimension=28):
                 break
     return processed_data
 
-def preprocess_dataset_CNN(dataset_x, max_nonzero):
+def preprocess_dataset_CNN(dataset_x, max_nonzero, downsample=False):
     """
     Apply preprocessing to the whole dataset.
     dataset_x: shape (N, 784)
@@ -315,7 +318,7 @@ def preprocess_dataset_CNN(dataset_x, max_nonzero):
     N = dataset_x.shape[0]
     processed_dataset = np.zeros((N, max_nonzero, 4), dtype=np.float32)
     for n in range(N):
-        processed_dataset[n] = mnist_loader_preprocessed_single_CNN(dataset_x[n], max_nonzero)
+        processed_dataset[n] = mnist_loader_preprocessed_single_CNN(dataset_x[n], max_nonzero, downsample)
     return processed_dataset
 
 if __name__ == "__main__":
@@ -349,11 +352,15 @@ if __name__ == "__main__":
         #     batchx, batchy = next(d)
         #     print(jnp.array(batchx).shape)
 
-        (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, 
-                                                                                                                                                                      shuffle=False, 
-                                                                                                                                                                      preprocess=False, 
-                                                                                                                                                                      CNN_preproces=False, 
-                                                                                                                                                                      downsample=False)
+        ((training_generator, total_train_batches), 
+        (validation_generator, total_val_batches), 
+        (test_generator, total_test_batches), 
+        max_nonzero) = mnist_loader_manual(batch_size, 
+            shuffle=False, 
+            preprocess=False, 
+            CNN_preprocess=False, 
+            downsample=False
+        )
 
         avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
@@ -382,8 +389,8 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
         
-        layer_size.append((28*28, 256, 10))
-        # layer_size.append((28*28, 256, 256, 10))
+        # layer_size.append((28*28, 256, 10))
+        layer_size.append((28*28, 256, 256, 10))
         # layer_size.append((28*28, 128, 10))
         # layer_size.append((28*28, 128, 128, 10))
         # layer_size.append((14*14, 128, 10))

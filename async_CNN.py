@@ -1690,16 +1690,16 @@ if __name__ == "__main__":
                                 (128,), # Fully connected layer
                                 (11,))) 
         case "mnist":
-            all_layers.append(( (1, 28, 28),                  # (channel, height, width)
-                                (3, (3,3), (1,1), (1,1), ""),   # (out_channel, kernel_size, padding, stride)
-                                (5, (3,3), (1,1), (1,1), "max"), 
-                                # (64,),
-                                (128,), # Fully connected layer
-                                (10,)))
+            # all_layers.append(( (1, 28, 28),                  # (channel, height, width)
+            #                     (3, (3,3), (1,1), (1,1), ""),   # (out_channel, kernel_size, padding, stride)
+            #                     (5, (3,3), (1,1), (1,1), "max"), 
+            #                     # (64,),
+            #                     (128,), # Fully connected layer
+            #                     (10,)))
 
             all_layers.append(( (1, 14, 14),                  # (channel, height, width)
                                 (3, (3,3), (1,1), (1,1), ""),   # (out_channel, kernel_size, padding, stride)
-                                (5, (3,3), (1,1), (1,1), "max"), 
+                                (5, (3,3), (1,1), (1,1), ""), 
                                 # (64,),
                                 (15,), # Fully connected layer
                                 (10,)))
@@ -1787,7 +1787,7 @@ if __name__ == "__main__":
         sys.exit(1)
     
     best = False # Old variable/ not in use anymore
-    load_file = True # Load pytorch pretrained weights
+    load_file = False # Load pytorch pretrained weights
     restrict = (0,) * len(layer_sizes) # Reset rate for each layer
     init_thresholds = 0.0 #float(jnp.sqrt(2))  # Set the initial threshold values
 
@@ -1835,7 +1835,7 @@ if __name__ == "__main__":
             max_nonzero = max_nonzero.tolist()[0]
             
             f_nb = (2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
-            f_nb = (10000,)*11
+            f_nb = (1,)*11
             params = Params(
                 dataset=dataset,
                 random_seed=random_seed,
@@ -1848,7 +1848,7 @@ if __name__ == "__main__":
                 shuffle_activations=False,      # Whether shuffle the activations in the hidden layer or not
                 restrict=restrict,              # Reset rate for each layer
                 firing_nb=f_nb,                 # How many top values do we allow to fire for each layer
-                sync_rate=10000,                    # How many input values do we need to receive before firing
+                sync_rate=1,                    # How many input values do we need to receive before firing
                 max_nonzero=max_nonzero,        # Maximum size of the input data (Computed from the dataloader, do not change it here)
                 shuffle_input=False,            # Whether shuffle the input values or not 
                 threshold_lr=0.0,               # Threshold learning rate
@@ -1894,7 +1894,7 @@ if __name__ == "__main__":
                 layer_computation = conv_layer_computation
             
             # To only run inference
-            batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
+            # batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
             
             # To run the full training pipeline
             result_path = train(params, key, network, weights, empty_neuron_states, layer_computation, "adam")
