@@ -139,7 +139,7 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
         #                 is_max, idx, argmax_idx, jnp.where(is_max, idx, values.shape[0]), unpooled, coords, safe_pooled_idx, 
         #                 jnp.where(argmax_idx < 1000000000, safe_pooled_idx[argmax_idx], -1), safe_values)
         unpooled_vals = unpooled
-    elif mode == "avg":
+    elif mode == "avg": # TODO fix average pooling
         # Replace invalid values so they never affect avg
         safe_values = jnp.where(valid, values, 0)
 

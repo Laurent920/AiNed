@@ -5,7 +5,11 @@ import os
 import numpy as np
 import json
 import dataclasses
+from jax import custom_jvp, jit
+from functools import partial
 
+
+#region ACCURACY
 def accuracy(batch_number, outputs, y, iterations, rank=None, print=False):
     # Get predictions (indices of max values)
     predictions = jnp.argmax(outputs, axis=-1)
@@ -21,7 +25,102 @@ def accuracy(batch_number, outputs, y, iterations, rank=None, print=False):
                 batch_number, rank, valid_predictions, valid_y, jnp.mean(iterations), batch_correct, valid_y.shape[0], outputs[-1])
     return valid_y, batch_correct
 
-#region DATACLASSES
+#region Activation_func
+# @custom_jvp # If thresholds == 0 then this behaves as a ReLu activation function 
+@jit
+def activation_func(thresholds, activations):
+    # return jax.nn.relu(activations)
+    return jnp.where(activations > thresholds, activations, 0.0)
+
+# @activation_func.defjvp
+# def activation_func_jvp(primals, tangents, k=1.0):
+#     # Surrogate gradient, redefine the function for the backward pass
+#     neuron_states, activations, = primals
+#     neuron_states_dot, activations_dot, = tangents
+#     ans = activation_func(neuron_states, activations)
+#     ans_dot = jnp.where(activations > neuron_states.thresholds, activations, 0.0)
+#     return ans, ans_dot
+
+#region keep_top_k
+@partial(jax.jit, static_argnames=['k', 'apply_abs', 'max_kernel',])
+def keep_top_k(x, k, apply_abs=False, max_kernel=None):
+    '''
+    Return the top-k values in the input x in the same shape and masks all other entries to 0
+    If multiple values are tied it returns the ones with the smallest indices
+
+    :param x: Input array/matrix, either the neuron states or a row of weights 
+    :param k: The exact number of highest values that you want to keep
+    :param apply_abs: Get the top-k according to the absolute values of x and returns the values in their original sign
+    :param max_kernel: Currently serves as a flag to determine whether the input x needs to be flattened
+    '''
+    if k < 0:
+        return x
+    
+    if max_kernel is None:
+        k = min(k, x.shape[0])
+        x_flat = x
+    else:
+        k = min(k, x.size)   
+        x_flat = x.flatten() 
+
+    x_top = x_flat
+    if apply_abs:
+        x_top = jnp.abs(x)
+
+    _, top_indices = jax.lax.top_k(x_top, k)
+
+    # Create a mask with 1s at top-k indices, 0 elsewhere
+    mask = jnp.zeros(x.shape)
+    mask = mask.at[top_indices].set(1)
+
+    out = x_flat * mask
+    return out.reshape(x.shape)
+
+#region output_vector_to_event 
+@partial(jax.jit, static_argnames=['params', 'max_len'])
+def output_vector_to_event(key, arr: jnp.ndarray, params, max_len):
+    '''
+    Processed the output of a layer from (1d array) to (2d array) with [(neuron idx, value)]
+    value == 0 are filled with index==-2
+    '''
+    # indices of nonzero values (padded with -2)
+    idx = jnp.nonzero(arr, size=max_len, fill_value=-2)[0]
+    vals = jnp.where(idx != -2, arr[idx], -2)
+
+    # stack before shuffle
+    pairs = jnp.stack([idx, vals], axis=1)
+
+    def do_shuffle(pairs):
+         # mask: 1 for valid entries, 0 for padded (-2, 0)
+        mask = (idx != -2).astype(jnp.int32)
+        
+        # assign random keys for sorting
+        rand_keys = jax.random.uniform(key, (max_len,))
+
+        # ensure valid entries come first, shuffled within themselves
+        sort_keys = jnp.where(mask == 1, rand_keys, rand_keys + 2.0)  
+        permuted = pairs[jnp.argsort(sort_keys)]
+
+        return permuted
+    
+    def do_sort_by_value(pairs):
+        # Sort by value (descending), with padding entries at the end
+        # Use negative values for descending sort, add large number to padding
+        mask = (idx != -2).astype(jnp.int32)
+        sort_keys = jnp.where(mask == 1, -vals, 1e10)  # valid: -value, padding: large number
+        sorted_pairs = pairs[jnp.argsort(sort_keys)]
+        return sorted_pairs
+
+    pairs_out = jax.lax.cond(
+        params.shuffle_activations,
+        do_shuffle,
+        do_sort_by_value, #lambda pairs: pairs,
+        operand=pairs
+    )
+
+    return pairs_out
+
+#region NeuronStates
 @jax.tree_util.register_pytree_node_class
 class NeuronStates:
     def __init__(self, 
@@ -150,6 +249,7 @@ class NeuronStates:
                 if print_values:
                     print(f"  * **Value**: {field}")
 
+#region Params
 @dataclasses.dataclass(frozen=True)
 class Params:
     dataset: str 
@@ -170,7 +270,7 @@ class Params:
     sparsity_impact: float
     w_reg: float                # Weight regularization factor
     rerun: str
-    async_layer: int            # The layer that is training asynchronously while all other layers are training sync, if -1 then all layers are async
+    top_weights: int            # The top number of weights ranked by absolute value that we want to use to integrate an input value, -1 means use all the weights # The layer that is training asynchronously while all other layers are training sync, if -1 then all layers are async
     history_size: int = 0       # Size of history you want to store
     max_kernel: int = None      # The maximum size of flattened kernel
     flat_layer_sizes: tuple[int, ...] = None
@@ -191,14 +291,14 @@ def rerun_init(data_file_path,
                sparsity_impact=False,
                w_reg=False,
                threshold_lr=False,
-               async_layer=False,
+               top_weights=False,
                history_size=False
                ):
     '''
     Rerun from an existing file by replacing the fields marked as True with the values of new params 
     '''
     layer_idx = mpi_config.layer_idx
-    last_layer_idx = mpi_config.last_layer_idx
+    last_layer = mpi_config.last_layer
 
     path = os.path.normpath(data_file_path).split(os.sep)
     assert path[1] == new_params.dataset, f"Rerun can only be used on the same dataset, got {path[1]} and {new_params.dataset}"
@@ -223,7 +323,7 @@ def rerun_init(data_file_path,
     sparsity_impact_val = new_params.sparsity_impact if sparsity_impact else tuple(stored_data.get("sparsity impact", 0))
     w_reg_val = new_params.w_reg if w_reg else stored_data.get("weight regularization", 0.0)
     threshold_lr_val = new_params.threshold_lr if threshold_lr else stored_data["threshold lr"]
-    async_layer_val = new_params.async_layer if async_layer else stored_data.get("async layer", False)
+    top_weights_val = new_params.top_weights if top_weights else stored_data.get("top weights", -1)
     history_size = new_params.history_size if history_size else 0
 
     threshold_dict = stored_data["thresholds"]
@@ -251,14 +351,14 @@ def rerun_init(data_file_path,
         sparsity_impact=sparsity_impact_val,
         w_reg=w_reg_val,
         rerun=data_file_path,
-        async_layer=async_layer_val,
+        top_weights=top_weights_val,
         history_size=history_size,
         max_kernel=new_params.max_kernel
     )
     
     if layer_idx > 0:
         weights = jnp.array(weights_dict["layer_"+str(layer_idx)])
-        if layer_idx < last_layer_idx:
+        if layer_idx < last_layer:
             thresholds = jnp.array(threshold_dict["thresholds_"+str(layer_idx)])
         else:
             thresholds = jnp.zeros(layer_sizes[layer_idx])
@@ -354,7 +454,7 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "processes": size,
         "firing number": params.firing_nb,
         "synchronization rate": params.sync_rate,
-        "async layer": params.async_layer,
+        "top weights": params.top_weights,
         "restrict": params.restrict,
         "sparsity impact": params.sparsity_impact,
         "weight regularization": params.w_reg,
@@ -520,3 +620,39 @@ def store_history(all_history, result_path, total_batches):
     plt.savefig(result_path + "_history.png")
     plt.close()
     
+# region store to json
+def store_data_to_json(filename, data_to_add, label=None):
+    '''
+    Storing input data, labels and network output for validating the implementation on the Spinnaker2
+    '''
+    # Step 1: Load existing file or start with an empty list
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            data = json.load(f)
+    else:
+        if label is None:   # list mode 
+            data = []
+        else:               # dict mode
+            data = {               
+                "outputs": [],
+                "labels": []
+            }
+
+    # Step 2: Append new data depending on mode
+    if label is None:
+        # List mode → append the raw data
+        data.append(data_to_add)
+    else:
+        # Dict mode → append to "outputs" and "labels"
+        # Make sure keys exist (in case file existed but was missing them)
+        if "outputs" not in data:
+            data["outputs"] = []
+        if "labels" not in data:
+            data["labels"] = []
+        
+        data["outputs"].append(data_to_add)
+        data["labels"].append(label)
+
+    # Step 3: Write back to disk
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=4)

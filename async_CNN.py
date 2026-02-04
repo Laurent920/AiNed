@@ -41,7 +41,8 @@ from dataset_helpers.dvs_helper import torch_DVSGesture_loader
 from dataset_helpers.cnn_mnist import get_weights_for_rank
 
 from other_helpers.helpers import Params, NeuronStates
-from other_helpers.helpers import accuracy, store_training_data, rerun_init
+from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
+from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history
 from other_helpers.backpropagation import back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
@@ -400,85 +401,6 @@ def init_params(key, layers, params, filename="", best=False):
     else:
         return jnp.zeros((1,1,1,1)) # Return an empty holder for the weights of the input layer
     
-# region INFERENCE
-@custom_jvp # If thresholds == 0 then this behaves as a ReLu activation function 
-def activation_func(thresholds, activations):
-    # return jax.nn.relu(activations)
-    return jnp.where(activations > thresholds, activations, 0.0)
-
-@activation_func.defjvp
-def activation_func_jvp(primals, tangents, k=1.0):
-    # Surrogate gradient, redefine the function for the backward pass
-    neuron_states, activations, = primals
-    neuron_states_dot, activations_dot, = tangents
-    ans = activation_func(neuron_states, activations)
-    ans_dot = jnp.where(activations > neuron_states.thresholds, activations, 0.0)
-    return ans, ans_dot
-
-@partial(jax.jit, static_argnames=['k', 'max_kernel',])
-def keep_top_k(x, k, max_kernel=None):
-    # Get the top-k values and their indices
-    if max_kernel is None:
-        k = min(k, x.shape[0])
-        x_flat = x
-    else:
-        k = min(k, x.size)   
-        x_flat = x.flatten() 
-
-    top_vals, top_indices = jax.lax.top_k(x_flat, k)
-
-    # Create a mask with 1s at top-k indices, 0 elsewhere
-    mask = jnp.zeros(x_flat.shape)
-    mask = mask.at[top_indices].set(1)
-
-    out = x_flat * mask
-    return out.reshape(x.shape)
-
-@partial(jax.jit, static_argnames=['params'])
-def process_activated_output(key, arr: jnp.ndarray, params):
-    '''
-    Processed the output of a layer from (1d array) to (2d array) with [(neuron idx, value)]
-    value == 0 are filled with index==-2
-    '''
-    max_len = params.layer_sizes[layer_idx][0]
-
-    # indices of nonzero values (padded with -2)
-    idx = jnp.nonzero(arr, size=max_len, fill_value=-2)[0]
-    vals = jnp.where(idx != -2, arr[idx], -2)
-
-    # stack before shuffle
-    pairs = jnp.stack([idx, vals], axis=1)
-
-    def do_shuffle(pairs):
-         # mask: 1 for valid entries, 0 for padded (-2, 0)
-        mask = (idx != -2).astype(jnp.int32)
-        
-        # assign random keys for sorting
-        rand_keys = jax.random.uniform(key, (max_len,))
-
-        # ensure valid entries come first, shuffled within themselves
-        sort_keys = jnp.where(mask == 1, rand_keys, rand_keys + 2.0)  
-        permuted = pairs[jnp.argsort(sort_keys)]
-
-        return permuted
-    
-    def do_sort_by_value(pairs):
-        # Sort by value (descending), with padding entries at the end
-        # Use negative values for descending sort, add large number to padding
-        mask = (idx != -2).astype(jnp.int32)
-        sort_keys = jnp.where(mask == 1, -vals, 1e10)  # valid: -value, padding: large number
-        sorted_pairs = pairs[jnp.argsort(sort_keys)]
-        return sorted_pairs
-
-    pairs_out = jax.lax.cond(
-        params.shuffle_activations,
-        do_shuffle,
-        do_sort_by_value, #lambda pairs: pairs,
-        operand=pairs
-    )
-    # jax.debug,print("pairs out: {}", pairs_out.shape) # TODO check why this only prints once
-    return pairs_out
-
 #region FC computation 
 @partial(jax.jit, static_argnames=['params', 'grad',])
 def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False):    
@@ -548,8 +470,6 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
     @jit
     def hidden_layer_case(_):
         fire = (iteration-neuron_states.last_sent_iteration) >= params.sync_rate # Fire if sync rate reached
-        async_fire = jnp.logical_or(params.async_layer < 0, layer_idx <= params.async_layer) # Fire if async_layer or no async_layer condition (-1)
-        fire = jnp.logical_and(fire, async_fire) 
         fire = jnp.logical_or(fire, neuron_idx < 0) # Fire if last input received
 
         # APPLY THE SYNC RATE  
@@ -615,8 +535,9 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
                                             is_conv=neuron_states.is_conv)
         
         nb_valid_elements = jnp.count_nonzero(activated_output)
-        processed_output = process_activated_output(key, activated_output, params) 
+        processed_output = output_vector_to_event(key, activated_output, params, params.layer_sizes[layer_idx][0]) 
 
+        # jax.debug.print("rank {} iteration {} nb valid elements {}, activated output {}", rank, iteration, nb_valid_elements, processed_output[0])
         # Pad to CNN format
         shaped_activated_output = jnp.pad(processed_output, ((0, 0), (2, 0)), constant_values=-2) 
         return nb_valid_elements, shaped_activated_output, new_neuron_states
@@ -788,6 +709,8 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                             pool_stride=neuron_states.pool_stride
                                             )
         # jax.debug.print("rank {}, values padded: {}, current slice: {}, updated slice: {}, activated output: {}, remaining: {}, neuron state: {}", rank, values_padded.shape, current_slice.shape, updated_slice.shape, activated_output.shape, remaining_value.shape, neuron_states.values.shape)
+        # jax.debug.print("rank {} iteration {} nb valid elements {}, activated output {}", rank, iteration, nb_valid_elements, out_events[0])
+
         return nb_valid_elements, out_events, new_neuron_states
 
     @jit
@@ -1003,7 +926,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     w_sum = l2_weight_regularization(mpi_config, weights)
 
     # Receive the gradients from the later layers
-    next_grad= recv(jnp.zeros((batch_part,) + params.flat_layer_sizes[layer_idx]), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
+    next_grad = recv(jnp.zeros((batch_part,) + params.flat_layer_sizes[layer_idx]), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
 
     # Compute input's gradient and weight gradient
     weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, layer_idx)
@@ -1013,7 +936,6 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
         # Send gradient to the previous layer
         send_grad = jnp.dot(next_grad, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
         send_grad *= (~jnp.all(weight_res == 0, axis=2)) 
-
         send(send_grad, dest=rank-process_per_layer, tag=2, comm=comm)
     
     # Sparsity loss gradients 
@@ -1027,7 +949,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     input_activity = jnp.sum(all_neuron_states.input_activity, axis=0) # Shape (784)
     layer_activity = jnp.sum(all_neuron_states.layer_activity, axis=0) # Shape (128)
     
-    layer_activity = gather_batch(layer_activity, mpi_config, average=False) # Gather the weight gradients from all ranks in the split rank
+    layer_activity = gather_batch(layer_activity, mpi_config, average=False) # Gather the weight gradients from all ranks in the same layer
     input_activity = gather_batch(input_activity, mpi_config, average=False)
     
     sparsity_residuals = scaling * layer_activity # Shape: (128,)
@@ -1205,8 +1127,8 @@ def sparsity_loss(params, all_neuron_states, iterations):
     leader_rank = layer_idx * process_per_layer
     # jax.debug.print("Rank {}, activations shape: {}, iterations shape: {}, last layer neuron values: {}", rank, (activations.shape), jnp.mean(iterations.shape), jnp.sum(all_neuron_states.values))
 
-    activations = gather_batch(all_neuron_states.input_residuals, mpi_config, average=False) # Gather the weight gradients from all ranks in the split rank
-    iterations = gather_batch(iterations, mpi_config, average=True) # Gather the iterations from all ranks in the split rank
+    activations = gather_batch(all_neuron_states.input_residuals, mpi_config, average=False) # Gather the weight gradients from all ranks in the same layer
+    iterations = gather_batch(iterations, mpi_config, average=True) # Gather the iterations from all ranks in the same layer
     # jax.debug.print("Rank {}, activations shape: {}, iterations shape: {}, last layer neuron values: {}", rank, (activations.shape), jnp.mean(iterations.shape), jnp.sum(all_neuron_states.values))
 
     all_iterations = 0.0
@@ -1247,7 +1169,7 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
     tag 6: activations for sparsity loss
     tag 7: compute weight regularization
     tag 10: data labels(y)
-    tag 20: communications for gathering, sharing and averaging data across split ranks
+    tag 20: communications for gathering, sharing and averaging data across ranks in the same layer
     """
     global training_generator
     global validation_generator
@@ -1323,7 +1245,7 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
 
                     weight_grad = gradients[0]
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
-                    weight_grad = combine_batch_avg(weight_grad, mpi_config) # Gather the weight gradients from all ranks in the split rank
+                    weight_grad = combine_batch_avg(weight_grad, mpi_config) # Gather the weight gradients from all ranks in the same layer
                 
                     # Store the accuracy, loss and history                    
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
@@ -1344,10 +1266,10 @@ def train(params: Params, key, network, weights, empty_neuron_states, layer_comp
                     outputs, iterations, all_neuron_states, grads = (bwd_fn)(params, subkey, network.conv_layer_sizes, weights, neuron_states, layer_computation, jnp.zeros((batch_part, 1, 4)))
                     weight_grad, threshold_grad, weight_sparsity_grad, threshold_sparsity_grad = grads
                     
-                    threshold_grad = gather_batch(threshold_grad, mpi_config, average=True) # Gather the thresholds' gradients from all ranks in the split rank
+                    threshold_grad = gather_batch(threshold_grad, mpi_config, average=True) # Gather the thresholds' gradients from all ranks in the same layer
 
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
-                    weight_grad = combine_batch_avg(weight_grad, mpi_config) # Gather the weight gradients from all ranks in the split rank
+                    weight_grad = combine_batch_avg(weight_grad, mpi_config) # Gather the weight gradients from all ranks in the same layer
                     
                     # Add sparsity loss' impact to the gradient if relevant
                     if params.sparsity_impact[layer_idx] > 0:
@@ -1490,7 +1412,7 @@ def gather_w_iter_th(network, layer_weights_sizes, weights, mean_iterations, thr
 
 
 # region Inference loop
-def batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True):    
+def batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True, readInputJson=False):    
     global training_generator
     global validation_generator
     global test_generator    
@@ -1522,7 +1444,9 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
     else:
         print("INVALID DATASET")
         return
-        
+    if total_batches == 0:
+        return -0.01, -1.0 # arbitrary code for empty dataset
+
     if layer_idx == last_layer:
         epoch_correct = 0
         epoch_total = 0
@@ -1530,11 +1454,26 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
 
     epoch_iterations = []
     for i in tqdm(range(total_batches), disable=TQDM_DISABLE):
-        if layer_idx == 0:                 
-            batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 4)
+        if layer_idx == 0:         
+            # readInputJson = True        
+            if readInputJson: # Test with stored input
+                folder_add = "14"
+                with open(f'pretrained_data/CNN/pretrained_data{folder_add}/{len(params.layer_sizes)}hidden_single_input.json') as f:
+                    batch_x = np.array(json.load(f)).squeeze() 
+                    batch_x = jnp.expand_dims(batch_x[0], axis=0)
+                # with open(f'{len(params.layer_sizes)}hidden_single_input.json') as f:
+                #     batch_x = np.array(json.load(f)).squeeze() 
+                #     batch_x = jnp.expand_dims(batch_x, axis=0)
+                with open(f'pretrained_data/CNN/pretrained_data{folder_add}/{len(params.layer_sizes)}hidden_single_output.json') as f:
+                    batch_y = np.array(json.load(f)["labels"]).squeeze()
+                    batch_y = jnp.expand_dims(batch_y[0], axis=0)
+            else:
+                batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 4)
+            # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_input.json", batch_x.tolist()) # Store for hardware usage
+            
             # batch_x, batch_y = jnp.array([(0.0,1.0,1.0, 1.0), (0.0,2.0,2.0, 2.0), (0.0, 1.0, 0.0, 3.0), (0.0, 4.0, 4.0, 4.0), (0.0, 3.0, 3.0, 5.0), (-2, -2, -2 ,-2)]), jnp.array([1])
             # batch_x = jnp.expand_dims(batch_x, axis=0)
-            # print("batch x shape", batch_x.shape)
+            # print("batch x shape, batch y shape", batch_x.shape, batch_y.shape)
 
             outputs, iterations, all_neuron_states = (conv_predict)(params, key, weights, empty_neuron_states, layer_computation, jnp.array(batch_x))
 
@@ -1545,24 +1484,29 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
             batch_data = jnp.zeros((batch_part, 1, 4))
 
             outputs, iterations, all_neuron_states = (conv_predict)(params, key, weights, empty_neuron_states, layer_computation, batch_data)
-            # jax.debug.print("Rank {} All neuron states values shape: {}, output shape : {}", rank, all_neuron_states.values.shape, outputs.shape)
+            # jax.debug.print("Rank {} All neuron states values shape: {}, output shape : {}", rank, all_neuron_states.values.shape, outputs)
 
             if layer_idx == last_layer:
+                # jax.debug.print("Rank {} All neuron states values shape: {}, output shape : {}", rank, all_neuron_states.values.shape, outputs)
+
                 y = recv(jnp.zeros((batch_part,)), source=rank - (last_layer * process_per_layer), tag=10, comm=comm)   
                 
                 valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
                 
                 epoch_correct += batch_correct
                 epoch_total += valid_y.shape[0]
+                # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_output.json", outputs.tolist(), y.tolist())
 
                 if params.history_size > 0:
                     # One-hot target → scalar class index
                     history = process_history(all_neuron_states.values_history, all_neuron_states.history_index, y)
                     all_history.append(history)
+            # store_data_to_json(f"{len(params.layer_sizes)}hidden_intermediates_layer{rank}.json", outputs.tolist())
 
+        # store_data_to_json(f"{len(params.layer_sizes)}hidden_iterations_layer{rank}.json", iterations.tolist())
         epoch_iterations.append(iterations[iterations > 1])
         # jax.debug.print("Rank {}, iterations: {}", rank, iterations)
-        # if i > 3:
+        # if i >= 0:
         #     break
     
     # print(f"Shape iterations before flattening: {jnp.array(epoch_iterations).shape}")
@@ -1651,7 +1595,7 @@ def get_layer_idx():
         batch_part=batch_part,
         comm=comm
     )
-    print(f"Rank {rank}, split rank: {layer_idx}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_layer}")
+    print(f"Rank {rank}, layer idx: {layer_idx}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_layer}")
 
 if __name__ == "__main__":
     if rank != 0:
@@ -1699,8 +1643,7 @@ if __name__ == "__main__":
 
             all_layers.append(( (1, 14, 14),                  # (channel, height, width)
                                 (3, (3,3), (1,1), (1,1), ""),   # (out_channel, kernel_size, padding, stride)
-                                (5, (3,3), (1,1), (1,1), ""), 
-                                # (64,),
+                                (5, (3,3), (1,1), (1,1), "max"), 
                                 (15,), # Fully connected layer
                                 (10,)))
             
@@ -1786,20 +1729,18 @@ if __name__ == "__main__":
         print(f"Error: one batch ({batch_size}) must be divisible by the number of processes per layer ({process_per_layer})")
         sys.exit(1)
     
-    best = False # Old variable/ not in use anymore
-    load_file = False # Load pytorch pretrained weights
-    restrict = (0,) * len(layer_sizes) # Reset rate for each layer
+    best = False                        # Old variable/ not in use anymore
+    load_file = False                    # Load pytorch pretrained weights
+    restrict = (0,) * len(layer_sizes)  # Reset rate for each layer
     init_thresholds = 0.0 #float(jnp.sqrt(2))  # Set the initial threshold values
 
     # Set rerun to a specific file to retrain or rerun inference and None for training from scratch
     rerun = "network_results/mnist/training/CNN/sync_rate_fixed/42_ep5_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.961_adam_.json"
     rerun = "network_results/mnist/training/CNN/sync/load_false/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json"
-    # rerun = "network_results/mnist/training/CNN/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.972_adam_.json"
+    rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_L15_L10_acc0.939_adam_.json"
+    # rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_P2x2_L15_L10_acc0.912_adam_.json"
     rerun = None
-
-    async_layer = -1 # Old parameter/ not in use anymore
-    # async_layer = 1
-    
+        
     cont = True
     while cont:
         # for f_nb in [1, 2, 4, 8, 16, 100000]: # Loop for multiple experiments 
@@ -1821,6 +1762,9 @@ if __name__ == "__main__":
                         loader = partial(torch_DVSGesture_loader, CNN_preprocess=True)
                     case _:
                         raise ValueError(f"Unknown dataset: {dataset}")
+                    
+                if downsample:
+                    print("Downsampling the dataset...")
                 # Load the data 
                 train_data, val_data, test_data, max_nonzero = loader(  batch_size=batch_size, 
                                                                         shuffle=False,
@@ -1841,7 +1785,7 @@ if __name__ == "__main__":
                 random_seed=random_seed,
                 layer_sizes=layer_sizes, 
                 init_thresholds=init_thresholds, 
-                num_epochs=1, 
+                num_epochs=2, 
                 learning_rate=0.0001, 
                 batch_size=batch_size,
                 load_file=load_file,
@@ -1855,7 +1799,7 @@ if __name__ == "__main__":
                 sparsity_impact=(0.000, 0.000, 0.000, 0.000, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0), # Beta sparse (Sparsity loss's impact)
                 w_reg=0.0,                      # Weight regularization impact
                 rerun="",
-                async_layer=async_layer,
+                top_weights=-1,
                 max_kernel=max_kernel,
                 flat_layer_sizes=(),            # Each layer's shape
                 history_size=0                  # How many output states should we keep for plotting output history
@@ -1894,7 +1838,7 @@ if __name__ == "__main__":
                 layer_computation = conv_layer_computation
             
             # To only run inference
-            # batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
+            # batch_predict(params, key, network, weights, empty_neuron_states, layer_computation, 'tes`t', save=True, debug=True)
             
             # To run the full training pipeline
             result_path = train(params, key, network, weights, empty_neuron_states, layer_computation, "adam")
