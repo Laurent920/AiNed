@@ -24,7 +24,7 @@ def torch_SHD_loader(batch_size, shuffle=False, downsample=False):
     cached_testset = DiskCachedDataset(testset, cache_path='./cache/SHD/test')
     
     # Train - validation - test split
-    val_split = 0.2
+    val_split = 0.1
     train_len = int(len(cached_trainset) * (1 - val_split))
     val_len = len(cached_trainset) - train_len
     train_subset, val_subset = random_split(cached_trainset, [train_len, val_len])

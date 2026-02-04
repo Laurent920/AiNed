@@ -12,40 +12,49 @@ import numpy as np
 import jax.numpy as jnp
 
 def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, downsample=False):
-    trainset = tonic.datasets.DVSGesture(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
-    testset = tonic.datasets.DVSGesture(save_to='./data', train=False)#, transform=transforms.NumpyAsType(float))
+    frame_transform = None
+    if downsample:
+        # Combining common practices: Denoise -> Downsample -> Binning
+        frame_transform = transforms.Compose([
+            transforms.Denoise(filter_time=10000),             # Remove noise (keep only if other events happened within 10 ms, we can go down to 5 ms max)
+            transforms.Downsample(spatial_factor=0.5),         # 128x128 -> 64x64
+        ])
     
-    data, label = trainset[0]
+    # tonic.transforms.Denoise(filter_time=5000)
+    # tonic.transforms.Downsample(spatial_factor=0.5)
+    trainset = tonic.datasets.DVSGesture(save_to='./data', train=True, transform=frame_transform)
+    testset = tonic.datasets.DVSGesture(save_to='./data', train=False, transform=frame_transform)
+
+    # data, label = trainset[0]
     # print("Type of data:", type(data))
     # print("Label:", label)
     # print(data.shape, data[0:200], (data[200:]))
-    cache_dir = "./cache/DVSGesture"
 
-    if CNN_preprocess:
-        cache_dir += "/CNN"
-        os.makedirs(cache_dir, exist_ok=True)
+    base_cache_dir = "./cache/DVSGesture"
+    model_type = "CNN" if CNN_preprocess else "MLP"
+    resolution = "64x64" if downsample else "128x128"
+    cache_dir = os.path.join(base_cache_dir, f"{model_type}_{resolution}") # Final path construction: ./cache/DVSGesture/CNN_64x64/train
 
-        cached_trainset = DiskCachedDataset(trainset, cache_path=cache_dir + '/train') 
-        cached_testset = DiskCachedDataset(testset, cache_path=cache_dir + '/test')
-    else:
-        cache_dir += "/MLP"
-        os.makedirs(cache_dir, exist_ok=True)
+    os.makedirs(cache_dir, exist_ok=True)
 
-        cached_trainset = DiskCachedDataset(trainset, cache_path=cache_dir + '/train') 
-        cached_testset = DiskCachedDataset(testset, cache_path=cache_dir + '/test')
-    
+    cached_trainset = DiskCachedDataset(trainset, cache_path=cache_dir + '/train') 
+    cached_testset = DiskCachedDataset(testset, cache_path=cache_dir + '/test')
 
     # Train - validation - test split
-    val_split = 0.2
+    val_split = 0.0
     train_len = int(len(cached_trainset) * (1 - val_split))
     val_len = len(cached_trainset) - train_len
     train_subset, val_subset = random_split(cached_trainset, [train_len, val_len])
 
-    max_data_length = 1594557
+    max_data_length = 1594557 if not downsample else 1295179
+    # No filter:            1594557 (avg 358752)
+    # denoise filter 10000: 1295179 (avg 253099)
+    #                5000 : 1198616 (avg 215057)
     # Create DataLoaders
-    # collate_fn = lambda batch: basic_event_collate(batch)
     if CNN_preprocess:
         collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length) 
+    elif CNN_preprocess is None:
+        collate_fn = lambda batch: basic_event_collate(batch)
     else:
         collate_fn = lambda batch: custom_preprocess_event_pad_collate(batch, max_data_length) 
 
@@ -135,11 +144,18 @@ def custom_preprocess_event_pad_collate(batch, max_len):
 
 if __name__ == '__main__':
     batch_size = 128
-    (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_nonzero = torch_DVSGesture_loader(batch_size, 
-                                                                                                                                                CNN_preprocess=True)
+    train, val, test, max_nonzero = torch_DVSGesture_loader(batch_size, 
+                                                            CNN_preprocess=None,
+                                                            downsample=True)
+    
+    (trainloader, total_train_batches) = train
+    (valloader, total_val_batches) = val
+    (testloader, total_test_batches) = test
     print(total_train_batches, total_val_batches, total_test_batches)
 
     max_length = 0
+    total_count = 0
+    total_nb = 0
     for loader in [trainloader, valloader, testloader]:
         for batch in tqdm(iter(loader)):
             batch_data, batch_labels = batch
@@ -147,9 +163,12 @@ if __name__ == '__main__':
         
             for d in batch_data:
                 length = d.shape[0]
+                total_count += length
+                total_nb += 1
                 # print(d[:100])
                 if length > max_length:
                     print('max length:, new_length', max_length, length)
                     max_length = length            
     print('final max length', max_length)
+    print('Average length: ', total_count/total_nb)
     # CLEAR CACHE: rm -r ./cache/DVSGesture
