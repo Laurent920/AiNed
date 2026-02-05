@@ -16,7 +16,7 @@ def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, dow
     if downsample:
         # Combining common practices: Denoise -> Downsample -> Binning
         frame_transform = transforms.Compose([
-            transforms.Denoise(filter_time=10000),             # Remove noise (keep only if other events happened within 10 ms, we can go down to 5 ms max)
+            # transforms.Denoise(filter_time=10000),             # Remove noise (keep only if other events happened within 10 ms, we can go down to 5 ms max)
             transforms.Downsample(spatial_factor=0.5),         # 128x128 -> 64x64
         ])
     
@@ -46,7 +46,7 @@ def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, dow
     val_len = len(cached_trainset) - train_len
     train_subset, val_subset = random_split(cached_trainset, [train_len, val_len])
 
-    max_data_length = 1594557 if not downsample else 1295179
+    max_data_length = 1594557 if not downsample else 1594557
     # No filter:            1594557 (avg 358752)
     # denoise filter 10000: 1295179 (avg 253099)
     #                5000 : 1198616 (avg 215057)

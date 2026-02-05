@@ -70,7 +70,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     # jax.debug.print("Original weights {}, filtered wights {}", weights[neuron_idx], filtered_weights)
     activations = jax.lax.cond(neuron_idx < 0,
                             lambda _: neuron_states.values,
-                            lambda _: jnp.dot(layer_input, filtered_weights) + neuron_states.values*0.99,
+                            lambda _: jnp.dot(layer_input, filtered_weights) + neuron_states.values,
                             None
                             )
     #TODO: being able to compute multiple incoming index neurons
@@ -1188,7 +1188,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
     dataset = 'mnist'
     # dataset = 'shd'
     # dataset = 'nmnist'
-    # dataset = 'dvs'
+    dataset = 'dvs'
     # dataset = 'smnist'
 
     # Network structure and parameters
@@ -1248,7 +1248,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
         case "nmnist":
             all_layers.append((34*34*2, 256, 10))   
         case "dvs":
-            # all_layers.append((128*128*2, 256, 11))
+            all_layers.append((128*128*2, 128, 11))
             
             all_layers.append((64*64*2, 128, 11))
             # all_layers.append((64*64*2, 128, 128, 128, 11))
@@ -1380,7 +1380,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                     load_file=load_file,
                     shuffle_activations=False,      # Whether shuffle the activations in the hidden layer or not
                     restrict=restrict,              # Reset rate for each layer
-                    firing_nb=10000,                    # How many top values do we allow to fire for each layer
+                    firing_nb=1,                    # How many top values do we allow to fire for each layer
                     sync_rate=1,                    # How many input values do we need to receive before firing
                     max_nonzero=max_nonzero,        # Maximum size of the input data (Computed from the dataloader, do not change it here)
                     shuffle_input=False,            # Whether shuffle the input values or not 
@@ -1389,7 +1389,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                     w_reg=0.0,                      # Weight regularization impact
                     rerun="",
                     top_weights=-1,
-                    history_size=200                  # How many output states should we keep for plotting output history
+                    history_size=0                  # How many output states should we keep for plotting output history
                 )
                 
                 if trial is not None:

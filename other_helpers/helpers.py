@@ -70,7 +70,7 @@ def keep_top_k(x, k, apply_abs=False, max_kernel=None):
     _, top_indices = jax.lax.top_k(x_top, k)
 
     # Create a mask with 1s at top-k indices, 0 elsewhere
-    mask = jnp.zeros(x.shape)
+    mask = jnp.zeros(x_flat.shape)
     mask = mask.at[top_indices].set(1)
 
     out = x_flat * mask
