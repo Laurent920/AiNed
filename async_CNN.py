@@ -222,7 +222,8 @@ class Network:
                         print(f"rank {rank}, Previous layer: {prev_size}")
 
                 key, subkey = jax.random.split(key) 
-                thresholds = jax.random.uniform(subkey, layer) * params.init_thresholds + th_bias
+                # thresholds = jax.random.uniform(subkey, layer) * params.init_thresholds + th_bias
+                thresholds = jnp.full(layer, params.init_thresholds)
                 empty_neuron_states = NeuronStates(
                                     values=jnp.zeros(layer),
                                     thresholds=thresholds,
@@ -283,7 +284,8 @@ class Network:
                         filename += f"_AvgP{pool_size[0]}x{pool_size[1]}"
 
                 key, subkey = jax.random.split(key) 
-                thresholds = jax.random.uniform(subkey, values.shape) * params.init_thresholds + th_bias
+                # thresholds = jax.random.uniform(subkey, values.shape) * params.init_thresholds + th_bias
+                thresholds = jnp.full(values.shape, params.init_thresholds)
                 weights_shape = (out_chan, in_chan, kernel[0], kernel[1])
                 neuron_state = NeuronStates(
                     values=values,
@@ -602,9 +604,9 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
         # Step 6: Apply the firing number        
         f_nb = params.firing_nb
         if isinstance(f_nb, int):
-            activated_output = keep_top_k(activated_output, f_nb, params.max_kernel) # Get the top k activations
+            activated_output = keep_top_k(activated_output, f_nb, max_kernel=params.max_kernel) # Get the top k activations
         else:
-            activated_output = keep_top_k(activated_output, f_nb[layer_idx], params.max_kernel) # Get the top k activations
+            activated_output = keep_top_k(activated_output, f_nb[layer_idx], max_kernel=params.max_kernel) # Get the top k activations
         
         # Step 7: Update the internal activity counter by resetting it for the neurons that have fired
         activation_mask = jnp.where(activated_output > 0, 0, 1) # Reset the activity counter where a neuron has fired
@@ -1445,7 +1447,7 @@ def batch_predict(params, key, network, weights, empty_neuron_states, layer_comp
         print("INVALID DATASET")
         return
     if total_batches == 0:
-        return -0.01, -1.0 # arbitrary code for empty dataset
+        return -0.01, -1.0, -1.0 # arbitrary code for empty dataset
 
     if layer_idx == last_layer:
         epoch_correct = 0
@@ -1627,9 +1629,16 @@ if __name__ == "__main__":
                                 (128,), # Fully connected layer
                                 (10,)))
         case "dvs":
+            all_layers.append(( (2, 64, 64), # (channel, height, width)
+                                (3, (3,3), (1,1), (1,1), ""), # (out_channel, kernel_size, padding, stride)
+                                (5, (3,3), (1,1), (1,1), "max"), 
+                                # (64,),
+                                (128,), # Fully connected layer
+                                (11,))) 
+            
             all_layers.append(( (2, 128, 128), # (channel, height, width)
                                 (3, (3,3), (1,1), (1,1), ""), # (out_channel, kernel_size, padding, stride)
-                                (5, (3,3), (1,1), (1,1), ""), 
+                                (5, (3,3), (1,1), (1,1), "max"), 
                                 # (64,),
                                 (128,), # Fully connected layer
                                 (11,))) 
@@ -1732,7 +1741,7 @@ if __name__ == "__main__":
     best = False                        # Old variable/ not in use anymore
     load_file = False                    # Load pytorch pretrained weights
     restrict = (0,) * len(layer_sizes)  # Reset rate for each layer
-    init_thresholds = 0.0 #float(jnp.sqrt(2))  # Set the initial threshold values
+    init_thresholds = 0.3 #float(jnp.sqrt(2))  # Set the initial threshold values
 
     # Set rerun to a specific file to retrain or rerun inference and None for training from scratch
     rerun = "network_results/mnist/training/CNN/sync_rate_fixed/42_ep5_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.961_adam_.json"
@@ -1743,7 +1752,7 @@ if __name__ == "__main__":
         
     cont = True
     while cont:
-        # for f_nb in [1, 2, 4, 8, 16, 100000]: # Loop for multiple experiments 
+        # for s in [2, 4]: # Loop for multiple experiments 
             # Initialize parameters (input data for rank 0 and weights for other ranks)
             total_train_batches, total_val_batches, total_test_batches, max_nonzero = 0, 0, 0, 0
             if rank == 0:
@@ -1760,6 +1769,8 @@ if __name__ == "__main__":
                         loader = torch_nmnist_loader
                     case "dvs":
                         loader = partial(torch_DVSGesture_loader, CNN_preprocess=True)
+                        if layer_sizes[0][1] == 64:
+                            downsample = True
                     case _:
                         raise ValueError(f"Unknown dataset: {dataset}")
                     
@@ -1779,7 +1790,7 @@ if __name__ == "__main__":
             max_nonzero = max_nonzero.tolist()[0]
             
             f_nb = (2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
-            f_nb = (1,)*11
+            f_nb = (10000,)*11
             params = Params(
                 dataset=dataset,
                 random_seed=random_seed,
