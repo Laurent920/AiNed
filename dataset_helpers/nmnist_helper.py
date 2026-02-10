@@ -9,8 +9,9 @@ from tonic import DiskCachedDataset
 import tonic.transforms as transforms
 import numpy as np
 from tqdm import tqdm
+import os
 
-def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmentation=False, binned=False, aggregate_time=True, downsample=False):
+def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmentation=False, binned=False, aggregate_time=True, downsample=False, data_dir=""):
     '''
     If not binned it returns the raw dataset in forms of tuples of 4 which correspond to (x, y, time, polarity)=>(polarity, x, y, 1),
     x and y are comprised in [0,34] and polarity is 1 for positive spike and 0 for negative spike
@@ -19,7 +20,6 @@ def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmenta
     If binned and aggregate_time=False, returns (B, T, C, H, W) with time preserved.
     '''
     sensor_size = tonic.datasets.NMNIST.sensor_size
-    print(f"NMNIST sensor size: {sensor_size}")
     frame_transform = transforms.Denoise(filter_time=10000) # Raw data
     if binned:
         # Denoise removes isolated, one-off events time_window
@@ -27,8 +27,23 @@ def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmenta
                                             transforms.ToFrame(sensor_size=sensor_size,
                                                                 time_window=1000)
                                             ])
-    trainset = tonic.datasets.NMNIST(save_to='./data', transform=frame_transform, train=True)
-    testset = tonic.datasets.NMNIST(save_to='./data', transform=frame_transform, train=False)
+    
+    if data_dir:
+        # If data_dir is provided, use it
+        save_dir = os.path.join(data_dir, 'data')
+        base_cache_dir = os.path.join(data_dir, "cache/nmnist")
+    else:
+        # Default to current directory
+        save_dir = './data'
+        base_cache_dir = "./cache/nmnist"
+
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Loading N-MNIST dataset from: {save_dir}")
+
+    trainset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=True)
+    testset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=False)
 
     # for x, y in testset:
     #     print(f"data shape: {np.array(x).shape}, data[0]: {x[0]}, label: {y}")
@@ -40,11 +55,11 @@ def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmenta
                                         torchvision.transforms.RandomRotation([-10,10])])
     
     if binned:
-        train_cache_path = './cache/nmnist/binned/train'
-        test_cache_path = './cache/nmnist/binned/test'
+        train_cache_path = os.path.join(base_cache_dir, 'binned/train')
+        test_cache_path = os.path.join(base_cache_dir, 'binned/test')
     else:
-        train_cache_path = './cache/nmnist/raw/train'
-        test_cache_path = './cache/nmnist/raw/test'
+        train_cache_path = os.path.join(base_cache_dir, 'raw/train')
+        test_cache_path = os.path.join(base_cache_dir, 'raw/test')
         
     if augmentation:
         cached_trainset = DiskCachedDataset(trainset, transform=transform, cache_path=train_cache_path)

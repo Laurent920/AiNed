@@ -4,7 +4,7 @@ This repository contains all the code for the simulation of a fully asynchronous
 
 ## Installation
 
-First install the JAX and mpi4jax libraries by following the steps on the official sites ([JAX](https://docs.jax.dev/en/latest/installation.html), [mpi4jax](https://mpi4jax.readthedocs.io/en/latest/installation.html)) the code is only tested on the cpu versions of both libraries (verify which version is used in the requirements.txt file)\
+First install the JAX and mpi4jax libraries by following the steps on the official sites [JAX](https://docs.jax.dev/en/latest/installation.html), [mpi4jax](https://mpi4jax.readthedocs.io/en/latest/installation.html) (this requires to have an MPI library installed) the code is only tested on the cpu versions of both libraries (verify which version is used in the requirements.txt file)\
 
 Then install the rest of the packages.
 

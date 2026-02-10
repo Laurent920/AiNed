@@ -8,8 +8,12 @@ try:
     import dataset_helpers.network_helper as network_helper
 except ModuleNotFoundError:
     import network_helper
-# region TORCH LOADER
 import os
+from urllib.request import urlretrieve
+import gzip
+import struct
+
+# region TORCH LOADER
 
 USE_CPU_ONLY = True
 flags = os.environ.get("XLA_FLAGS", "")
@@ -158,25 +162,107 @@ def average_active_inputs(train_dataloader):
 
     return total_active_features / total_samples
 
+#region Download dataset
+def download_mnist_csv(dataset_folder):
+    """
+    Download MNIST using PyTorch and convert to CSV format.
+    This is the most reliable method as PyTorch handles mirror fallbacks automatically.
+    """
+    try:
+        from torchvision import datasets
+        import torch
+    except ImportError:
+        raise ImportError(
+            "PyTorch is required for automatic MNIST download. "
+            "Install with: pip install torch torchvision"
+        )
+    
+    os.makedirs(dataset_folder, exist_ok=True)
+    
+    train_csv = os.path.join(dataset_folder, 'mnist_train.csv')
+    test_csv = os.path.join(dataset_folder, 'mnist_test.csv')
+    
+    # Check if CSV files already exist
+    if os.path.exists(train_csv) and os.path.exists(test_csv):
+        print("MNIST CSV files already exist")
+        return
+    
+    print("Downloading MNIST dataset using PyTorch...")
+    
+    # Create temporary directory for PyTorch download
+    torch_data_dir = os.path.join(dataset_folder, 'torch_tmp')
+    
+    # Download training data
+    train_dataset = datasets.MNIST(
+        root=torch_data_dir,
+        train=True,
+        download=True
+    )
+    
+    # Download test data
+    test_dataset = datasets.MNIST(
+        root=torch_data_dir,
+        train=False,
+        download=True
+    )
+    
+    # Convert to numpy and save as CSV
+    print("Converting training data to CSV...")
+    train_images = train_dataset.data.numpy().reshape(-1, 28*28)
+    train_labels = train_dataset.targets.numpy()
+    train_data = np.column_stack([train_labels, train_images])
+    pd.DataFrame(train_data).to_csv(train_csv, index=False, header=False)
+    
+    print("Converting test data to CSV...")
+    test_images = test_dataset.data.numpy().reshape(-1, 28*28)
+    test_labels = test_dataset.targets.numpy()
+    test_data = np.column_stack([test_labels, test_images])
+    pd.DataFrame(test_data).to_csv(test_csv, index=False, header=False)
+    
+    # Clean up temporary PyTorch download directory
+    import shutil
+    if os.path.exists(torch_data_dir):
+        shutil.rmtree(torch_data_dir)
+    
+    print("MNIST dataset downloaded and converted to CSV successfully!")
+    
 #region MANUAL LOADER
-def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preprocess=False, downsample=False, cache_dir='./cache/mnist'):
+def mnist_loader_manual(batch_size, 
+                        shuffle=False, 
+                        preprocess=True, 
+                        CNN_preprocess=False, 
+                        downsample=False, 
+                        sequential=False, 
+                        permuted=False,
+                        data_dir="",
+                        cache_dir='./cache/mnist'):
     max_nonzero = 351
-    dataset_folder = "data/mnist/"
+    dataset_folder = os.path.join(data_dir, "data/mnist/")
+    cache_dir = os.path.join(data_dir, cache_dir)
 
+    download_mnist_csv(dataset_folder)
+    
     if not preprocess:
         pass
     else:
-        if downsample:
-            if CNN_preprocess:
-                cache_dir += "/async_CNN_14"
-            else:
-                cache_dir += "/async_MLP_14"
+        cache_dir_add =  "/async"
+        if CNN_preprocess:
+            cache_dir_add += "_CNN"
         else:
-            if CNN_preprocess:
-                cache_dir += "/async_CNN"
-            else:
-                cache_dir += "/async_MLP"
+            cache_dir_add += "_MLP"
             
+        if downsample:
+            cache_dir_add += "_14"
+        
+        if sequential:
+            cache_dir_add += "_sequential"
+        
+        if permuted:
+            cache_dir_add += "_permuted"
+        
+
+        cache_dir += cache_dir_add
+
     os.makedirs(cache_dir, exist_ok=True)
     train_cache_path = os.path.join(cache_dir, 'train.npz')
     test_cache_path  = os.path.join(cache_dir, 'test.npz')
@@ -201,6 +287,15 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
         mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
         mnist_data_y_test = mnist_data.iloc[:, 0].values
 
+        if permuted:
+            num_pixels = mnist_data_x.shape[1]  # Should be 784
+            np.random.seed(42)  # Set seed for reproducibility
+            permutation = np.random.permutation(num_pixels)
+
+            # Apply the same permutation to all training and test samples
+            mnist_data_x = mnist_data_x[:, permutation]
+            mnist_data_x_test = mnist_data_x_test[:, permutation]
+
         if downsample:
             print("Downsampling MNIST images to 14x14")
             mnist_data_x = downsample_14x14(mnist_data_x)
@@ -211,19 +306,16 @@ def mnist_loader_manual(batch_size, shuffle=False, preprocess=True, CNN_preproce
                 print("Preprocess MNIST dataset for CNN")                    
                 mnist_data_x = preprocess_dataset_CNN(mnist_data_x, max_nonzero, downsample)
                 mnist_data_x_test = preprocess_dataset_CNN(mnist_data_x_test, max_nonzero, downsample)
-
-                # Save cached dataset
-                np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
-                np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
             else:
                 print('Preprocessing MNIST dataset')
-                mnist_data_x = preprocess_dataset(mnist_data_x, max_nonzero)
-                mnist_data_x_test = preprocess_dataset(mnist_data_x_test, max_nonzero)
+                mnist_data_x = preprocess_dataset(mnist_data_x, max_nonzero, sequential)
+                mnist_data_x_test = preprocess_dataset(mnist_data_x_test, max_nonzero, sequential)
 
-                # Save cached dataset
-                np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
-                np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
-    
+
+        # Save cached dataset
+        np.savez_compressed(train_cache_path, x=mnist_data_x, y=mnist_data_y)
+        np.savez_compressed(test_cache_path, x=mnist_data_x_test, y=mnist_data_y_test)
+
     # print(mnist_data_x[0], mnist_data_x.shape, mnist_data_x[0].shape)
     
     # Define training set dataloader object
@@ -261,7 +353,7 @@ def downsample_14x14(x):
         x = x.reshape(-1, 14, 2, 14, 2).mean(axis=(2, 4))
         return x.reshape(-1, 196)
 
-def mnist_loader_preprocessed_single(x, max_nonzero):
+def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
     """
     Preprocess a single MNIST sample (1D vector).
     Stores (index, value) for non-zero pixels up to max_nonzero.
@@ -270,13 +362,16 @@ def mnist_loader_preprocessed_single(x, max_nonzero):
     j = 0
     for i, val in enumerate(x):
         if val != 0:
-            processed_data[j] = [i, val]
+            if sequential:
+                processed_data[j] = [0, val]
+            else:
+                processed_data[j] = [i, val]
             j += 1
             if j >= max_nonzero:  # stop if full
                 break
     return jnp.array(processed_data)
 
-def preprocess_dataset(dataset_x, max_nonzero):
+def preprocess_dataset(dataset_x, max_nonzero, sequential):
     """
     Apply preprocessing to the whole dataset.
     dataset_x: shape (N, 784)
@@ -285,7 +380,7 @@ def preprocess_dataset(dataset_x, max_nonzero):
     N = dataset_x.shape[0]
     processed_dataset = np.zeros((N, max_nonzero, 2), dtype=np.float32)
     for n in range(N):
-        processed_dataset[n] = mnist_loader_preprocessed_single(dataset_x[n], max_nonzero)
+        processed_dataset[n] = mnist_loader_preprocessed_single(dataset_x[n], max_nonzero, sequential)
     return jnp.array(processed_dataset)
 
 def mnist_loader_preprocessed_single_CNN(x, max_nonzero, downsample=False):
@@ -357,9 +452,10 @@ if __name__ == "__main__":
         (test_generator, total_test_batches), 
         max_nonzero) = mnist_loader_manual(batch_size, 
             shuffle=False, 
-            preprocess=False, 
+            preprocess=True, 
             CNN_preprocess=False, 
-            downsample=False
+            downsample=False,
+            sequential=True
         )
 
         avg_non_zero = average_active_inputs(training_generator)

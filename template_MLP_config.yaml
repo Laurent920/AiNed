@@ -1,0 +1,131 @@
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+# Choose one: 'mnist', 'shd', 'nmnist', 'dvs', 'smnist', 'psmnist'
+dataset: mnist
+
+# Choose either train or inference
+mode: train 
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+# Array of layer sizes: [input_size, hidden1, hidden2, ..., output_size]
+# 
+# Common configurations:
+# MNIST (28x28 images = 784 pixels):
+#   - Small: [784, 128, 10]
+#   - Medium: [784, 256, 256, 10]
+#   - Large: [784, 512, 512, 10]
+#   - Downsampled [14x14]: [196, 32, 10]
+# 
+# S-MNIST (Sequential MNIST sending 1 pixel at a time]) 
+#   - [1, 256, 10]
+# 
+# PS-MNIST (Permuted Sequential MNIST, operates the same permutation on the input]) 
+#   - [1, 256, 10]
+# 
+# N-MNIST (34x34 neuromorphic, 2 polarities):
+#   - [2312, 256, 10]  # 34*34*2
+# 
+# SHD (Spiking Heidelberg Digits, 700 input channels):
+#   - [700, 256, 20]
+#   - [700, 256, 256, 20]
+# 
+# DVS Gesture (128x128 or 64x64, 2 polarities):
+#   - [32768, 128, 11]  # 128*128*2
+#   - [8192, 128, 11]   # 64*64*2
+layer_sizes: [784, 256, 10]
+
+# ============================================================================
+# TRAINING PARAMETERS
+# ============================================================================
+batch_size: 36              # Number of samples per batch
+num_epochs: 10              # Number of training epochs
+learning_rate: 0.0001       # Learning rate for optimizer
+optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
+
+# ============================================================================
+# MODEL LOADING/SAVING
+# ============================================================================
+load_file: false            # Load PyTorch pretrained weights (true/false)
+best: false                 # Legacy parameter, keep as false
+
+# Path to previous training JSON to continue/rerun training
+# Set to null or remove to train from scratch
+# Example: # rerun: network_results/mnist/training/MLP/sync1_fnb1_2/42_ep200_b36_784_256_256_10_acc0.981_adam_.json
+rerun: null
+
+# List of parameters to override from the loaded model
+# Leave empty or null to use all parameters from the file
+override_params: null
+# override_params:
+#   - batch_size
+#   - learning_rate
+#   - restrict
+#   - init_thresholds
+#   - shuffle_activations
+#   - shuffle_input
+#   - firing_nb
+#   - sync_rate 
+#   - threshold_lr
+#   - sparsity_impact
+#   - w_reg
+#   - top_weights
+#   - history_size
+
+# ============================================================================
+# NEURON BEHAVIOR
+# ============================================================================
+# Reset rate for each layer - controls the amount for the neurons' reset 
+# Must be a tuple matching the number of layers (the first value is not used)
+# Examples:
+#   - [0, 0, 0] - automatically sets reset rate to 1
+#   - [1, 1, 1] - all layers' neurons reset to 0 (neuron_value - reset*neuron_value == 0)
+#   - [2, 2.5, 1] - input layer ignores the reset value(2), hidden layer reset the value to -1.5*neuron_value, output layer reset the value to 0
+#   - null - auto-generates [1, 1, ...] for all layers
+restrict: null
+
+# Initial threshold value for all neurons
+# 0.0 is common, but can be tuned
+init_thresholds: 0.0
+
+# Whether to shuffle activations in hidden layers
+shuffle_activations: false
+
+# Whether to shuffle input values before processing
+shuffle_input: false
+
+# Maximum number of top-k neurons allowed to fire per layer
+# Higher = more neurons can fire, lower = more sparse
+firing_nb: 10000
+
+# Number of input values needed before a neuron can fire
+# 1 = fire immediately, higher = wait for more inputs
+sync_rate: 1
+
+# ============================================================================
+# LEARNING AND REGULARIZATION
+# ============================================================================
+# Learning rate for adaptive thresholds
+# 0.0 = fixed thresholds, >0 = learnable thresholds
+threshold_lr: 0.0
+
+# Sparsity loss impact for each layer (encourages sparse activations)
+# Tuple must match number of layers
+# Example: [0.001, 0.001, 0.0] - apply to hidden layers only
+sparsity_impact: [0.0, 0.0, 0.0]
+
+# Weight regularization (L2) impact
+# 0.0 = no regularization, higher = stronger regularization
+w_reg: 0.0
+
+# ============================================================================
+# ADVANCED FEATURES
+# ============================================================================
+# Use only top-k weights during computation
+# -1 = use all weights, k>0 = use only top k weights
+top_weights: -1
+
+# Number of output states to keep for visualizing the evolution of the output prediction
+# 0 = don't store history, >0 = store last N states (N should be a few hundred at least for meaningful analysis)
+history_size: 0

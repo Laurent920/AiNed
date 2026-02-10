@@ -1,0 +1,226 @@
+# ============================================================================
+# CNN CONFIGURATION TEMPLATE
+# ============================================================================
+# This configuration file is for Convolutional Neural Networks (CNNs)
+# For fully connected networks (MLPs), use the standard config.yaml template
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+# Choose one: 'mnist', 'nmnist', 'dvs'
+dataset: mnist
+
+# Choose either 'training' or 'inference'
+mode: training
+
+# ============================================================================
+# CNN ARCHITECTURE
+# ============================================================================
+# Layer format:
+# - Input layer:     (channels, height, width)
+# - Conv layer:      (out_channels, kernel_size, padding, stride, pooling_type)
+# - Conv + Pool:     (out_channels, kernel_size, padding, stride, pooling_type, pool_size, pool_stride)
+# - FC layer:        (units,)
+# - Output layer:    (num_classes,)
+#
+# pooling_type options: "", "max", "avg"
+# - "" = no pooling
+# - "max" = max pooling with default 2x2 kernel and stride 2
+# - To specify custom pool size: use 6-tuple format with pool_size and pool_stride
+#
+# kernel_size, padding, stride, pool_size, pool_stride are tuples: (height, width)
+
+# Example architectures:
+
+# ---------- Small network ----------
+layer_sizes:
+  - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+  - [3, [3, 3], [1, 1], [1, 1], "max"]    # Conv: 3 filters, 3x3 kernel, max pool
+  # - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
+  - [128]                                  # FC: 120 units
+  - [10]                                   # Output: 10 classes
+
+# ---------- LeNet-5 Style (MNIST) ----------
+# layer_sizes:
+#   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+#   - [6, [5, 5], [0, 0], [1, 1], "max"]    # Conv: 6 filters, 5x5 kernel, max pool
+#   - [16, [5, 5], [0, 0], [1, 1], "max"]   # Conv: 16 filters, 5x5 kernel, max pool
+#   - [120]                                  # FC: 120 units
+#   - [84]                                   # FC: 84 units
+#   - [10]                                   # Output: 10 classes
+
+# ---------- VGG-8 Style (MNIST) ----------
+# layer_sizes:
+#   - [1, 28, 28]                           # Input
+#   - [64, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
+#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+#   - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
+#   - [128, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
+#   - [128]                                  # FC layer
+#   - [10]                                   # Output
+
+# ---------- VGG-16 Style (MNIST) ----------
+# layer_sizes:
+#   - [1, 28, 28]                           # Input
+#   # Block 1
+#   - [64, [3, 3], [1, 1], [1, 1], ""]      # Conv
+#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + pool
+#   # Block 2
+#   - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [128, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+#   # Block 3
+#   - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+#   # Block 4
+#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+#   # Block 5
+#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+#   - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+#   # FC layers
+#   - [4096]                                 # FC
+#   - [4096]                                 # FC
+#   - [10]                                   # Output
+
+# ---------- Simple CNN (Downsampled 14x14 MNIST) ----------
+# layer_sizes:
+#   - [1, 14, 14]                           # Input: 14x14 downsampled
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [15]                                   # FC: 15 units
+#   - [10]                                   # Output: 10 classes
+
+# ---------- N-MNIST (34x34 neuromorphic) ----------
+# layer_sizes:
+#   - [2, 34, 34]                           # Input: 2 polarities, 34x34
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [128]                                  # FC: 128 units
+#   - [10]                                   # Output: 10 classes
+
+# ---------- DVS Gesture (64x64 downsampled) ----------
+# layer_sizes:
+#   - [2, 64, 64]                           # Input: 2 polarities, 64x64
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [128]                                  # FC: 128 units
+#   - [11]                                   # Output: 11 gesture classes
+
+# ---------- DVS Gesture (128x128 full resolution) ----------
+# layer_sizes:
+#   - [2, 128, 128]                         # Input: 2 polarities, 128x128
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [128]                                  # FC: 128 units
+#   - [11]                                   # Output: 11 gesture classes
+
+# ---------- Custom Pooling Example ----------
+# layer_sizes:
+#   - [1, 28, 28]                                                 # Input
+#   - [16, [3, 3], [1, 1], [1, 1], ""]                           # Conv only
+#   - [32, [3, 3], [1, 1], [1, 1], "max", [2, 2], [2, 2]]        # Conv + custom pool (2x2, stride 2)
+#   - [128]                                                       # FC
+#   - [10]                                                        # Output
+
+# ============================================================================
+# TRAINING PARAMETERS
+# ============================================================================
+batch_size: 36              # Number of samples per batch
+num_epochs: 20              # Number of training epochs
+learning_rate: 0.0001       # Learning rate for optimizer
+optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
+
+# ============================================================================
+# MODEL LOADING/SAVING
+# ============================================================================
+load_file: false            # Load PyTorch pretrained weights (true/false)
+best: false                 # Legacy parameter, keep as false
+
+# Path to previous training JSON to continue/rerun training
+# Example for CNN:
+# rerun: network_results/mnist/training/CNN/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json
+rerun: null
+
+# List of parameters to override from the loaded model
+# Leave empty or null to use all parameters from the file
+override_params: null
+# Common overrides for CNN fine-tuning:
+# override_params:
+#   - learning_rate      # Lower learning rate for fine-tuning
+#   - num_epochs         # More epochs
+#   - threshold_lr       # Enable adaptive thresholds
+#   - sparsity_impact    # Add sparsity regularization
+
+# ============================================================================
+# DATA PREPROCESSING
+# ============================================================================
+# Downsampling is automatically determined from layer_sizes:
+# - MNIST: if input is [1, 14, 14] instead of [1, 28, 28]
+# - DVS: if input is [2, 64, 64] instead of [2, 128, 128]
+# No manual configuration needed
+
+# ============================================================================
+# NEURON BEHAVIOR
+# ============================================================================
+# Reset rate for each layer - controls the amount for the neurons' reset
+# Must be a list matching the number of layers (first value is not used)
+# Examples:
+#   - null - auto-generates [1, 1, 1, ...] for all layers
+#   - [0, 1, 1, 1, 1, 1] - standard reset for all layers
+#   - [0, 2, 2, 2, 1, 1] - stronger reset for conv layers, normal for FC layers
+restrict: null
+
+# Initial threshold value for all neurons
+init_thresholds: 0.0
+
+# Whether to shuffle activations in hidden layers
+shuffle_activations: false
+
+# Whether to shuffle input values before processing
+shuffle_input: false
+
+# Maximum number of top-k neurons allowed to fire per layer
+# For CNNs, this affects both convolutional and FC layers
+# Higher values allow more spatial features to activate
+# This also supports different firing number per layer
+firing_nb: 10000
+firing_nb: [2, 2, 2, 2, 2, 2]
+
+# Number of input values needed before a neuron can fire
+# 1 = fire immediately (recommended for CNNs)
+# Higher values can enforce more synchronous behavior
+sync_rate: 1
+
+# ============================================================================
+# LEARNING AND REGULARIZATION
+# ============================================================================
+# Learning rate for adaptive thresholds
+# 0.0 = fixed thresholds, >0 = learnable thresholds
+threshold_lr: 0.0
+
+# Sparsity loss impact for each layer (encourages sparse activations)
+# List must match number of layers
+# Example for LeNet-5 (6 layers): [0.0, 0.001, 0.001, 0.0, 0.0, 0.0]
+#   - Apply sparsity to conv layers, not to FC/output layers
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Weight regularization (L2) impact
+# 0.0 = no regularization
+# 0.0001-0.001 typical for CNNs
+w_reg: 0.0
+
+# ============================================================================
+# ADVANCED FEATURES
+# ============================================================================
+# Use only top-k weights during computation
+# -1 = use all weights (recommended for CNNs)
+# k>0 = use only top k weights (experimental)
+top_weights: -1
+
+# Number of output states to keep for visualizing output evolution
+# 0 = don't store history
+# 100+ = store for analysis (useful for debugging CNN behavior)
+history_size: 0
