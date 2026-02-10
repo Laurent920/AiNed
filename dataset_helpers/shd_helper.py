@@ -9,10 +9,37 @@ import tonic.transforms as transforms
 import numpy as np
 import jax.numpy as jnp
 from tqdm import tqdm
+import os
 
-def torch_SHD_loader(batch_size, shuffle=False, downsample=False):
-    trainset = tonic.datasets.SHD(save_to='./data', train=True)#, transform=transforms.NumpyAsType(float))
-    testset = tonic.datasets.SHD(save_to='./data', train=False)#, transform=transforms.NumpyAsType(float))
+def torch_SHD_loader(batch_size, shuffle=False, downsample=False, data_dir=""):
+    """
+    Load SHD (Spiking Heidelberg Digits) dataset.
+    
+    Args:
+        batch_size: Number of samples per batch
+        shuffle: Whether to shuffle the data
+        downsample: Downsampling option (currently unused for SHD)
+        data_dir: Root directory for data storage. If empty, uses current directory.
+    
+    Returns:
+        Tuple of (train_data, val_data, test_data, max_nonzero)
+    """
+    if data_dir:
+        # If data_dir is provided, use it
+        save_dir = os.path.join(data_dir, 'data')
+        base_cache_dir = os.path.join(data_dir, "cache/SHD")
+    else:
+        # Default to current directory
+        save_dir = './data'
+        base_cache_dir = "./cache/SHD"
+
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Loading SHD dataset from: {save_dir}")
+    
+    trainset = tonic.datasets.SHD(save_to=save_dir, train=True)
+    testset = tonic.datasets.SHD(save_to=save_dir, train=False)
     
     # data, label = trainset[0]
 
@@ -20,8 +47,8 @@ def torch_SHD_loader(batch_size, shuffle=False, downsample=False):
     # print("Label:", label)
     # print(data.shape, data[0:200])
     
-    cached_trainset = DiskCachedDataset(trainset, cache_path='./cache/SHD/train') 
-    cached_testset = DiskCachedDataset(testset, cache_path='./cache/SHD/test')
+    cached_trainset = DiskCachedDataset(trainset, cache_path=os.path.join(base_cache_dir, 'train')) 
+    cached_testset = DiskCachedDataset(testset, cache_path=os.path.join(base_cache_dir, 'test'))
     
     # Train - validation - test split
     val_split = 0.1

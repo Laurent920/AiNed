@@ -35,7 +35,7 @@ from dataset_helpers.network_helper import one_hot_encode
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
-from other_helpers.helpers import update_history, process_history
+from other_helpers.helpers import update_history, process_history, load_config_with_defaults
 from other_helpers.backpropagation import back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
@@ -63,9 +63,11 @@ test_generator = None
 
 # region INFERENCE
 @partial(jax.jit, static_argnames=['params', 'grad'])
-def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False):    
+def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False): 
+    # jax.debug.print("rank {}, neuron idx {} weight array {}", rank, neuron_idx, weights[neuron_idx].shape)   
     # Compute the new values of the neuron states
     filtered_weights = keep_top_k(weights[neuron_idx], params.top_weights, apply_abs=True)
+    # filtered_weights = weights[neuron_idx]
 
     # jax.debug.print("Original weights {}, filtered wights {}", weights[neuron_idx], filtered_weights)
     activations = jax.lax.cond(neuron_idx < 0,
@@ -1172,7 +1174,7 @@ def get_layer_idx(batch_size, layer_sizes, trial=None):
     if trial is None:
         print(f"Rank {rank}, layer idx: {layer_idx}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_layer}")
 
-def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):   
+def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, config_path=None, data_dir=""):   
     global training_generator
     global validation_generator
     global test_generator 
@@ -1185,86 +1187,21 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
     if rank != 0:
         TQDM_DISABLE = True
 
-    dataset = 'mnist'
-    # dataset = 'shd'
-    # dataset = 'nmnist'
-    dataset = 'dvs'
-    # dataset = 'smnist'
 
-    # Network structure and parameters
-    all_layers = [] 
+    # Load configuration from file or use defaults
+    config = load_config_with_defaults(config_path)
     
-    match dataset:
-        case "mnist":
-            # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 32, 10))
-            # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 64, 10))
-            # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 128, 10))
+    # Extract configuration parameters
+    dataset = config['dataset']
+    layer_sizes = tuple(config['layer_sizes'])
+    batch_size = config['batch_size']
 
-            # all_layers.append((28*28, 32, 32, 32, 32, 32, 32, 10))
-            # all_layers.append((28*28, 64, 64, 64, 64, 64, 64, 10))
-            # all_layers.append((28*28, 128, 128, 128, 128, 128, 128, 10))
+    restrict = config['restrict']    
+    init_thresholds = config['init_thresholds']
+    load_file = config['load_file']
+    best = config['best']
+    rerun = config['rerun']
 
-            # all_layers.append((28*28, 32, 32, 32, 32, 32, 10))
-            # all_layers.append((28*28, 64, 64, 64, 64, 64, 10))    
-            # all_layers.append((28*28, 128, 128, 128, 128, 128, 10))
-
-            # all_layers.append((28*28, 32, 32, 32, 32, 10))
-            # all_layers.append((28*28, 64, 64, 64, 64, 10))    
-            # all_layers.append((28*28, 128, 128, 128, 128, 10))
-
-            # all_layers.append((28*28, 128, 64, 32, 10))    
-            # all_layers.append((28*28, 64, 64, 64, 10))
-            # all_layers.append((28*28, 128, 128, 128, 10))
-
-            # all_layers.append((14*14, 32, 32, 10))
-            # all_layers.append((28*28, 32, 32, 10))
-            # all_layers.append((28*28, 64, 64, 10))    
-            # all_layers.append((28*28, 128, 128, 10))
-            # all_layers.append((28*28, 256, 256, 10))
-
-            # all_layers.append((14*14, 32, 10))
-            # all_layers.append((28*28, 32, 10))
-            # all_layers.append((28*28, 64, 10))    
-            all_layers.append((28*28, 256, 10))    
-            # all_layers.append((28*28, 256, 10))    
-        case "shd":
-            # all_layers.append((700, 128, 128, 128, 128, 20))    
-            # all_layers.append((700, 256, 256, 256, 256, 20))                
-
-            # all_layers.append((700, 256, 256, 256, 20))                
-            # all_layers.append((700, 128, 64, 32, 20))    
-            # all_layers.append((700, 64, 64, 64, 20))    
-            # all_layers.append((700, 32, 32, 32, 20))  
-              
-            # all_layers.append((700, 256, 256, 20))                
-            # all_layers.append((700, 128, 128, 20))    
-            # all_layers.append((700, 64, 64, 20))    
-            # all_layers.append((700, 32, 32, 20))    
-            
-            all_layers.append((700, 256, 20))    
-            # all_layers.append((700, 128, 20))    
-            # all_layers.append((700, 64, 20))    
-            # all_layers.append((700, 32, 20))    
-        case "nmnist":
-            all_layers.append((34*34*2, 256, 10))   
-        case "dvs":
-            all_layers.append((128*128*2, 128, 11))
-            
-            all_layers.append((64*64*2, 128, 11))
-            # all_layers.append((64*64*2, 128, 128, 128, 11))
-        case _:
-            print("Error: Non valid dataset selection.")
-            sys.exit(1)
-    
-    layer_sizes = all_layers[0]
-
-    best = False # Old variable/ not in use anymore
-    load_file = False # Load pytorch pretrained weights
-    batch_size = 36
-    restrict = (1,) * len(layer_sizes) # Reset rate for each layer
-    # restrict = (2, 2, 2, 2, 1, 1)
-
-    init_thresholds = None
     if trial is not None: # Optuna Hyper-parameter tuning parameter
         dataset = trial_params.dataset
         layer_sizes = trial_params.layer_sizes
@@ -1283,164 +1220,134 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
         sys.exit(1)
     
     for f_nb in [128]: # Loop for multiple experiments
-        # Set rerun to a specific file to retrain or rerun inference and None for training from scratch
-        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.974_adam_.json"
-        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.972_adam_.json"
-        rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.862_adam_.json"
-        # rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.865_adam_.json"
+        # Initialize parameters (input data for rank 0 and weights for other ranks)
+        key, subkey = jax.random.split(key) 
+        total_train_batches, total_val_batches, total_test_batches, max_nonzero = 0, 0, 0, 0
+        weights = init_params(subkey, batch_size, layer_sizes, load_file=load_file, best=best)
+        if rank == 0: # Only the first rank loads the dataset
+            downsample = False
+            # Load the data 
+            match dataset:
+                case "mnist" | "smnist" | "psmnist":
+                    sequential = False
+                    permuted = False
+                    if layer_sizes[0] == 14*14:
+                        downsample = True
+                    if dataset == "smnist" or dataset == "psmnist":
+                        sequential = True
+                        if dataset == "psmnist":
+                            permuted = True
 
-        # rerun = 'network_results/shd/training/basic/42_ep10_batch36_700_128_128_20_acc0.612_adam_.json'
-        rerun = "network_results/shd/training/MLP/sparsity_loss/42_ep10_batch36_700_128_20_acc0.613_adam_.json"
+                    loader = partial(mnist_loader_manual, 
+                                        sequential=sequential, 
+                                        permuted=permuted)
+                case "shd":
+                    loader = torch_SHD_loader
+                case "nmnist":
+                    loader = torch_nmnist_loader
+                case "dvs":
+                    if layer_sizes[0] == 64*64*2:
+                        downsample = True 
+                    loader = torch_DVSGesture_loader                            
+                case _:
+                    raise ValueError(f"Unknown dataset: {dataset}")
+
+            # Load and unpack the dataloaders
+            train_data, val_data, test_data, max_nonzero = loader(  batch_size=batch_size, 
+                                                                    shuffle=False, 
+                                                                    CNN_preprocess=False, 
+                                                                    downsample=downsample,
+                                                                    data_dir=data_dir)
+            training_generator, total_train_batches = train_data
+            validation_generator, total_val_batches = val_data
+            test_generator, total_test_batches = test_data
+
+        # Broadcast the total number of batches to all other ranks
+        total_train_batches, total_val_batches, total_test_batches = bcast(jnp.array([total_train_batches, total_val_batches, total_test_batches]), root=0 , comm=comm)
+        max_nonzero = bcast(jnp.array([max_nonzero]), root=0, comm=comm)
+        max_nonzero = max_nonzero.tolist()[0]
         
-        # T03
-        rerun ="network_results/mnist/training/MLP/42_ep40_b36_196_32_10_acc0.968_adam_.json"
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.959_adam_.json"
+        thresholds = jnp.full(layer_sizes[layer_idx], init_thresholds)
 
-        # T0
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_10_acc0.965_adam_.json"
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.960_adam_.json"
+        params = Params(
+            dataset=dataset,
+            random_seed=random_seed,
+            layer_sizes=layer_sizes, 
+            init_thresholds=init_thresholds, 
+            num_epochs=config['num_epochs'],
+            learning_rate=config['learning_rate'], 
+            batch_size=batch_size,
+            load_file=load_file,
+            shuffle_activations=config['shuffle_activations'],
+            restrict=restrict,
+            firing_nb=config['firing_nb'],
+            sync_rate=config['sync_rate'],
+            max_nonzero=max_nonzero,
+            shuffle_input=config['shuffle_input'],
+            threshold_lr=config['threshold_lr'],
+            sparsity_impact=tuple(config['sparsity_impact']),
+            w_reg=config['w_reg'],
+            rerun="",
+            top_weights=config['top_weights'],
+            history_size=config['history_size']
+        )
+        if trial is not None:
+            params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
 
-        # Restrict
-        rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.952_adam_.json" # RESET2
+        if rerun is not None:                  
+            override_list = config.get('override_params', None)
+            params, weights, thresholds = rerun_init(
+                rerun, 
+                mpi_config, 
+                params, 
+                override_params=override_list
+            )
         
-        # Firing nb
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.948_adam_.json" # FNB 1
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.958_adam_.json" # FNB 2
-
-        # Sync rate
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.965_adam_.json" # SYNC 2
-        # rerun ="network_results/mnist/training/MLP/42_ep20_b36_196_32_32_10_acc0.966_adam_.json" # SYNC 4
+        if rank == 0:
+            print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
+            print(params)
         
-        # rerun = "network_results/mnist/training/MLP/basic/load_false/42_ep20_batch36_784_128_10_acc0.976_adam_.json"
-        # rerun = "network_results/mnist/training/MLP/basic/load_false/42_ep20_batch36_784_128_128_10_acc0.974_adam_.json"
-        
-        # Best MNIST
-        rerun ="network_results/mnist/training/MLP/sync1_fnb1_2/42_ep200_b36_784_256_256_10_acc0.981_adam_.json" 
+        # Instantiate the neuron states with the correct shapes and initial values
+        empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
+                                            thresholds=thresholds,
+                                            input_residuals=np.zeros((layer_sizes[layer_idx-1],)),
+                                            input_order=jnp.full((layer_sizes[layer_idx-1],), -1, dtype=int), 
+                                            input_activity=jnp.full((layer_sizes[layer_idx-1],), 0, dtype=int),
+                                            layer_activity=jnp.zeros((layer_sizes[layer_idx],), dtype=int),
+                                            output_activity=jnp.zeros((layer_sizes[layer_idx-1], layer_sizes[layer_idx])),
+                                            last_sent_iteration=-1,
+                                            input_vector=jnp.zeros((layer_sizes[layer_idx-1]), dtype=int),
+                                            output_vector=jnp.zeros((layer_sizes[layer_idx]), dtype=int),
+                                            values_history=jnp.zeros((params.history_size, layer_sizes[layer_idx])),
+                                            history_index=jnp.array(0, dtype=jnp.int32))
 
-        # rerun = "network_results/shd/training/MLP/w_reg/42_ep1_b36_700_256_20_acc0.431_adam_.json"
-        # rerun = "network_results/shd/training/MLP/42_ep100_b36_700_256_256_256_20_acc0.662_adam_.json"
-        # rerun = "network_results/shd/training/MLP/42_ep50_b36_700_256_20_acc0.677_adam_.json"
-        rerun = None
+        total_batches = (total_train_batches, total_val_batches, total_test_batches)
 
-        cont = True
-        while cont:
-            # for i in [1, 2, 4, 8, 16, 32, 64, 128, 256]: # Loop for multiple experiments
-            for i in [256]: 
-                # Initialize parameters (input data for rank 0 and weights for other ranks)
-                key, subkey = jax.random.split(key) 
-                total_train_batches, total_val_batches, total_test_batches, max_nonzero = 0, 0, 0, 0
-                weights = init_params(subkey, batch_size, layer_sizes, load_file=load_file, best=best)
-                if rank == 0: # Only the first rank loads the dataset
-                    downsample = False
-                    # Load the data 
-                    match dataset:
-                        case "mnist":
-                            loader = mnist_loader_manual
-                            if layer_sizes[0] == 14*14:
-                                downsample = True
-                        case "shd":
-                            loader = torch_SHD_loader
-                        case "nmnist":
-                            loader = partial(torch_nmnist_loader, CNN_preprocess=False)
-                        case "dvs":
-                            if layer_sizes[0] == 64*64*2:
-                                downsample = True 
-                            loader = partial(torch_DVSGesture_loader, CNN_preprocess=False, downsample=downsample)                            
-                        case _:
-                            raise ValueError(f"Unknown dataset: {dataset}")
-
-                    # Load and unpack the dataloaders
-                    train_data, val_data, test_data, max_nonzero = loader(  batch_size=batch_size, 
-                                                                            shuffle=False, 
-                                                                            downsample=downsample)
-                    training_generator, total_train_batches = train_data
-                    validation_generator, total_val_batches = val_data
-                    test_generator, total_test_batches = test_data
-
-                # Broadcast the total number of batches to all other ranks
-                total_train_batches, total_val_batches, total_test_batches = bcast(jnp.array([total_train_batches, total_val_batches, total_test_batches]), root=0 , comm=comm)
-                max_nonzero = bcast(jnp.array([max_nonzero]), root=0 , comm=comm)
-                max_nonzero = max_nonzero.tolist()[0]
-                
-                key, subkey = jax.random.split(key) 
-                if init_thresholds is None:
-                    init_thresholds = 0.0 # Set the initial threshold values
-                    # thresholds = jax.random.uniform(subkey, layer_sizes[layer_idx])
-                    # thresholds = jax.nn.sigmoid(jax.random.normal(subkey, (layer_sizes[layer_idx])))*init_thresholds
-                thresholds = jnp.full(layer_sizes[layer_idx], init_thresholds)
-
-                params = Params(
-                    dataset=dataset,
-                    random_seed=random_seed,
-                    layer_sizes=layer_sizes, 
-                    init_thresholds=init_thresholds, 
-                    num_epochs=10,
-                    learning_rate=0.0001, 
-                    batch_size=batch_size,
-                    load_file=load_file,
-                    shuffle_activations=False,      # Whether shuffle the activations in the hidden layer or not
-                    restrict=restrict,              # Reset rate for each layer
-                    firing_nb=1,                    # How many top values do we allow to fire for each layer
-                    sync_rate=1,                    # How many input values do we need to receive before firing
-                    max_nonzero=max_nonzero,        # Maximum size of the input data (Computed from the dataloader, do not change it here)
-                    shuffle_input=False,            # Whether shuffle the input values or not 
-                    threshold_lr=0.0,               # Threshold learning rate
-                    sparsity_impact=tuple([0.000, 0.000, 0.000, 0.000, 0.0000]), # Beta sparse (Sparsity loss's impact)
-                    w_reg=0.0,                      # Weight regularization impact
-                    rerun="",
-                    top_weights=-1,
-                    history_size=0                  # How many output states should we keep for plotting output history
-                )
-                
-                if trial is not None:
-                    params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
-
-                if rerun is not None:
-                    new_epoch_number = 50 # Number of training epoch to run again                    
-                    params, weights, thresholds = rerun_init(rerun, 
-                                                             mpi_config, 
-                                                             params, 
-                                                             new_epoch_number, 
-                                                             threshold_lr=False, 
-                                                             sparsity_impact=False, 
-                                                             top_weights=False,
-                                                             history_size=True,
-                                                             shuffle_activations=False,
-                                                             shuffle_input=False)
-                
-                if rank == 0:
-                    print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
-                    print(params)
-                
-                # Instantiate the neuron states with the correct shapes and initial values
-                empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
-                                                    thresholds=thresholds,
-                                                    input_residuals=np.zeros((layer_sizes[layer_idx-1],)),
-                                                    input_order=jnp.full((layer_sizes[layer_idx-1],), -1, dtype=int), 
-                                                    input_activity=jnp.full((layer_sizes[layer_idx-1],), 0, dtype=int),
-                                                    layer_activity=jnp.zeros((layer_sizes[layer_idx],), dtype=int),
-                                                    output_activity=jnp.zeros((layer_sizes[layer_idx-1], layer_sizes[layer_idx])),
-                                                    last_sent_iteration=-1,
-                                                    input_vector=jnp.zeros((layer_sizes[layer_idx-1]), dtype=int),
-                                                    output_vector=jnp.zeros((layer_sizes[layer_idx]), dtype=int),
-                                                    values_history=jnp.zeros((params.history_size, layer_sizes[layer_idx])),
-                                                    history_index=jnp.array(0, dtype=jnp.int32))
-
-                total_batches = (total_train_batches, total_val_batches, total_test_batches)
-
-                # To only run inference
-                # batch_predict(params, key, total_batches, weights, empty_neuron_states, "test", save=True, debug=True)
-                
-                # To run the full training pipeline
-                val_acc, result_path = train(params, key, total_batches, weights, empty_neuron_states, "adam", trial)
-
-                # rerun = result_path
-                # print(rerun)
-                # break
-            break
+        mode = config['mode']
+        if mode == 'inference':
+            # To only run inference
+            batch_predict(params, key, total_batches, weights, empty_neuron_states, "test", save=True, debug=True)
+        elif mode == 'training':                
+            # To run the full training pipeline
+            val_acc, result_path = train(params, key, total_batches, weights, empty_neuron_states, config['optimizer'], trial)
+            # val_acc, result_path = train(params, key, total_batches, weights, empty_neuron_states, "adam", trial)
+        else:
+            print(f"Unknown mode in config file, choose either 'training' or 'inference', got {mode}")
+            sys.exit(1)
             
 if __name__ == "__main__":
-    random_seed = 42
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train async neural network')
+    parser.add_argument('--config', type=str, default=None, 
+                       help='Path to YAML configuration file')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed (default: 42)')
+    parser.add_argument('--data_dir', type=str, default="",
+                       help='Directory for storing and reading the datasets (default: current directory/data/)')
+    args = parser.parse_args()
+    
+    random_seed = args.seed
     key = jax.random.key(random_seed)
     
     # Initialize MPI
@@ -1448,4 +1355,5 @@ if __name__ == "__main__":
     rank = comm.Get_rank()      # Real rank
     size = comm.Get_size()
 
-    main(random_seed, key, rank, size, comm)
+    main(random_seed, key, rank, size, comm, config_path=args.config, data_dir=args.data_dir)
+# JAX_PLATFORMS=cpu mpirun -n 4 python async_MLP.py --config "MLP_config.yaml"

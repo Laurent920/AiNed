@@ -7,6 +7,9 @@ import json
 import dataclasses
 from jax import custom_jvp, jit
 from functools import partial
+import yaml
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 
 #region ACCURACY
@@ -55,22 +58,18 @@ def keep_top_k(x, k, apply_abs=False, max_kernel=None):
     '''
     if k < 0:
         return x
-    
-    if max_kernel is None:
-        k = min(k, x.shape[0])
-        x_flat = x
-    else:
-        k = min(k, x.size)   
-        x_flat = x.flatten() 
 
-    x_top = x_flat
+    x = jnp.atleast_1d(x)
+    k = min(k, x.size)
+    x_flat = x.flatten()
+
     if apply_abs:
-        x_top = jnp.abs(x)
+        x_flat = jnp.abs(x_flat)
 
-    _, top_indices = jax.lax.top_k(x_top, k)
+    _, top_indices = jax.lax.top_k(x_flat, k)
 
     # Create a mask with 1s at top-k indices, 0 elsewhere
-    mask = jnp.zeros(x_flat.shape)
+    mask = jnp.zeros(x_flat.size)
     mask = mask.at[top_indices].set(1)
 
     out = x_flat * mask
@@ -276,26 +275,40 @@ class Params:
     flat_layer_sizes: tuple[int, ...] = None
 
 #region RERUN
-def rerun_init(data_file_path, 
-               mpi_config, 
-               new_params,
-               new_epoch_nb, 
-               shuffle_activations=False,
-               shuffle_input=False,
-               firing_nb=False,
-               sync_rate=False,
-               batch_size=False,
-               learning_rate=False,
-               init_thresholds=False,
-               restrict=False,
-               sparsity_impact=False,
-               w_reg=False,
-               threshold_lr=False,
-               top_weights=False,
-               history_size=False
-               ):
+def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     '''
-    Rerun from an existing file by replacing the fields marked as True with the values of new params 
+    Rerun from an existing file by replacing specified fields with values from new_params.
+    
+    Args:
+        data_file_path: Path to the JSON file containing stored parameters
+        mpi_config: MPI configuration object
+        new_params: Params object containing new parameter values
+        override_params: List of parameter names to override from new_params.
+                        If None or empty, all parameters are loaded from the file.
+                        
+    Available parameter names to override:
+        - 'shuffle_activations': Whether to shuffle activations in hidden layers
+        - 'shuffle_input': Whether to shuffle input values
+        - 'firing_nb': Maximum number of neurons allowed to fire per layer
+        - 'sync_rate': Number of input values needed before firing
+        - 'batch_size': Training batch size
+        - 'learning_rate': Learning rate for optimizer
+        - 'init_thresholds': Initial threshold values for neurons
+        - 'restrict': Reset rate for each layer
+        - 'sparsity_impact': Sparsity loss impact per layer
+        - 'w_reg': Weight regularization impact
+        - 'threshold_lr': Threshold learning rate
+        - 'top_weights': Top-k weights to use
+        - 'history_size': Number of output states to keep for plotting
+    
+    Example:        
+        # Override multiple training parameters
+        params, weights, thresholds = rerun_init(
+            "path/to/model.json",
+            mpi_config,
+            new_params,
+            override_params=['learning_rate', 'batch_size', 'sparsity_impact']
+        )
     '''
     layer_idx = mpi_config.layer_idx
     last_layer = mpi_config.last_layer
@@ -309,35 +322,77 @@ def rerun_init(data_file_path,
     load_file = stored_data["loadfile"]
     layer_sizes = list_to_tuple_deep(stored_data["layer_sizes"])
     # assert layer_sizes == new_params.layer_sizes, f"Network structure must be the same to rerun, got {layer_sizes} and {new_params.layer_sizes}"
-    
-    # Use stored value if flag is False, otherwise use new_params value
-    shuffle_activations_val = new_params.shuffle_activations if shuffle_activations else stored_data["shuffle activations"]
-    shuffle_input_val = new_params.shuffle_input if shuffle_input else stored_data["shuffle input"]
-    firing_nb_val = new_params.firing_nb if firing_nb else stored_data["firing number"]
-    sync_rate_val = new_params.sync_rate if sync_rate else stored_data["synchronization rate"]
-    batch_size_val = new_params.batch_size if batch_size else stored_data["batch_size"]
-    learning_rate_val = new_params.learning_rate if learning_rate else stored_data["learning rate"]
-    init_thresholds_val = new_params.init_thresholds if init_thresholds else extract_scalar(stored_data["thresholds"]["thresholds_1"])
-    
-    restrict_val = new_params.restrict if restrict else tuple(stored_data["restrict"])
-    sparsity_impact_val = new_params.sparsity_impact if sparsity_impact else tuple(stored_data.get("sparsity impact", 0))
-    w_reg_val = new_params.w_reg if w_reg else stored_data.get("weight regularization", 0.0)
-    threshold_lr_val = new_params.threshold_lr if threshold_lr else stored_data["threshold lr"]
-    top_weights_val = new_params.top_weights if top_weights else stored_data.get("top weights", -1)
-    history_size = new_params.history_size if history_size else 0
+    # Replacement for the assert line:
+    if not check_core_structure(layer_sizes, new_params.layer_sizes):
+        raise AssertionError(
+            f"Network structure mismatch! Core components must match. "
+            f"Got: \n{new_params.layer_sizes} \nvs \n{layer_sizes}"
+        )
 
-    threshold_dict = stored_data["thresholds"]
-    weights_dict = stored_data["weights"]
+    # Initialize override_params as empty set if None
+    if override_params is None:
+        override_params = set()
+    else:
+        override_params = set(override_params)  # Convert to set for faster lookup
+    
+    # Helper function to decide whether to use new_params or stored value
+    def get_param(param_name, stored_key=None, default=None, transform=None):
+        """
+        Get parameter value from either new_params or stored_data.
+        
+        Args:
+            param_name: Name of the parameter in new_params object
+            stored_key: Key in stored_data dictionary
+            default: Default value if key not found in stored_data
+            transform: Optional function to transform stored value (e.g., tuple conversion)
+        
+        Returns:
+            Parameter value from new_params if param_name in override_params, else from stored_data
+        """
+        if stored_key is None:
+            stored_key = param_name
+        
+        if param_name in override_params:
+            return getattr(new_params, param_name)
+        else:
+            value = stored_data.get(stored_key, default)
+            if transform is not None and value is not None:
+                value = transform(value)
+            return value
+    
+    # Extract all parameters using the helper function
+    shuffle_activations_val = get_param('shuffle_activations', 'shuffle activations')
+    shuffle_input_val = get_param('shuffle_input', 'shuffle input')
 
+    firing_nb_val = get_param('firing_nb', 'firing number')    
+    sync_rate_val = get_param('sync_rate', 'synchronization rate')
+    batch_size_val = get_param('batch_size')
+    learning_rate_val = get_param('learning_rate', 'learning rate')
+
+    # Special handling for init_thresholds
+    if 'init_thresholds' in override_params:
+        init_thresholds_val = new_params.init_thresholds
+    else:
+        init_thresholds_val = extract_scalar(stored_data["thresholds"]["thresholds_1"])
+    
+    restrict_val = get_param('restrict', transform=tuple)
+    sparsity_impact_val = get_param('sparsity_impact','sparsity impact', default=0, transform=tuple)
+    w_reg_val = get_param('w_reg', 'weight regularization', default=0.0)
+    threshold_lr_val = get_param('threshold_lr', 'threshold lr')
+    top_weights_val = get_param('top_weights', 'top weights', default=-1)
+    history_size_val = get_param('history_size', default=0)
+
+    # Convert firing_nb to tuple if it's a list
     if isinstance(firing_nb_val, list):
         firing_nb_val = tuple(firing_nb_val)
 
+    # Create new Params object with merged values
     params = Params(
-        dataset=new_params.dataset,  # Assuming you want to keep the dataset from new_params
-        random_seed=new_params.random_seed,  # Assuming you want to keep the random_seed from new_params
+        dataset=new_params.dataset,
+        random_seed=new_params.random_seed,
         layer_sizes=layer_sizes, 
         init_thresholds=init_thresholds_val, 
-        num_epochs=new_epoch_nb, 
+        num_epochs=new_params.num_epochs,
         learning_rate=learning_rate_val, 
         batch_size=batch_size_val,
         load_file=load_file,
@@ -345,17 +400,21 @@ def rerun_init(data_file_path,
         restrict=restrict_val,
         firing_nb=firing_nb_val,
         sync_rate=sync_rate_val,
-        max_nonzero=new_params.max_nonzero,  # Assuming you want to keep max_nonzero from new_params
+        max_nonzero=new_params.max_nonzero,
         shuffle_input=shuffle_input_val,
         threshold_lr=threshold_lr_val,
         sparsity_impact=sparsity_impact_val,
         w_reg=w_reg_val,
         rerun=data_file_path,
         top_weights=top_weights_val,
-        history_size=history_size,
+        history_size=history_size_val,
         max_kernel=new_params.max_kernel
     )
     
+    # Load weights and thresholds
+    threshold_dict = stored_data["thresholds"]
+    weights_dict = stored_data["weights"]
+
     if layer_idx > 0:
         weights = jnp.array(weights_dict["layer_"+str(layer_idx)])
         if layer_idx < last_layer:
@@ -365,10 +424,28 @@ def rerun_init(data_file_path,
     else:
         l = layer_sizes[layer_idx]
         if isinstance(l, int) or len(l) == 1:
-            weights = thresholds = jnp.zeros(layer_sizes[layer_idx])
+            weights = thresholds = jnp.zeros((layer_sizes[0]))
         else:
             weights = thresholds = jnp.zeros((1,1,1,1))
+            
     return params, weights, thresholds
+
+def check_core_structure(ls1, ls2):
+    # Check whether two network structures match, for CNN we only check the channel dimension, the filter sizes and the pooling
+    if len(ls1) != len(ls2):
+        return False
+    
+    for e1, e2 in zip(ls1, ls2):
+        # If the element has multiple parts (is a tuple/list)
+        if hasattr(e1, '__len__') and len(e1) > 1:
+            # Check first and second elements (e.g., in_channels and height)
+            if e1[0] != e2[0] or e1[1] != e2[1] or (len(e1) >= 5 and len(e2) >= 5 and e1[4] != e2[4]):
+                return False
+        else:
+            # If it's a single value (like [128]), just compare the whole thing
+            if e1 != e2:
+                return False
+    return True
 
 def list_to_tuple_deep(obj):
     if isinstance(obj, list):
@@ -656,3 +733,104 @@ def store_data_to_json(filename, data_to_add, label=None):
     # Step 3: Write back to disk
     with open(filename, "w") as f:
         json.dump(data, f, indent=4)
+
+
+# region Load config file
+def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = False) -> Dict[str, Any]:
+    """
+    Load configuration from a YAML file with default values for missing fields.
+    
+    Args:
+        config_path: Path to the YAML configuration file. If None, uses all defaults.
+    
+    Returns:
+        Dictionary containing the configuration parameters
+    """
+    # Default configuration
+    default_config = {
+        # Dataset selection: 'mnist', 'shd', 'nmnist', 'dvs', 'smnist'
+        'dataset': 'mnist',
+
+        'mode': 'training', # Choose either train or inference
+
+        # Network architecture: tuple of layer sizes (input, hidden1, hidden2, ..., output)
+        # Examples:
+        #   MNIST: (784, 256, 10) or (28*28, 128, 128, 10)
+        #   SHD: (700, 256, 20)
+        #   N-MNIST: (34*34*2, 256, 10)
+        #   DVS Gesture: (128*128*2, 128, 11) or (64*64*2, 128, 11)
+        'layer_sizes': (784, 256, 10),
+        
+        # Training parameters
+        'batch_size': 36,
+        'num_epochs': 10,
+        'learning_rate': 0.0001,
+        'optimizer': 'adam',
+        
+        # Model loading/saving
+        'load_file': False,  # Load pytorch pretrained weights
+        'best': False,  # Old variable, not in use anymore
+        'rerun': None,  # Path to a previous training JSON to continue/rerun
+        "override_params": None,  # List of parameter names to override when rerunning from a previous file
+
+        # Reset rate for each layer (tuple, must match number of layers)
+        # Example: (1, 1, 1) for 3 layers, (2, 2, 1) for different reset rates
+        'restrict': None,  # Will be auto-generated as (1,) * len(layer_sizes) if None
+        
+        # Threshold initialization
+        'init_thresholds': 0.0,  # Initial threshold value for neurons
+        
+        # Neuron behavior parameters
+        'shuffle_activations': False,  # Shuffle activations in hidden layers
+        'shuffle_input': False,  # Shuffle input values
+        'firing_nb': 10000,  # Max number of top values allowed to fire per layer
+        'sync_rate': 1,  # Number of input values needed before firing
+        
+        # Learning and regularization
+        'threshold_lr': 0.0,  # Threshold learning rate
+        'sparsity_impact': (0.0, 0.0, 0.0, 0.0, 0.0),  # Sparsity loss impact per layer
+        'w_reg': 0.0,  # Weight regularization impact
+        
+        # Advanced features
+        'top_weights': -1,  # Top k weights to use (-1 for all)
+        'history_size': 0,  # Number of output states to keep for plotting
+        
+        # Experiment settings
+        'new_epoch_number': 50,  # Epochs to run when rerunning a model
+    }
+
+    if is_cnn:
+        default_config['layer_sizes'] = (
+            [1, 28, 28], 
+            [3, [3, 3], [1, 1], [1, 1], 'max'], 
+            [128], 
+            [10]
+        )
+        
+    
+    # If no config file provided, return defaults
+    if config_path:
+        config_file = Path(config_path)
+
+        # Load YAML configuration
+        if not config_file.exists():
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
+    
+        with open(config_file, 'r') as f:
+            user_config = yaml.safe_load(f)
+            
+            if user_config:
+                default_config.update(user_config)
+    
+    # Convert all lists to tuples (especially layer_sizes)
+    final_config = {k: make_hashable(v) for k, v in default_config.items()}
+
+    if final_config['restrict'] is None:
+        final_config['restrict'] = (1,) * len(final_config['layer_sizes'])
+
+    return final_config
+
+def make_hashable(item):
+    if isinstance(item, (list, tuple)):
+        return tuple(make_hashable(i) for i in item)
+    return item

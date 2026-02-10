@@ -11,26 +11,38 @@ import tonic.transforms as transforms
 import numpy as np
 import jax.numpy as jnp
 
-def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, downsample=False):
+def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, downsample=False, data_dir=""):
     frame_transform = None
     if downsample:
         # Combining common practices: Denoise -> Downsample -> Binning
         frame_transform = transforms.Compose([
             # transforms.Denoise(filter_time=10000),             # Remove noise (keep only if other events happened within 10 ms, we can go down to 5 ms max)
             transforms.Downsample(spatial_factor=0.5),         # 128x128 -> 64x64
+            # transforms.CropTime(max=500000),  # Keep only first 500ms (time in microseconds)
         ])
     
-    # tonic.transforms.Denoise(filter_time=5000)
-    # tonic.transforms.Downsample(spatial_factor=0.5)
-    trainset = tonic.datasets.DVSGesture(save_to='./data', train=True, transform=frame_transform)
-    testset = tonic.datasets.DVSGesture(save_to='./data', train=False, transform=frame_transform)
+    if data_dir:
+        # If data_dir is provided, use it
+        save_dir = os.path.join(data_dir, 'data')
+        base_cache_dir = os.path.join(data_dir, "cache/DVSGesture")
+    else:
+        # Default to current directory
+        save_dir = './data'
+        base_cache_dir = "./cache/DVSGesture"
+
+    # Create directory if it doesn't exist
+    os.makedirs(save_dir, exist_ok=True)
+    
+    print(f"Loading DVSGesture dataset from: {save_dir}")
+    
+    trainset = tonic.datasets.DVSGesture(save_to=save_dir, train=True, transform=frame_transform)
+    testset = tonic.datasets.DVSGesture(save_to=save_dir, train=False, transform=frame_transform)
 
     # data, label = trainset[0]
     # print("Type of data:", type(data))
     # print("Label:", label)
     # print(data.shape, data[0:200], (data[200:]))
 
-    base_cache_dir = "./cache/DVSGesture"
     model_type = "CNN" if CNN_preprocess else "MLP"
     resolution = "64x64" if downsample else "128x128"
     cache_dir = os.path.join(base_cache_dir, f"{model_type}_{resolution}") # Final path construction: ./cache/DVSGesture/CNN_64x64/train
