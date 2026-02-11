@@ -32,18 +32,19 @@ There are multiple main files inside the repository (AED = Asynchronous Event-Dr
 ## Usage
 ## AED MLP and CNN
 The files `async_MLP.py` and `async_CNN.py` contain the code to run inference, training and retraining of neural networks.\
-The different parameters that can be used are explained in the `Params` data structure.
+The different parameters that can be used are explained in the `Params` data structure. All the parameters are to be specified in the corresponding `config.yaml` file (more details in `template_config.yaml`)
 
 Run command:
 ```bash
-JAX_PLATFORMS=cpu mpirun -n <NUM_PROCESSES> python <SCRIPT>.py
+JAX_PLATFORMS=cpu mpirun -n <NUM_PROCESSES> python <SCRIPT>.py --config "<CONFIG>"
 ```
 - `NUM_PROCESSES`: must be a multiple of the number of layers in the network.
 - `SCRIPT`: script to run (e.g. async_MLP.py)
+- `CONFIG`: contains all the parameters
 
 Example:
 ```bash
-JAX_PLATFORMS=cpu mpirun -n 3 python async_MLP.py
+JAX_PLATFORMS=cpu mpirun -n 3 python async_MLP.py --config "MLP_config.yaml"
 ```
 
 ## Optuna Hyper Parameters tuning

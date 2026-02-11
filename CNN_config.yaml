@@ -96,13 +96,13 @@ layer_sizes:
 
 
 # ---------- N-MNIST (34x34 neuromorphic) ----------
-dataset: nmnist
-layer_sizes:
-  - [2, 34, 34]                           # Input: 2 polarities, 34x34
-  - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
-  - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
-  - [128]                                  # FC: 128 units
-  - [10]                                   # Output: 10 classes
+# dataset: nmnist
+# layer_sizes:
+#   - [2, 34, 34]                           # Input: 2 polarities, 34x34
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [128]                                  # FC: 128 units
+#   - [10]                                   # Output: 10 classes
 
 # dataset: dvs
 # ---------- DVS Gesture (64x64 downsampled) ----------
@@ -178,8 +178,8 @@ shuffle_activations: false
 shuffle_input: false
 
 firing_nb: 1
-firing_nb: [1, 1, 1, 1, 2]
-sync_rate: 2
+firing_nb: [1, 1, 1, 1, 1]
+sync_rate: 1
 
 # ============================================================================
 # LEARNING AND REGULARIZATION
