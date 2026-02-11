@@ -36,8 +36,8 @@ layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
-dataset: smnist
-layer_sizes: [1, 256, 256, 10] 
+# dataset: smnist
+# layer_sizes: [1, 256, 256, 10] 
 
 # dataset: psmnist
 # layer_sizes: [1, 256, 256, 10] 
@@ -96,8 +96,8 @@ restrict: null
 init_thresholds: 0.0
 shuffle_activations: false
 shuffle_input: false
-firing_nb: 8
-sync_rate: 8
+firing_nb: 1
+sync_rate: 1
 # ============================================================================
 # LEARNING AND REGULARIZATION
 # ============================================================================
