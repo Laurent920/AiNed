@@ -31,7 +31,7 @@ dataset: mnist
 layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
-# layer_sizes: [784, 128, 10]
+layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
@@ -46,8 +46,8 @@ layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 
-# dataset: shd
-# layer_sizes: [700, 256, 20]
+dataset: shd
+layer_sizes: [700, 256, 20]
 # layer_sizes: [700, 256, 256, 20]
 
 # dataset: dvs
@@ -105,7 +105,7 @@ threshold_lr: 0.0
 sparsity_impact: [0.0, 0.0, 0.0]
 w_reg: 0.0
 top_weights: -1
-history_size: 100
+history_size: 0
 
 # Set rerun to a specific file to retrain or rerun inference and None for training from scratch
 # rerun = "network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.974_adam_.json"

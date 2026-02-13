@@ -78,6 +78,7 @@ validation_generator = None
 test_generator = None
 
 TQDM_DISABLE = False
+STORE_EACH_EPOCH = True
 
 @jax.tree_util.register_pytree_node_class
 class ConvNeuronStates():
@@ -1329,6 +1330,30 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         epoch_accuracy = bcast(epoch_accuracy, root=size-1, comm=comm)
         if epoch_accuracy >= 0.9999:
             break
+        if STORE_EACH_EPOCH: 
+            # Gather the weights and iteration values at the last layer
+            layer_weights_sizes = [] # Retrieve the shapes of all the weights 
+            for layer in network.layers:
+                layer_weights_sizes.append(layer.weights_shape)
+            weights_dict, all_iteration_mean, thresholds_dict = gather_w_iter_th(network, layer_weights_sizes, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
+
+            if rank == last_layer * process_per_layer:
+                result_path_str = store_training_data(
+                                size,
+                                network, 
+                                "train",
+                                all_epoch_accuracies, 
+                                all_validation_accuracies, 
+                                -1.0,
+                                time.time() - start_time,
+                                all_iteration_mean,
+                                weights_dict,
+                                all_loss, 
+                                thresholds_dict,
+                                opti,
+                                "CNN_temp",
+                                all_history,
+                                total_batches[0])
 
     # Inference on the test set
     test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset="test", save=False, debug=False)
