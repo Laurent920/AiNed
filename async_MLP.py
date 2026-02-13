@@ -44,6 +44,7 @@ jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_disable_jit", True)
 
 TQDM_DISABLE = False
+STORE_EACH_EPOCH = True
 BUFFER_SIZE = 0
 
 # Initialize empty global MPI variables
@@ -632,6 +633,27 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         if epoch_accuracy >= 0.9999:
             break
         
+        if STORE_EACH_EPOCH:
+            # Gather the weights and iteration values at the last layer
+            weights_dict, all_iteration_mean, thresholds_dict = gather_w_it_th(params, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
+            if rank == last_layer * process_per_layer: 
+                result_path_str = store_training_data(
+                            size,
+                            params, 
+                            "train",
+                            all_epoch_accuracies, 
+                            all_validation_accuracies, 
+                            -1.0,
+                            time.time() - start_time,
+                            all_iteration_mean,
+                            weights_dict,
+                            all_loss, 
+                            thresholds_dict,
+                            opti,
+                            "MLP_temp",
+                            all_history,
+                            total_batches[0])
+            
         if trial is not None: # If using Optuna Hyper-parameter tuner
             # Return values if the run is not promising and should be pruned  
             all_mean_it = combine_batch_avg(all_mean_iterations, mpi_config) # Gather the weight gradients from all ranks in the same layer
@@ -1088,7 +1110,7 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
         # store_data_to_json(f"{len(params.layer_sizes)}hidden_iterations_layer{rank}.json", iterations.tolist())
 
         epoch_iterations.append(iterations[iterations > 1])
-        # if i >= 0: # Run a single epoch for testing
+        # if i >= 100: # Run a single epoch for testing
         #     break
     
     # Compute the average iterations for each layer

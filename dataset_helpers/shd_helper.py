@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from tqdm import tqdm
 import os
 
-def torch_SHD_loader(batch_size, shuffle=False, downsample=False, data_dir=""):
+def torch_SHD_loader(batch_size, shuffle=False, downsample=False, CNN_preprocess=False, data_dir=""):
     """
     Load SHD (Spiking Heidelberg Digits) dataset.
     
