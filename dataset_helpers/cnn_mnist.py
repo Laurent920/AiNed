@@ -340,20 +340,20 @@ class VGG8(nn.Module):
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 3: 256 filters
-        self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
-        self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.conv3_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        # self.conv3_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        # self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 4: 512 filters
-        self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False)
-        self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
+        # self.conv4_1 = nn.Conv2d(256, 512, kernel_size=3, padding=1, bias=False)
+        # self.conv4_2 = nn.Conv2d(512, 512, kernel_size=3, padding=1, bias=False)
         # self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
         # self.pool4 = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.pool4 = nn.AvgPool2d(kernel_size=2, stride=2)
+        # self.pool4 = nn.AvgPool2d(kernel_size=2, stride=2)
         
         # Fully connected layers
-        self.fc1 = nn.Linear(512, 512, bias=False)
-        self.out = nn.Linear(512, num_classes, bias=False)
+        self.fc1 = nn.Linear(7*7*128, 128, bias=False)
+        self.out = nn.Linear(128, num_classes, bias=False)
         
         # Activation stats (matching your format)
         self.activation_stats = {
@@ -386,14 +386,14 @@ class VGG8(nn.Module):
         x = self.pool2(x);           self._record_activation("pool2", x)
         
         # Block 3
-        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
-        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
-        x = self.pool3(x);           self._record_activation("pool3", x)
+        # x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        # x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        # x = self.pool3(x);           self._record_activation("pool3", x)
         
-        # Block 4
-        x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
-        x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
-        x = self.pool4(x);           self._record_activation("pool4", x)
+        # # Block 4
+        # x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
+        # x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
+        # x = self.pool4(x);           self._record_activation("pool4", x)
         
         # Flatten
         x = x.view(x.size(0), -1)
@@ -504,10 +504,10 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
     if dataset == "mnist":
         # Choose one:
         # model = SimpleCNN().to(device)
-        model = LeNet5().to(device)
+        # model = LeNet5().to(device)
 
         # model = VGG16(num_classes=10, in_channels=1).to(device)
-        # model = VGG8(num_classes=10, in_channels=1).to(device)
+        model = VGG8(num_classes=10, in_channels=1).to(device)
         # model = VGG8Light(num_classes=10, in_channels=1).to(device)
     elif dataset == "nmnist":
         # Choose one:

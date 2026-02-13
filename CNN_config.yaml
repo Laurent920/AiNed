@@ -40,6 +40,12 @@ dataset: mnist
 #   - [5, [3, 3], [1, 1], [1, 1], ""]   # Conv: 5 filters, 3x3 kernel, max pool
 #   - [128]                                  # FC: 120 units
 #   - [10]                                   # Output: 10 classes
+# layer_sizes:
+#   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+#   - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
+#   - [5, [3, 3], [1, 1], [1, 1], ""]   # Conv: 5 filters, 3x3 kernel, max pool
+#   - [128]                                  # FC: 120 units
+#   - [10]                                   # Output: 10 classes
 
 # ---------- LeNet-5 Style (MNIST) ----------
 # layer_sizes:
@@ -179,14 +185,14 @@ shuffle_activations: false
 shuffle_input: false
 
 firing_nb: 1
-firing_nb: [1, 1, 1, 1, 1]
+firing_nb: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 sync_rate: 1
 
 # ============================================================================
 # LEARNING AND REGULARIZATION
 # ============================================================================
 threshold_lr: 0.0
-sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 w_reg: 0.0
 top_weights: -1
 history_size: 0

@@ -1624,6 +1624,7 @@ def get_layer_idx(batch_size, layer_sizes):
     )
     print(f"Rank {rank}, layer idx: {layer_idx}, batch part: {batch_part}, process per layer: {process_per_layer}, last rank: {last_layer}")
 
+# region MAIN
 def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, config_path=None, data_dir=""):  
     global training_generator
     global validation_generator

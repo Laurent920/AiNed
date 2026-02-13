@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+import sys
 import jax.numpy as jnp
 from abc import ABC, abstractmethod
 try:
@@ -278,12 +279,12 @@ def mnist_loader_manual(batch_size,
         mnist_data_y_test = data['y']
     else:
         # Read all MNIST training data from the file
-        mnist_data = pd.read_csv(dataset_folder + 'mnist_train.csv')
+        mnist_data = pd.read_csv(dataset_folder + 'mnist_train.csv', header=None)
         mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
         mnist_data_y = mnist_data.iloc[:, 0].values
         
         # Read all MNIST test data from the file
-        mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv')
+        mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv', header=None)
         mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
         mnist_data_y_test = mnist_data.iloc[:, 0].values
 
@@ -353,6 +354,9 @@ def downsample_14x14(x):
         x = x.reshape(-1, 14, 2, 14, 2).mean(axis=(2, 4))
         return x.reshape(-1, 196)
 
+MNIST_MEAN = 0.1307
+MNIST_STD = 0.3081
+
 def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
     """
     Preprocess a single MNIST sample (1D vector).
@@ -363,7 +367,7 @@ def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
     for i, val in enumerate(x):
         if val != 0:
             if sequential:
-                processed_data[j] = [0, val]
+                processed_data[j] = [0, (val/255.0)]
             else:
                 processed_data[j] = [i, val]
             j += 1
@@ -439,7 +443,7 @@ if __name__ == "__main__":
         #     break
         torch_train(training_generator, train, test, params)
     else:    
-        batch_size = 36
+        batch_size = 1
         # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
         
         # d = iter(test_generator)
@@ -455,12 +459,16 @@ if __name__ == "__main__":
             preprocess=True, 
             CNN_preprocess=False, 
             downsample=False,
-            sequential=True
+            sequential=False
         )
-
+        print(f"Total train batches: {total_train_batches}, Total val batches: {total_val_batches}, Total test batches: {total_test_batches}")
         avg_non_zero = average_active_inputs(training_generator)
         print(f"Average non‑zero inputs per sample: {avg_non_zero:.2f}")
 
+        # for i, (batch_x, batch_y) in enumerate(test_generator):
+        #     print(f"Batch {i} x shape: {batch_x.shape}, y shape: {batch_y.shape}")
+
+        sys.exit(0)
         # Define neural network
         # layer_dims = (784, 128, 10)
         layer_size = []

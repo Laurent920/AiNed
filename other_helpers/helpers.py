@@ -133,6 +133,8 @@ class NeuronStates:
                  last_sent_iteration, 
                  input_vector, 
                  output_vector, 
+                 sync_rate_vector=None,
+                 recurrent_weight=None,
                  values_history=None,
                  history_index=None,
                  weights_shape=None, 
@@ -162,6 +164,8 @@ class NeuronStates:
         self.last_sent_iteration = last_sent_iteration
         self.input_vector = input_vector
         self.output_vector = output_vector
+        self.sync_rate_vector = sync_rate_vector
+        self.recurrent_weight = recurrent_weight
         self.values_history = values_history
         self.history_index = history_index
         self.weights_shape = weights_shape
@@ -172,8 +176,8 @@ class NeuronStates:
         children = (self.values, self.thresholds, self.input_residuals,
                     self.input_order, self.input_activity, self.layer_activity,
                     self.output_activity, self.last_sent_iteration, 
-                    self.input_vector, self.output_vector, 
-                    self.values_history, self.history_index,
+                    self.input_vector, self.output_vector, self.sync_rate_vector,
+                    self.recurrent_weight, self.values_history, self.history_index,
                     self.weights_shape, self.is_conv)
         aux_data = None  # no extra static data
         return children, aux_data
@@ -195,6 +199,8 @@ class NeuronStates:
             last_sent_iteration=updates.get("last_sent_iteration", self.last_sent_iteration),
             input_vector=updates.get("input_vector", self.input_vector),
             output_vector=updates.get("output_vector", self.output_vector),
+            sync_rate_vector=updates.get("sync_rate_vector", self.sync_rate_vector),
+            recurrent_weight=updates.get("recurrent_weight", self.recurrent_weight),
             values_history=updates.get("values_history", self.values_history),
             history_index=updates.get("history_index", self.history_index),
             weights_shape=updates.get("weights_shape", self.weights_shape),
@@ -260,13 +266,13 @@ class Params:
     batch_size: int
     load_file: bool
     shuffle_activations: bool   # Shuffle the activations in the network
-    restrict: int               # The amount of times a single neuron can fire accross all inputs, if negative then no restriction
-    firing_nb: int              # The maximum number of neurons that can fire for one input at each layer
-    sync_rate: int              # The number of inputs that needs to be accumulated before firing  
+    restrict: float| tuple[float]               # The amount of times a single neuron can fire accross all inputs, if negative then no restriction
+    firing_nb: int| tuple[int]              # The maximum number of neurons that can fire for one input at each layer
+    sync_rate: int| tuple[int]              # The number of inputs that needs to be accumulated before firing  
     max_nonzero: int
     shuffle_input:bool          # Shuffle the input data 
     threshold_lr: float
-    sparsity_impact: float
+    sparsity_impact: float| tuple[float]
     w_reg: float                # Weight regularization factor
     rerun: str
     top_weights: int            # The top number of weights ranked by absolute value that we want to use to integrate an input value, -1 means use all the weights # The layer that is training asynchronously while all other layers are training sync, if -1 then all layers are async
@@ -535,6 +541,7 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "restrict": params.restrict,
         "sparsity impact": params.sparsity_impact,
         "weight regularization": params.w_reg,
+        "threshold init": params.init_thresholds,
         "threshold lr": params.threshold_lr,
         "test accuracy": test_accuracy,
         "layer_sizes": params.layer_sizes,
