@@ -31,13 +31,14 @@ dataset: mnist
 layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
-# layer_sizes: [784, 128, 10]
+layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
 dataset: smnist
 layer_sizes: [1, 256, 256, 10] 
+# layer_sizes: [1, 256, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
 # dataset: psmnist
@@ -56,13 +57,12 @@ layer_sizes: [1, 256, 256, 10]
 # layer_sizes: [32768, 128, 128, 11]
 # layer_sizes: [8192, 128, 11]  # 64*64*2
 
-recurrence: [null, 1, 1, null]
 mode: training
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 2            # Number of training epochs
+num_epochs: 5            # Number of training epochs
 learning_rate: 0.0001       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 
@@ -96,17 +96,17 @@ override_params: null
 # ============================================================================
 # NEURON BEHAVIOR
 # ============================================================================
-restrict: null
+restrict: 1
 init_thresholds: 0.0
 shuffle_activations: false
 shuffle_input: false
-firing_nb: 10000
+firing_nb: 1
 sync_rate: 1
 # ============================================================================
 # LEARNING AND REGULARIZATION
 # ============================================================================
 threshold_lr: 0.0
-sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0]
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 w_reg: 0.0
 top_weights: -1
 history_size: 0

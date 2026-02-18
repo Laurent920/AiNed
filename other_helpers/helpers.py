@@ -126,6 +126,7 @@ class NeuronStates:
                  values, 
                  thresholds, 
                  input_residuals, 
+                 output_residuals,
                  input_order, 
                  input_activity, 
                  layer_activity, 
@@ -145,6 +146,7 @@ class NeuronStates:
         values: jnp.ndarray             # Current state of the neurons in the layer, shape: (layer_sizes[rank],) __ (128,)
         thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
         input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
+        output_residuals: jnp.ndarray   # Sum of all output neurons, shape: (layer_sizes[rank],) __ (128,)
         input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
         input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
         layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
@@ -157,6 +159,7 @@ class NeuronStates:
         self.values = values
         self.thresholds = thresholds
         self.input_residuals = input_residuals
+        self.output_residuals = output_residuals
         self.input_order = input_order
         self.input_activity = input_activity
         self.layer_activity = layer_activity
@@ -173,7 +176,7 @@ class NeuronStates:
 
     # Tell JAX how to flatten this object
     def tree_flatten(self):
-        children = (self.values, self.thresholds, self.input_residuals,
+        children = (self.values, self.thresholds, self.input_residuals, self.output_residuals,
                     self.input_order, self.input_activity, self.layer_activity,
                     self.output_activity, self.last_sent_iteration, 
                     self.input_vector, self.output_vector, self.sync_rate_vector,
@@ -192,6 +195,7 @@ class NeuronStates:
             values=updates.get("values", self.values),
             thresholds=updates.get("thresholds", self.thresholds),
             input_residuals=updates.get("input_residuals", self.input_residuals),
+            output_residuals=updates.get("output_residuals", self.output_residuals),
             input_order=updates.get("input_order", self.input_order),
             input_activity=updates.get("input_activity", self.input_activity),
             layer_activity=updates.get("layer_activity", self.layer_activity),
@@ -279,6 +283,7 @@ class Params:
     history_size: int = 0       # Size of history you want to store
     max_kernel: int = None      # The maximum size of flattened kernel
     flat_layer_sizes: tuple[int, ...] = None
+    recurrence: tuple[int, ...] | None = None
 
 #region RERUN
 def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
@@ -767,7 +772,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         #   N-MNIST: (34*34*2, 256, 10)
         #   DVS Gesture: (128*128*2, 128, 11) or (64*64*2, 128, 11)
         'layer_sizes': (784, 256, 10),
-        
+        'recurrence':(None, None, None), # No recurrence by default
         # Training parameters
         'batch_size': 36,
         'num_epochs': 10,

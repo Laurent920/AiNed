@@ -44,7 +44,7 @@ from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults
-from other_helpers.backpropagation import back_prop
+from other_helpers.backpropagation import MLP_back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 from other_helpers.event_pooling import output_to_event_array_with_pooling, full_matrix_to_event_array_with_pooling
@@ -489,9 +489,12 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
             activated_output = keep_top_k(activated_output, f_nb[layer_idx]) # Get the top k activations
                 
         # APPLY THE RESTRICTION
-        penalty = jax.lax.cond(params.restrict[layer_idx] <= 0,
+        reset = params.restrict
+        if not isinstance(reset, int):
+            reset = reset[layer_idx]
+        penalty = jax.lax.cond(reset <= 0,
                                lambda _: activated_output, 
-                               lambda _: activated_output*params.restrict[layer_idx], None)
+                               lambda _: activated_output*reset, None)
         
         if grad:
             # Update the layer activity by adding the neurons that activated
@@ -620,11 +623,14 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
         )
         # jax.debug.print("rank {}, activity_slice {}, new activity_slice {}, fire_mask {}, final activity slice {}", 
         #                 rank, activity_slice, ne_activity_slice, fire_mask, new_activity_slice)
-
+        
+        reset = params.restrict
+        if not isinstance(reset, int):
+            reset = reset[layer_idx]
         # Step 8: Apply the restriction
-        penalty = jax.lax.cond( params.restrict[layer_idx] <= 0, 
+        penalty = jax.lax.cond( reset <= 0, 
                                 lambda _: activated_output, 
-                                lambda _: activated_output*params.restrict[layer_idx], None)
+                                lambda _: activated_output*reset, None)
         
         # Step 9: Compute remaining values
         remaining_value = updated_values_slice - penalty
@@ -932,7 +938,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     next_grad = recv(jnp.zeros((batch_part,) + params.flat_layer_sizes[layer_idx]), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
 
     # Compute input's gradient and weight gradient
-    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, layer_idx)
+    weight_grad, th_grad, weight_res = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
 
     if layer_idx > 1:

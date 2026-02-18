@@ -34,12 +34,12 @@ mode: training
 
 # ---------- Small network ----------
 dataset: mnist
-# layer_sizes:
-#   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
-#   - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
-#   - [5, [3, 3], [1, 1], [1, 1], ""]   # Conv: 5 filters, 3x3 kernel, max pool
-#   - [128]                                  # FC: 120 units
-#   - [10]                                   # Output: 10 classes
+layer_sizes:
+  - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+  - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
+  - [5, [3, 3], [1, 1], [1, 1], ""]   # Conv: 5 filters, 3x3 kernel, max pool
+  - [128]                                  # FC: 120 units
+  - [10]                                   # Output: 10 classes
 # layer_sizes:
 #   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
 #   - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
@@ -57,15 +57,15 @@ dataset: mnist
 #   - [10]                                   # Output: 10 classes
 
 # ---------- VGG-8 Style (MNIST) ----------
-layer_sizes:
-  - [1, 28, 28]                           # Input
-  - [32, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
-  - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
-  - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
-  - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
-  - [256]                                  # FC layer
-  - [128]                                  # FC layer
-  - [10]                                   # Output
+# layer_sizes:
+#   - [1, 28, 28]                           # Input
+#   - [32, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
+#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+#   - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
+#   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
+#   - [256]                                  # FC layer
+#   - [128]                                  # FC layer
+#   - [10]                                   # Output
 
 # ---------- VGG-16 Style (MNIST) ----------
 # layer_sizes:

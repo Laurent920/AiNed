@@ -29,15 +29,16 @@
 
 dataset: mnist
 layer_sizes: [784, 256, 256, 10]
-# layer_sizes: [784, 256, 10]
+layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
-layer_sizes: [784, 128, 10]
+# layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
 dataset: smnist
 layer_sizes: [1, 256, 256, 10] 
+layer_sizes: [1, 256, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
 # dataset: psmnist
@@ -49,13 +50,14 @@ layer_sizes: [1, 256, 256, 10]
 
 dataset: shd
 layer_sizes: [700, 256, 20]
-# layer_sizes: [700, 256, 256, 20]
+layer_sizes: [700, 256, 256, 20]
 
 # dataset: dvs
 # layer_sizes: [32768, 128, 11] # 128*128*2
 # layer_sizes: [32768, 128, 128, 11]
 # layer_sizes: [8192, 128, 11]  # 64*64*2
 
+recurrence: [null, 1, 1, null]
 mode: training
 # ============================================================================
 # TRAINING PARAMETERS
@@ -100,12 +102,12 @@ init_thresholds: 0.0
 shuffle_activations: false
 shuffle_input: false
 firing_nb: 1
-sync_rate: 16
+sync_rate: 1
 # ============================================================================
 # LEARNING AND REGULARIZATION
 # ============================================================================
 threshold_lr: 0.0
-sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0]
 w_reg: 0.0
 top_weights: -1
 history_size: 0

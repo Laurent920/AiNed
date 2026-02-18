@@ -238,6 +238,8 @@ def mnist_loader_manual(batch_size,
                         data_dir="",
                         cache_dir='./cache/mnist'):
     max_nonzero = 351
+    if sequential:
+        max_nonzero = 784
     dataset_folder = os.path.join(data_dir, "data/mnist/")
     cache_dir = os.path.join(data_dir, cache_dir)
 
@@ -362,17 +364,21 @@ def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
     Preprocess a single MNIST sample (1D vector).
     Stores (index, value) for non-zero pixels up to max_nonzero.
     """
+    if sequential:
+        max_nonzero
     processed_data = np.full((max_nonzero, 2), -2.0, dtype=np.float32)
     j = 0
     for i, val in enumerate(x):
-        if val != 0:
-            if sequential:
-                processed_data[j] = [0, (val/255.0)]
-            else:
-                processed_data[j] = [i, val]
+        if sequential:
+            processed_data[j] = [0, val]
+            # processed_data[j] = [0, float(val)/255.0]
             j += 1
-            if j >= max_nonzero:  # stop if full
-                break
+        else:
+            if val != 0:
+                processed_data[j] = [i, val]
+                j += 1
+                if j >= max_nonzero:  # stop if full
+                    break
     return jnp.array(processed_data)
 
 def preprocess_dataset(dataset_x, max_nonzero, sequential):

@@ -47,7 +47,7 @@ from dataset_helpers.cnn_mnist import get_weights_for_rank
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init
 from other_helpers.helpers import update_history, process_history
-from other_helpers.backpropagation import back_prop
+from other_helpers.backpropagation import MLP_back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 from other_helpers.event_pooling import output_to_event_array_with_pooling, full_matrix_to_event_array_with_pooling
@@ -997,7 +997,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     #                                lambda _: (next_weight_res), None) 
     # jax.debug.print("Rank {} received next_grad shape: {}", rank, next_weight_res)
 
-    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, split_rank)
+    weight_grad, th_grad, weight_res = MLP_back_prop(params, all_neuron_states, next_grad, split_rank)
     weight_grad += 2 * params.w_reg * weights
 
     if split_rank > 1:

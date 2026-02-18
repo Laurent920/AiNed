@@ -41,7 +41,7 @@ from dataset_helpers.network_helper import one_hot_encode
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init
 from other_helpers.helpers import update_history, process_history
-from other_helpers.backpropagation import back_prop
+from other_helpers.backpropagation import MLP_back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.general_MPI_helper import concatenate_model_partition, data_split, model_split 
 from other_helpers.general_MPI_helper import forward_send, forward_recv, backward_send, backward_recv, send_labels, recv_labels
@@ -450,7 +450,7 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     next_grad = next_grad[:, mpi_config.model_part.start_idx:mpi_config.model_part.end_idx+1] # Shape: (B, layer_size)
     # next_grad = recv(jnp.zeros((batch_part_size, params.layer_sizes[layer_idx])), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
     # jax.debug.print("Rank {} received next_grad shape: {}, next grad mean {}", rank, next_grad.shape, jnp.mean(next_grad))
-    weight_grad, th_grad, weight_res = back_prop(params, all_neuron_states, next_grad, layer_idx)
+    weight_grad, th_grad, weight_res = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
 
     if layer_idx > 1:
