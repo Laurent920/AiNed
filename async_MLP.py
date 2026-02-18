@@ -36,7 +36,7 @@ from dataset_helpers.network_helper import one_hot_encode
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
-from other_helpers.helpers import update_history, process_history, load_config_with_defaults
+from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from other_helpers.backpropagation import MLP_back_prop, RNN_back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
@@ -1241,7 +1241,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
     # Load configuration from file or use defaults
     config = load_config_with_defaults(config_path)
-    
+    config = parse_unknown_args_and_overrides_config(unknown, config)
+
     # Extract configuration parameters
     dataset = config['dataset']
     layer_sizes = tuple(config['layer_sizes'])
@@ -1403,7 +1404,7 @@ if __name__ == "__main__":
                        help='Random seed (default: 42)')
     parser.add_argument('--data_dir', type=str, default="",
                        help='Directory for storing and reading the datasets (default: current directory/data/)')
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     
     random_seed = args.seed
     key = jax.random.key(random_seed)

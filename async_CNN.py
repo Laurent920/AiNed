@@ -43,7 +43,7 @@ from dataset_helpers.cnn_mnist import get_weights_for_rank
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
-from other_helpers.helpers import update_history, process_history, load_config_with_defaults
+from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from other_helpers.backpropagation import MLP_back_prop
 from other_helpers.loss_functions import loss_bpp, mean_loss
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
@@ -229,6 +229,7 @@ class Network:
                                     values=jnp.zeros(layer),
                                     thresholds=thresholds,
                                     input_residuals=jnp.zeros((prev_size,)),
+                                    output_residuals=jnp.zeros(layer),
                                     input_order=jnp.full((prev_size,), -1, dtype=int),
                                     input_activity=jnp.zeros((prev_size,), dtype=int),
                                     layer_activity=jnp.zeros((layer[0],), dtype=int),
@@ -292,6 +293,7 @@ class Network:
                     values=values,
                     thresholds=thresholds,
                     input_residuals=jnp.zeros(previous_layer.shape),
+                    output_residuals=jnp.zeros(values.shape),
                     input_order=jnp.full(previous_layer.shape, -1, dtype=int),
                     input_activity=jnp.zeros(previous_layer.shape, dtype=int),
                     layer_activity=jnp.zeros(values.shape),
@@ -458,6 +460,7 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
         return jnp.array(0), jnp.zeros((activations.shape[0], 4)), NeuronStates(  values=activations, 
                                                                     thresholds=neuron_states.thresholds, 
                                                                     input_residuals=new_input_residuals, 
+                                                                    output_residuals=neuron_states.output_residuals, 
                                                                     input_order=neuron_states.input_order, 
                                                                     input_activity=new_input_activity,
                                                                     layer_activity=neuron_states.layer_activity,
@@ -497,6 +500,8 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
                                lambda _: activated_output*reset, None)
         
         if grad:
+            new_output_residuals = neuron_states.output_residuals + activated_output 
+
             # Update the layer activity by adding the neurons that activated
             active_indexes = jnp.where(activated_output > 0, 1, 0)
             new_layer_activity = neuron_states.layer_activity + active_indexes
@@ -517,6 +522,7 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
                                         iteration+1,
                                         neuron_states.output_vector)
         else:
+            new_output_residuals=neuron_states.output_residuals
             new_layer_activity = neuron_states.layer_activity
             new_input_order = neuron_states.input_order
             new_output_activity = neuron_states.output_activity
@@ -528,6 +534,7 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
         new_neuron_states = NeuronStates(   values=activations - penalty, 
                                             thresholds=neuron_states.thresholds, 
                                             input_residuals=new_input_residuals, 
+                                            output_residuals=new_output_residuals, 
                                             input_order=new_input_order, 
                                             input_activity=new_input_activity,
                                             layer_activity=new_layer_activity,
@@ -695,6 +702,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                             NeuronStates(values=new_values,
                                                 thresholds=neuron_states.thresholds,
                                                 input_residuals=new_input_residuals,
+                                                output_residuals=neuron_states.output_residuals,
                                                 input_order=neuron_states.input_order,
                                                 input_activity=new_input_activity,
                                                 layer_activity=new_layer_activity,
@@ -758,6 +766,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
                                             NeuronStates(values=remaining_value,
                                                 thresholds=neuron_states.thresholds,
                                                 input_residuals=neuron_states.input_residuals,
+                                                output_residuals=neuron_states.output_residuals,
                                                 input_order=neuron_states.input_order,
                                                 input_activity=jnp.ones(neuron_states.input_activity.shape, dtype=int),
                                                 layer_activity=new_layer_activity,
@@ -1646,7 +1655,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     
     # Load configuration from file or use defaults
     config = load_config_with_defaults(config_path)
-    
+    config = parse_unknown_args_and_overrides_config(unknown, config)
+
     # Extract configuration parameters
     dataset = config['dataset']
     layer_sizes = tuple(config['layer_sizes'])
@@ -1793,7 +1803,7 @@ if __name__ == "__main__":
                        help='Random seed (default: 42)')
     parser.add_argument('--data_dir', type=str, default="",
                        help='Directory for storing and reading the datasets (default: current directory/data/)')
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
     
     random_seed = args.seed
     key = jax.random.key(random_seed)

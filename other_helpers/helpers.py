@@ -846,3 +846,25 @@ def make_hashable(item):
     if isinstance(item, (list, tuple)):
         return tuple(make_hashable(i) for i in item)
     return item
+
+# region parse_unknown_args
+def parse_unknown_args_and_overrides_config(unknown, config):
+    overrides = {}
+    key = None
+
+    for item in unknown:
+        if item.startswith("--"):
+            key = item.lstrip("-")
+        else:
+            if key is None:
+                raise ValueError(f"Unexpected value {item}")
+            overrides[key] = item
+            key = None
+
+    for k, v in overrides.items():
+        if k in config:
+            # Auto-cast to correct type
+            config[k] = type(config[k])(v)
+        else:
+            raise ValueError(f"Unknown config key: {k}")
+    return config
