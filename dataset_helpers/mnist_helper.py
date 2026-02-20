@@ -258,7 +258,7 @@ def mnist_loader_manual(batch_size,
             cache_dir_add += "_14"
         
         if sequential:
-            cache_dir_add += "_sequential"
+            cache_dir_add += "_sequential_mean0"
         
         if permuted:
             cache_dir_add += "_permuted"
@@ -370,8 +370,9 @@ def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
     j = 0
     for i, val in enumerate(x):
         if sequential:
-            processed_data[j] = [0, val]
+            # processed_data[j] = [0, val]
             # processed_data[j] = [0, float(val)/255.0]
+            processed_data[j] = [0, ((float(val)/255.0)-MNIST_MEAN)/MNIST_STD]
             j += 1
         else:
             if val != 0:

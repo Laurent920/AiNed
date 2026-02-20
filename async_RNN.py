@@ -73,7 +73,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     # jax.debug.print("Original weights {}, filtered wights {}", weights[neuron_idx], filtered_weights)
     activations = jax.lax.cond(neuron_idx < 0,
                             lambda _: neuron_states.values,
-                            lambda _: jnp.dot(layer_input, filtered_weights) + neuron_states.values,
+                            lambda _: jnp.dot(layer_input, filtered_weights) + neuron_states.values + neuron_states.bias, 
                             None
                             )
     #TODO: being able to compute multiple incoming index neurons
@@ -107,6 +107,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
 
         dummy_activations = jnp.zeros((activations.shape[0], 2))
         return jnp.array(0), dummy_activations, NeuronStates(   values=activations, 
+                                                                bias=neuron_states.bias,
                                                                 thresholds=neuron_states.thresholds, 
                                                                 input_residuals=new_input_residuals, 
                                                                 output_residuals=neuron_states.output_residuals, 
@@ -141,7 +142,11 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
         # jax.debug.print("rank {}, iteration {}, sync_fire: {}, activations {}, activated_output {}", rank, iteration, sync_fire, activations, activated_output)
 
         # APPLY THE FIRING NUMBER        
-        activated_output = keep_top_k(activated_output, params.firing_nb) # Get the top k activations
+        f_nb = params.firing_nb
+        if isinstance(f_nb, int):
+            activated_output = keep_top_k(activated_output, f_nb) # Get the top k activations
+        else:
+            activated_output = keep_top_k(activated_output, f_nb[layer_idx]) # Get the top k activations
         
         # APPLY THE RESTRICTION
         penalty = jax.lax.cond(params.restrict[layer_idx] <= 0,
@@ -181,7 +186,8 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
         recurrent_activation = jnp.dot(activated_output, neuron_states.recurrent_weight) # Shape (128,)
         # recurrent_activation = jnp.zeros(activations.shape) # Shape (128,)
         # jax.debug.print("rank {}, neuron idx {}, activations {}, activated_output {}, penalty {}, recurrent_activation {}", rank, neuron_idx, activations, activated_output, penalty, recurrent_activation)
-        new_neuron_states = NeuronStates(   values=activations - penalty + recurrent_activation, 
+        new_neuron_states = NeuronStates(   values=activations - penalty + recurrent_activation,
+                                            bias=neuron_states.bias, 
                                             thresholds=neuron_states.thresholds, 
                                             input_residuals=new_input_residuals, 
                                             output_residuals=new_output_residuals, 
@@ -391,8 +397,8 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     th_sparsity_grad = -sparsity_residuals
     weight_sparsity_grad = jnp.outer(input_activity, sparsity_residuals) # Shape: (784, 128)
     # jax.debug.print("Rank {}, th_sparsity_grad: {}, weight_sparsity_grad: {}", rank, jnp.mean(th_sparsity_grad), np.mean(weight_sparsity_grad))
-    
-    return all_outputs, iterations, all_neuron_states, (weight_grad, th_grad, weight_sparsity_grad, th_sparsity_grad, recurrent_weight_grad) 
+
+    return all_outputs, iterations, all_neuron_states, (weight_grad, th_grad, weight_sparsity_grad, th_sparsity_grad, recurrent_weight_grad, jnp.mean(next_grad, axis=0)) 
 
 # Define the loss function
 @partial(jax.jit, static_argnames=['params'])
@@ -511,6 +517,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         solver = None
     if solver is not None:
         opt_state = solver.init(weights)
+        bias_opt_state = solver.init(empty_neuron_states.bias)
     if params.recurrence[layer_idx] is not None:
         recurrent_opt_state = solver.init(empty_neuron_states.recurrent_weight)
 
@@ -578,7 +585,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                 else: 
                     # Run the forward and backward pass for the hidden layers
                     outputs, iterations, all_neuron_states, grads = (predict_bwd)(params, subkey, weights, neuron_states, jnp.zeros((batch_part, params.layer_sizes[0])))
-                    weight_grad, threshold_grad, weight_sparsity_grad, threshold_sparsity_grad, recurrent_weight_grad = grads
+                    weight_grad, threshold_grad, weight_sparsity_grad, threshold_sparsity_grad, recurrent_weight_grad, next_grad = grads
 
                     threshold_grad = gather_batch(threshold_grad, mpi_config, average=True) # Gather the thresholds' gradients from all ranks in the same layer
                     
@@ -611,8 +618,12 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                         new_recurrence_weights = neuron_states.recurrent_weight
                     # new_recurrence_weights = neuron_states.recurrent_weight
                     
+                    b = empty_neuron_states.bias
+                    bias_updates, bias_opt_state = solver.update(next_grad, bias_opt_state, b)
+                    new_bias = optax.apply_updates(b, bias_updates)
                     empty_neuron_states = NeuronStates(
                                             values=empty_neuron_states.values, 
+                                            bias=new_bias,
                                             thresholds=new_thresholds, 
                                             input_residuals=empty_neuron_states.input_residuals, 
                                             output_residuals=empty_neuron_states.output_residuals, 
@@ -1087,7 +1098,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         print(f"Error: one batch ({batch_size}) must be divisible by the number of processes per layer ({process_per_layer})")
         sys.exit(1)
     
-    for f_nb in [128]: # Loop for multiple experiments
+    # for f_nb in [2, 4, 8, 16, 32]: # Loop for multiple experiments
+    for f_nb in [1]: # Loop for multiple experiments
         # Initialize parameters (input data for rank 0 and weights for other ranks)
         key, subkey = jax.random.split(key) 
         total_train_batches, total_val_batches, total_test_batches, max_nonzero = 0, 0, 0, 0
@@ -1148,6 +1160,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             load_file=load_file,
             shuffle_activations=config['shuffle_activations'],
             restrict=restrict,
+            # firing_nb=f_nb,
             firing_nb=config['firing_nb'],
             sync_rate=config['sync_rate'],
             max_nonzero=max_nonzero,
@@ -1182,6 +1195,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
         key, subkey = jax.random.split(key) 
         empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
+                                            bias=jnp.zeros(layer_sizes[layer_idx]),
                                             thresholds=thresholds,
                                             input_residuals=np.zeros((layer_sizes[layer_idx-1],)),
                                             output_residuals=np.zeros((layer_sizes[layer_idx],)),

@@ -227,6 +227,7 @@ class Network:
                 thresholds = jnp.full(layer, params.init_thresholds)
                 empty_neuron_states = NeuronStates(
                                     values=jnp.zeros(layer),
+                                    bias=jnp.zeros(layer),
                                     thresholds=thresholds,
                                     input_residuals=jnp.zeros((prev_size,)),
                                     output_residuals=jnp.zeros(layer),
@@ -291,6 +292,7 @@ class Network:
                 weights_shape = (out_chan, in_chan, kernel[0], kernel[1])
                 neuron_state = NeuronStates(
                     values=values,
+                    bias=jnp.zeros(values.shape),
                     thresholds=thresholds,
                     input_residuals=jnp.zeros(previous_layer.shape),
                     output_residuals=jnp.zeros(values.shape),
@@ -458,6 +460,7 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
             new_values_history, new_history_index = update_history(new_values_history, new_history_index, activations)
 
         return jnp.array(0), jnp.zeros((activations.shape[0], 4)), NeuronStates(  values=activations, 
+                                                                    bias=neuron_states.bias,                                                                                
                                                                     thresholds=neuron_states.thresholds, 
                                                                     input_residuals=new_input_residuals, 
                                                                     output_residuals=neuron_states.output_residuals, 
@@ -532,6 +535,7 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
         
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
         new_neuron_states = NeuronStates(   values=activations - penalty, 
+                                            bias=neuron_states.bias,
                                             thresholds=neuron_states.thresholds, 
                                             input_residuals=new_input_residuals, 
                                             output_residuals=new_output_residuals, 
@@ -700,6 +704,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
 
         new_neuron_states = ConvNeuronStates(neuron_state=
                                             NeuronStates(values=new_values,
+                                                bias=neuron_states.bias,
                                                 thresholds=neuron_states.thresholds,
                                                 input_residuals=new_input_residuals,
                                                 output_residuals=neuron_states.output_residuals,
@@ -764,6 +769,7 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
         
         new_neuron_states = ConvNeuronStates(neuron_state=
                                             NeuronStates(values=remaining_value,
+                                                bias=neuron_states.bias,
                                                 thresholds=neuron_states.thresholds,
                                                 input_residuals=neuron_states.input_residuals,
                                                 output_residuals=neuron_states.output_residuals,
@@ -1770,6 +1776,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 empty_neuron_states = network.rerun(thresholds)
 
         params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes)
+        network = dataclasses.replace(network, params=params)
 
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")

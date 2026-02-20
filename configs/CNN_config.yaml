@@ -12,7 +12,7 @@
 
 # Choose either 'training' or 'inference'
 mode: training
-# mode: inference
+mode: inference
 # ============================================================================
 # CNN ARCHITECTURE
 # ============================================================================
@@ -158,7 +158,7 @@ best: false                 # Legacy parameter, keep as false
 # rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_P2x2_L15_L10_acc0.912_adam_.json"
 
 rerun : network_results/mnist/training/CNN/sync/load_false/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json
-rerun: null
+# rerun: null
 
 # List of parameters to override from the loaded model
 # Leave empty or null to use all parameters from the file
@@ -166,7 +166,6 @@ override_params: null
 # Common overrides for CNN fine-tuning:
 # override_params:
 #   - learning_rate      # Lower learning rate for fine-tuning
-#   - num_epochs         # More epochs
 #   - threshold_lr       # Enable adaptive thresholds
 #   - sparsity_impact    # Add sparsity regularization
 

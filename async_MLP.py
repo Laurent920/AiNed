@@ -108,6 +108,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
 
         dummy_activations = jnp.zeros((activations.shape[0], 2))
         return jnp.array(0), dummy_activations, NeuronStates(   values=activations, 
+                                                                bias=neuron_states.bias,
                                                                 thresholds=neuron_states.thresholds, 
                                                                 input_residuals=new_input_residuals, 
                                                                 output_residuals=neuron_states.output_residuals, 
@@ -186,6 +187,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
 
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
         new_neuron_states = NeuronStates(   values=activations - penalty, 
+                                            bias=neuron_states.bias,
                                             thresholds=neuron_states.thresholds, 
                                             input_residuals=new_input_residuals, 
                                             output_residuals=new_output_residuals, 
@@ -598,6 +600,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                                                                                  
                         empty_neuron_states = NeuronStates(
                                                 values=empty_neuron_states.values, 
+                                                bias=neuron_states.bias,
                                                 thresholds=new_thresholds, 
                                                 input_residuals=empty_neuron_states.input_residuals, 
                                                 output_residuals=empty_neuron_states.output_residuals, 
@@ -1366,6 +1369,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         layer_key = jax.random.fold_in(key, layer_idx)
         sync_rate_vector = jax.random.randint(layer_key, shape=(layer_sizes[layer_idx],), minval=1, maxval=params.sync_rate)
         empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
+                                            bias=jnp.zeros(layer_sizes[layer_idx]),
                                             thresholds=thresholds,
                                             input_residuals=np.zeros((layer_sizes[layer_idx-1],)),
                                             output_residuals=np.zeros((layer_sizes[layer_idx],)),

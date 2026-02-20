@@ -124,6 +124,7 @@ def output_vector_to_event(key, arr: jnp.ndarray, params, max_len):
 class NeuronStates:
     def __init__(self, 
                  values, 
+                 bias,
                  thresholds, 
                  input_residuals, 
                  output_residuals,
@@ -157,6 +158,7 @@ class NeuronStates:
         is_conv                         # Is convolution layer               
         '''
         self.values = values
+        self.bias = bias
         self.thresholds = thresholds
         self.input_residuals = input_residuals
         self.output_residuals = output_residuals
@@ -176,7 +178,7 @@ class NeuronStates:
 
     # Tell JAX how to flatten this object
     def tree_flatten(self):
-        children = (self.values, self.thresholds, self.input_residuals, self.output_residuals,
+        children = (self.values, self.bias, self.thresholds, self.input_residuals, self.output_residuals,
                     self.input_order, self.input_activity, self.layer_activity,
                     self.output_activity, self.last_sent_iteration, 
                     self.input_vector, self.output_vector, self.sync_rate_vector,
@@ -193,6 +195,7 @@ class NeuronStates:
         """Return a new NeuronStates object with some fields replaced."""
         return NeuronStates(
             values=updates.get("values", self.values),
+            bias=updates.get("bias", self.bias),
             thresholds=updates.get("thresholds", self.thresholds),
             input_residuals=updates.get("input_residuals", self.input_residuals),
             output_residuals=updates.get("output_residuals", self.output_residuals),
@@ -571,6 +574,7 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         fig, ax1 = plt.subplots(figsize=(8, 5))
         ax1.plot(epochs, all_epoch_accuracies, 'o-', label='Training Accuracy')
         ax1.plot(epochs, all_validation_accuracies, 's-', label='Validation Accuracy')
+        ax1.axhline(test_accuracy, color='red', linestyle='--', label=f'Test Accuracy ({test_accuracy:.4f})')
         ax1.set_xlabel('Epoch')
         ax1.set_ylabel('Accuracy')
         ax1.set_title(f"Final Val Acc: {all_validation_accuracies[-1]:.4f} | Final Train Acc: {all_epoch_accuracies[-1]:.4f}")

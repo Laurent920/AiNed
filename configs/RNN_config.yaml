@@ -29,16 +29,16 @@
 
 dataset: mnist
 layer_sizes: [784, 256, 256, 10]
-layer_sizes: [784, 256, 10]
+# layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
 # layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
-dataset: smnist
-layer_sizes: [1, 256, 256, 10] 
-layer_sizes: [1, 256, 10] 
+# dataset: smnist
+# layer_sizes: [1, 256, 256, 10] 
+# layer_sizes: [1, 128, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
 # dataset: psmnist
@@ -48,9 +48,9 @@ layer_sizes: [1, 256, 10]
 # layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 
-dataset: shd
-layer_sizes: [700, 256, 20]
-layer_sizes: [700, 256, 256, 20]
+# dataset: shd
+# layer_sizes: [700, 128, 20]
+# layer_sizes: [700, 128, 128, 20]
 
 # dataset: dvs
 # layer_sizes: [32768, 128, 11] # 128*128*2
@@ -63,7 +63,7 @@ mode: training
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 5            # Number of training epochs
+num_epochs: 2            # Number of training epochs
 learning_rate: 0.0001       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 
@@ -102,6 +102,7 @@ init_thresholds: 0.0
 shuffle_activations: false
 shuffle_input: false
 firing_nb: 1
+# firing_nb: [1, 2, 1, 1, 1, 1, 1, 1, 1]
 sync_rate: 1
 # ============================================================================
 # LEARNING AND REGULARIZATION

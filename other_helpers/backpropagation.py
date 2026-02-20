@@ -112,7 +112,7 @@ def compute_full_RNN_bpp(params, all_neuron_states, next_grad, layer_idx):
     Return:
         weight_grad, shape: (784, 128)
     '''
-    weight_res = jnp.where(all_neuron_states.output_residuals == 0, 0, 1)
+    weight_res = jnp.where(all_neuron_states.output_residuals == 0, 0, 1) # Shape: (128)
 
     # (4) Shape: (784, 128)
     next_grad_expanded = jnp.expand_dims(next_grad, axis=0)  # Shape: (1, 128)
