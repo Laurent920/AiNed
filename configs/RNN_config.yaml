@@ -28,17 +28,17 @@
 #   - [8192, 128, 11]   # 64*64*2
 
 dataset: mnist
-layer_sizes: [784, 256, 256, 10]
-# layer_sizes: [784, 256, 10]
+# layer_sizes: [784, 256, 256, 10]
+layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
-# layer_sizes: [784, 128, 10]
+layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
-# dataset: smnist
-# layer_sizes: [1, 256, 256, 10] 
-# layer_sizes: [1, 128, 10] 
+dataset: smnist
+layer_sizes: [1, 256, 256, 10] 
+layer_sizes: [1, 256, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
 # dataset: psmnist
@@ -58,11 +58,15 @@ layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [8192, 128, 11]  # 64*64*2
 
 recurrence: [null, 1, 1, null]
+# recurrence: [null, null, null, null]
 mode: training
+use_bias: false
+use_tanh: true  # Set to true to apply tanh to the hidden state update
+use_tanh: false
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
-batch_size: 36             # Number of samples per batch
+batch_size: 120             # Number of samples per batch
 num_epochs: 2            # Number of training epochs
 learning_rate: 0.0001       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
@@ -74,12 +78,13 @@ best: false
 # Example: rerun = network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.974_adam_.json
 # rerun: network_results/mnist/training/MLP/42_ep2_b36_784_256_256_10_acc0.963_adam_.json
 rerun: null
-# rerun: network_results/mnist/training/MLP/sync1_fnb1_2/42_ep200_b36_784_256_256_10_acc0.981_adam_.json
+# rerun: network_results/mnist/training/RNN/recurrence_with_activated_output/42_ep2_b36_784_256_256_10_acc0.943_adam_.json
 
 # List of parameters to override from the loaded model
 # Leave empty or null to use all parameters from the file
 override_params: null
 # override_params:
+#   - recurrence
   # - batch_size
   # - learning_rate
   # - restrict

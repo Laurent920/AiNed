@@ -17,8 +17,8 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 20
-batch_size = 36
+epochs = 5
+batch_size = 120
 
 dataset = "mnist"
 # dataset = "nmnist"
@@ -420,27 +420,28 @@ class VGG8Light(nn.Module):
         
         # Block 1: 32 filters
         self.conv1_1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False)
-        self.conv1_2 = nn.Conv2d(32, 32, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 2: 64 filters
-        self.conv2_1 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False)
-        self.conv2_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.conv2_2 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
         self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 3: 128 filters
-        self.conv3_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
-        self.conv3_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
-        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.conv3_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        # self.conv3_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        # self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
         
-        # Block 4: 256 filters
-        self.conv4_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
-        self.conv4_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
-        self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
+        # # Block 4: 256 filters
+        # self.conv4_1 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        # self.conv4_2 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+        # self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
         
         # FC layers
-        self.fc1 = nn.Linear(256, 256, bias=False)
-        self.out = nn.Linear(256, num_classes, bias=False)
+        self.fc1 = nn.Linear(256*7*7, 256, bias=False)
+        self.fc2 = nn.Linear(256, 128, bias=False)
+        self.out = nn.Linear(128, num_classes, bias=False)
         
         # Activation stats (matching your format)
         self.activation_stats = {
@@ -472,21 +473,22 @@ class VGG8Light(nn.Module):
         x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
         x = self.pool2(x);           self._record_activation("pool2", x)
         
-        # Block 3
-        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
-        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
-        x = self.pool3(x);           self._record_activation("pool3", x)
+        # # Block 3
+        # x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        # x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        # x = self.pool3(x);           self._record_activation("pool3", x)
         
-        # Block 4
-        x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
-        x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
-        x = self.pool4(x);           self._record_activation("pool4", x)
+        # # Block 4
+        # x = F.relu(self.conv4_1(x)); self._record_activation("conv4_1", x)
+        # x = F.relu(self.conv4_2(x)); self._record_activation("conv4_2", x)
+        # x = self.pool4(x);           self._record_activation("pool4", x)
         
         # Flatten
         x = x.view(x.size(0), -1)
         
         # FC
         x = F.relu(self.fc1(x));     self._record_activation("fc1", x)
+        x = F.relu(self.fc2(x));     self._record_activation("fc2", x)
         x = self.out(x);             self._record_activation("out", x)
         
         return x
@@ -507,8 +509,8 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         # model = LeNet5().to(device)
 
         # model = VGG16(num_classes=10, in_channels=1).to(device)
-        model = VGG8(num_classes=10, in_channels=1).to(device)
-        # model = VGG8Light(num_classes=10, in_channels=1).to(device)
+        # model = VGG8(num_classes=10, in_channels=1).to(device)
+        model = VGG8Light(num_classes=10, in_channels=1).to(device)
     elif dataset == "nmnist":
         # Choose one:
         # model = NmnistCNN().to(device)

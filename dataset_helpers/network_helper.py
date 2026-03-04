@@ -700,7 +700,7 @@ def train_func(network, train_dataloader, val_dataloader, optimizer, loss_func, 
 
         for x, y in train_dataloader:
             # print(i)
-            # print(f"x shape: {x.shape}")
+            # print(f"x shape: {x.shape}, max: {np.max(x)}")
             output = network.forward(Tensor(x))
 
             labels = Tensor(one_hot_encode(y, num_classes=10))

@@ -282,12 +282,12 @@ def mnist_loader_manual(batch_size,
     else:
         # Read all MNIST training data from the file
         mnist_data = pd.read_csv(dataset_folder + 'mnist_train.csv', header=None)
-        mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')
+        mnist_data_x = mnist_data.iloc[:, 1:].values.astype('float')/255.0
         mnist_data_y = mnist_data.iloc[:, 0].values
         
         # Read all MNIST test data from the file
         mnist_data = pd.read_csv(dataset_folder + 'mnist_test.csv', header=None)
-        mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')
+        mnist_data_x_test = mnist_data.iloc[:, 1:].values.astype('float')/255.0
         mnist_data_y_test = mnist_data.iloc[:, 0].values
 
         if permuted:
@@ -376,7 +376,7 @@ def mnist_loader_preprocessed_single(x, max_nonzero, sequential):
             j += 1
         else:
             if val != 0:
-                processed_data[j] = [i, val]
+                processed_data[j] = [i, float(val)/255.0]
                 j += 1
                 if j >= max_nonzero:  # stop if full
                     break
@@ -450,7 +450,7 @@ if __name__ == "__main__":
         #     break
         torch_train(training_generator, train, test, params)
     else:    
-        batch_size = 1
+        batch_size = 120
         # (training_generator, total_train_batches), (validation_generator, total_val_batches), (test_generator, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, shuffle=False, preprocess=True)
         
         # d = iter(test_generator)
@@ -463,7 +463,7 @@ if __name__ == "__main__":
         (test_generator, total_test_batches), 
         max_nonzero) = mnist_loader_manual(batch_size, 
             shuffle=False, 
-            preprocess=True, 
+            preprocess=False, 
             CNN_preprocess=False, 
             downsample=False,
             sequential=False
@@ -475,7 +475,7 @@ if __name__ == "__main__":
         # for i, (batch_x, batch_y) in enumerate(test_generator):
         #     print(f"Batch {i} x shape: {batch_x.shape}, y shape: {batch_y.shape}")
 
-        sys.exit(0)
+        # sys.exit(0)
         # Define neural network
         # layer_dims = (784, 128, 10)
         layer_size = []
@@ -500,8 +500,8 @@ if __name__ == "__main__":
         # layer_size.append((28*28, 128, 128, 128, 128,10))
         # layer_size.append((28*28, 128, 128, 128, 10))
         
-        # layer_size.append((28*28, 256, 10))
-        layer_size.append((28*28, 256, 256, 10))
+        layer_size.append((28*28, 256, 10))
+        # layer_size.append((28*28, 256, 256, 10))
         # layer_size.append((28*28, 128, 10))
         # layer_size.append((28*28, 128, 128, 10))
         # layer_size.append((14*14, 128, 10))
@@ -530,7 +530,7 @@ if __name__ == "__main__":
 
             # Define optimizer
             # optimizer = network_helper.SGDOptimizer(network.param, lr=0.001)
-            optimizer = network_helper.AdamOptimizer(network.param, lr=0.0001)
+            optimizer = network_helper.AdamOptimizer(network.param, lr=0.0005)
             # Define loss function
             loss_func = network_helper.SoftmaxCrossEntropy()
 
@@ -553,7 +553,7 @@ if __name__ == "__main__":
 
             plt.plot(epochs, train_accuracy_list, 'o-', label='Training Accuracy')
             plt.plot(epochs, val_accuracy_list, 's-', label='Validation Accuracy')
-
+            plt.axhline(y=test_acc, color='r', linestyle='--', label='Test Accuracy')
             plt.xlabel('Epoch')
             plt.ylabel('Accuracy')
             plt.title(f"Final Train Acc: {train_accuracy_list[-1]:.4f} | Final Val Acc: {val_accuracy_list[-1]:.4f} | Test Acc: {test_acc:.4f}")

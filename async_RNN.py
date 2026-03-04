@@ -1,4 +1,3 @@
-from ast import Load
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
 
@@ -8,7 +7,7 @@ os.environ.pop("JAX_TRACEBACK_FILTERING", None)
 
 import jax
 import jax.numpy as jnp
-from jax import custom_jvp, jit
+from jax import jit
 from functools import partial
 import optax
 
@@ -38,7 +37,7 @@ from other_helpers.helpers import accuracy, store_training_data, rerun_init, sto
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from other_helpers.backpropagation import MLP_back_prop, RNN_back_prop
-from other_helpers.loss_functions import loss_bpp, mean_loss
+from other_helpers.loss_functions import loss_bpp, loss_func
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 
 jax.config.update("jax_debug_nans", True)
@@ -46,6 +45,7 @@ jax.config.update("jax_debug_nans", True)
 
 TQDM_DISABLE = False
 BUFFER_SIZE = 0
+END_SIGNAL = jnp.array([-1.0, -1.0], dtype=jnp.float32)
 
 # Initialize empty global MPI variables
 comm = None
@@ -66,16 +66,19 @@ test_generator = None
 @partial(jax.jit, static_argnames=['params', 'grad'])
 def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False): 
     # jax.debug.print("rank {}, neuron idx {} weight array {}", rank, neuron_idx, weights[neuron_idx].shape)   
+    # jax.debug.print("rank {}, layer input {}", rank, layer_input)   
     # Compute the new values of the neuron states
     filtered_weights = keep_top_k(weights[neuron_idx], params.top_weights, apply_abs=True)
     # filtered_weights = weights[neuron_idx]
 
     # jax.debug.print("Original weights {}, filtered wights {}", weights[neuron_idx], filtered_weights)
-    activations = jax.lax.cond(neuron_idx < 0,
-                            lambda _: neuron_states.values,
-                            lambda _: jnp.dot(layer_input, filtered_weights) + neuron_states.values + neuron_states.bias, 
-                            None
-                            )
+    invalid_idx = neuron_idx < 0
+    activations = jax.lax.cond(
+        invalid_idx,
+        lambda _: neuron_states.values,
+        lambda _: layer_input * filtered_weights + neuron_states.values + neuron_states.bias,
+        None
+    )
     #TODO: being able to compute multiple incoming index neurons
     #TODO: store the weight residuals of last layer and neuron state of input layer in sparse matrix representation to reduce space utilization because unused
     
@@ -85,12 +88,12 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     #                 None)
 
     if grad:
-        new_input_residuals = jax.lax.cond(neuron_idx < 0,
+        new_input_residuals = jax.lax.cond(invalid_idx,
                                 lambda _: neuron_states.input_residuals,
                                 lambda _: neuron_states.input_residuals.at[neuron_idx].add(layer_input),
                                 None
                                 )
-        new_input_activity = jax.lax.cond(neuron_idx < 0,
+        new_input_activity = jax.lax.cond(invalid_idx,
                                 lambda _: neuron_states.input_activity,
                                 lambda _: neuron_states.input_activity.at[neuron_idx].add(1),
                                 None
@@ -106,22 +109,11 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
             new_values_history, new_history_index = update_history(new_values_history, new_history_index, activations)
 
         dummy_activations = jnp.zeros((activations.shape[0], 2))
-        return jnp.array(0), dummy_activations, NeuronStates(   values=activations, 
-                                                                bias=neuron_states.bias,
-                                                                thresholds=neuron_states.thresholds, 
-                                                                input_residuals=new_input_residuals, 
-                                                                output_residuals=neuron_states.output_residuals, 
-                                                                input_order=neuron_states.input_order, 
-                                                                input_activity=new_input_activity,
-                                                                layer_activity=neuron_states.layer_activity,
-                                                                output_activity=neuron_states.output_activity,
-                                                                last_sent_iteration=neuron_states.last_sent_iteration,
-                                                                input_vector=neuron_states.input_vector,
-                                                                output_vector=neuron_states.output_vector,
-                                                                sync_rate_vector=neuron_states.sync_rate_vector,
-                                                                recurrent_weight=neuron_states.recurrent_weight,
-                                                                values_history=new_values_history,
-                                                                history_index=new_history_index)
+        return jnp.array(0), dummy_activations, neuron_states.replace(  values=activations,
+                                                                        input_residuals=new_input_residuals,
+                                                                        input_activity=new_input_activity,
+                                                                        values_history=new_values_history,
+                                                                        history_index=new_history_index)
     
     @jit
     def hidden_layer_case(_):
@@ -143,67 +135,143 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
 
         # APPLY THE FIRING NUMBER        
         f_nb = params.firing_nb
-        if isinstance(f_nb, int):
-            activated_output = keep_top_k(activated_output, f_nb) # Get the top k activations
-        else:
-            activated_output = keep_top_k(activated_output, f_nb[layer_idx]) # Get the top k activations
+        k = f_nb if isinstance(f_nb, int) else f_nb[layer_idx]
+        activated_output = keep_top_k(activated_output, k) # Get the top k activations
         
         # APPLY THE RESTRICTION
         penalty = jax.lax.cond(params.restrict[layer_idx] <= 0,
                                lambda _: activated_output, 
                                lambda _: activated_output*params.restrict[layer_idx], None)
-        if grad:
-            new_output_residuals = neuron_states.output_residuals + activated_output 
-
-            # Update the layer activity by adding the neurons that activated
-            active_indexes = jnp.where(activated_output > 0, 1, 0)
-            new_layer_activity = neuron_states.layer_activity + active_indexes
-            
-            last_neuron_idx = jnp.argmax(neuron_states.input_order) # Last neuron index in the input order
-            new_neuron_idx = jax.lax.cond(neuron_idx < 0,
-                        lambda _: last_neuron_idx, 
-                        lambda _: neuron_idx,
-                        None)
-            
-            new_input_order = neuron_states.input_order.at[new_neuron_idx].set(iteration) # Update the input activity by setting the input neuron to the iteration number        
-            
-            new_output_activity = neuron_states.output_activity.at[new_neuron_idx].add(active_indexes)
-            
-            # Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1)
-            new_input_vector = neuron_states.input_vector.at[neuron_idx].set(iteration+1)   # Set the input neuron to the iteration at which the input was received
-            new_output_vector = jnp.where(activated_output > 0,                             # Set the output neuron to the last iteration at which it activated
-                                        iteration+1,
-                                        neuron_states.output_vector)
-        else:
-            new_output_residuals=neuron_states.output_residuals
-            new_layer_activity = neuron_states.layer_activity
-            new_input_order = neuron_states.input_order
-            new_output_activity = neuron_states.output_activity
-            new_input_vector = neuron_states.input_vector
-            new_output_vector = neuron_states.output_vector
-
+        
         new_last_sent_iteration = jax.lax.cond(fire, lambda _: iteration, lambda _: neuron_states.last_sent_iteration, None)
-        recurrent_activation = jnp.dot(activated_output, neuron_states.recurrent_weight) # Shape (128,)
-        # recurrent_activation = jnp.zeros(activations.shape) # Shape (128,)
+
+        remaining_values = activations - penalty
+        # safe_remaining = jnp.maximum(0.0, remaining_values)
+        # safe_remaining = jnp.clip(remaining_values, min=-10.0)
+        # jax.debug.print("rank {} activated output {}, remaining values {}", rank, activated_output, remaining_values)
+        if params.recurrence[layer_idx] is not None:
+            recurrent_activation = jnp.dot(activated_output, neuron_states.recurrent_weight) # Shape (128,)
+            # recurrent_activation = jnp.dot(remaining_values, neuron_states.recurrent_weight) # Shape (128,)
+            # recurrent_activation = jnp.dot(safe_remaining, neuron_states.recurrent_weight) # Shape (128,)
+        else:
+            recurrent_activation = jnp.zeros(activations.shape) # Shape (128,)
         # jax.debug.print("rank {}, neuron idx {}, activations {}, activated_output {}, penalty {}, recurrent_activation {}", rank, neuron_idx, activations, activated_output, penalty, recurrent_activation)
-        new_neuron_states = NeuronStates(   values=activations - penalty + recurrent_activation,
-                                            bias=neuron_states.bias, 
-                                            thresholds=neuron_states.thresholds, 
-                                            input_residuals=new_input_residuals, 
-                                            output_residuals=new_output_residuals, 
-                                            input_order=new_input_order, 
-                                            input_activity=new_input_activity,
-                                            layer_activity=new_layer_activity,
-                                            output_activity=new_output_activity,
-                                            last_sent_iteration=new_last_sent_iteration,
-                                            input_vector=new_input_vector,
-                                            output_vector=new_output_vector,
-                                            sync_rate_vector=neuron_states.sync_rate_vector,
-                                            recurrent_weight=neuron_states.recurrent_weight,
-                                            values_history=neuron_states.values_history,
-                                            history_index=neuron_states.history_index)
-        valid_elements = jnp.count_nonzero(activated_output)
-        processed_output = output_vector_to_event(key, activated_output, params, params.layer_sizes[layer_idx])
+        # new_output_residuals = neuron_states.output_residuals + remaining_values
+        # new_values = values=safe_remaining + recurrent_activation,
+        # Optionally wrap the state update with tanh (controlled by params.use_tanh)
+        # Without tanh: z^t = activations - penalty + recurrent_activation
+        # With tanh:    z^t = tanh(activations - penalty + recurrent_activation)
+        #               O^t = ReLU(z^t)
+        inner = activations - penalty + recurrent_activation
+        if params.use_tanh:
+            tanh_out = jnp.tanh(inner)
+            # Store raw tanh(z) as the hidden state (needed for correct tanh' = 1 - z^2 in backprop).
+            # Send relu(tanh(z)) so transmitted values are non-negative, matching gradient derivation.
+            new_values = tanh_out
+            fire_mask = (activated_output != 0).astype(tanh_out.dtype)
+            send_output = jax.nn.relu(tanh_out) * fire_mask  # O^t = ReLU(tanh(z^t))
+        else:
+            tanh_out = inner  # alias for consistency in tanh_deriv_curr below
+            new_values = inner
+            send_output = activated_output
+
+        if grad:
+            # Keep recurrence gradient bookkeeping aligned with the selected events
+            active_indexes = jnp.where(send_output != 0, 1, 0)  # Update the layer activity by adding the neurons that activated
+
+            # Tanh derivatives for backprop (see backprop equations in comments below)
+            # T_{t-1} = 1 - (z^{t-1})^2  ->  used to scale A matrix (recurrence factor)
+            # T_t     = 1 - (z^t)^2      ->  used at firing accumulation  m_i * T_i
+            # New A_hat_j = T_j * A_j,  new firing weight = m_i * T_i
+            if params.use_tanh:
+                # new_values = tanh_out = tanh(z^t), stored as hidden state
+                # T_{t-1} = 1 - tanh(z^{t-1})^2, using previous hidden state (raw tanh, not relu)
+                tanh_deriv_prev = 1.0 - neuron_states.values**2  # T_{t-1}, shape (n_hidden,)
+                # derivative of relu(tanh(z)): tanh'(z) only where tanh(z) > 0, else 0
+                tanh_deriv_curr = (tanh_out > 0).astype(tanh_out.dtype) * (1.0 - tanh_out**2)  # T_t
+                active_tanh = active_indexes * tanh_deriv_curr    # m_i * T_i
+            else:
+                active_tanh = active_indexes
+
+            # --- A matrix: recurrent Jacobian from previous step ---
+            # W_hh is (n_hidden, n_hidden) so A is a full matrix, not a per-neuron scalar.
+            # A.T[m, l] = (1 - prev_active[m]) * delta_{ml}  +  prev_active[m] * W_hh[m, l]
+            # Rows where prev_active[m]=0 are identity rows (pass-through).
+            # Rows where prev_active[m]=1 are the corresponding row of W_hh (full recurrence).
+            # With tanh: A_hat = T_{t-1} * A  (multiply each row m by T_{t-1}[m])
+            prev_active_f = neuron_states.prev_active.astype(float)  # (n_hidden,)
+            W_hh = neuron_states.recurrent_weight  # (n_hidden, n_hidden)
+            A_T = (1.0 - prev_active_f)[:, None] * jnp.eye(W_hh.shape[0]) + prev_active_f[:, None] * W_hh
+            if params.use_tanh:
+                A_T = tanh_deriv_prev[:, None] * A_T  # A_hat = T_{t-1} * A, shape (n_hidden, n_hidden)
+            # Shape: (n_hidden, n_hidden)
+
+            # --- Update rnn_running_sum ---
+            # Diagonal of A_hat: tanh'[j] * ((1-m[j]) + m[j]*w_hh[j,j])
+            A_T_diag = (1.0 - prev_active_f) + prev_active_f * jnp.diag(W_hh)  # (n_hidden,)
+            if params.use_tanh:
+                A_T_diag = tanh_deriv_prev * A_T_diag  # tanh' scales the whole diagonal
+            new_running_sum = neuron_states.rnn_running_sum * A_T_diag[None, :]  # (n_input, n_hidden)
+            new_running_sum = jax.lax.cond(
+                neuron_idx >= 0,
+                lambda rs: rs.at[neuron_idx, :].add(layer_input),
+                lambda rs: rs,
+                new_running_sum
+            )
+
+            # --- Update rnn_total_sum (accumulate when neuron fires) ---
+            # With tanh: accumulate with m_i * T_i instead of m_i
+            new_total_sum = (neuron_states.rnn_total_sum
+                            + new_running_sum * active_tanh[None, :])  # (n_input, n_hidden)
+
+            # --- Compact recurrent accumulator for W_hh ---
+            # Empirically better compact source term than diag(R_{i-1}):
+            # source[:, n] = R_{i-1} for every target column n.
+            # Recurrence: U_i = source(R_{i-1}) + U_{i-1} @ A_{i-1}
+            # Total: S += U_i * (ReLU'(z_i) * T_i)[None, :]  (column-wise scale)
+            recurrent_source = jnp.broadcast_to(
+                neuron_states.prev_activated_output[:, None],
+                neuron_states.rnn_running_product.shape,
+            )
+            recurrent_running_sum = (
+                neuron_states.rnn_running_product @ A_T
+                + recurrent_source
+            )
+            new_total_product_sum = (
+                neuron_states.rnn_total_product_sum
+                + recurrent_running_sum * active_tanh[None, :]
+            )
+
+            last_neuron_idx = jnp.argmax(neuron_states.input_order) # Last neuron index in the input order
+            new_neuron_idx = jax.lax.cond(neuron_idx < 0, lambda _: last_neuron_idx, lambda _: neuron_idx, None)
+
+            new_neuron_states = neuron_states.replace(
+                values=new_values,
+                input_residuals=new_input_residuals,
+                output_residuals=neuron_states.output_residuals + send_output,
+                input_activity=new_input_activity,
+                layer_activity=neuron_states.layer_activity + active_indexes,
+                input_order=neuron_states.input_order.at[new_neuron_idx].set(iteration),                    # Update the input activity by setting the input neuron to the iteration number
+                output_activity=neuron_states.output_activity.at[new_neuron_idx].add(active_indexes),
+                input_vector=neuron_states.input_vector.at[neuron_idx].set(iteration + 1),                  # Set the input neuron to the iteration at which the input was received (# Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1))
+                output_vector=jnp.where(send_output > 0, iteration + 1, neuron_states.output_vector),  # Set the output neuron to the last iteration at which it activated     (Same as above for +1)
+                last_sent_iteration=new_last_sent_iteration,
+                # New RNN gradient fields:
+                rnn_running_sum=new_running_sum,
+                rnn_total_sum=new_total_sum,
+                rnn_running_product=recurrent_running_sum,
+                rnn_total_product_sum=new_total_product_sum,
+                prev_active=active_indexes,
+                prev_activated_output=send_output,)
+        else:
+            new_neuron_states = neuron_states.replace(
+                values=new_values,
+                input_residuals=new_input_residuals,
+                input_activity=new_input_activity,
+                last_sent_iteration=new_last_sent_iteration)
+
+        valid_elements = jnp.count_nonzero(send_output)
+        processed_output = output_vector_to_event(key, send_output, params, params.layer_sizes[layer_idx])
 
         return valid_elements, processed_output, new_neuron_states
     
@@ -283,7 +351,7 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
         iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
 
         # Send end signal
-        send(jnp.array([-1.0, -1.0]), dest=rank+process_per_layer, tag=0, comm=comm)
+        send(END_SIGNAL, dest=rank+process_per_layer, tag=0, comm=comm)
 
         return jnp.zeros(()), neuron_states, iteration, jnp.zeros((BUFFER_SIZE, 2))
     
@@ -332,7 +400,7 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
         # Send -1 to the next rank when all incoming data has been processed
         jax.lax.cond(
             layer_idx != last_layer,
-            lambda _: send(jnp.array([-1.0, -1.0]), dest=rank + process_per_layer, tag=0, comm=comm),
+            lambda _: send(END_SIGNAL, dest=rank + process_per_layer, tag=0, comm=comm),
             lambda _: [],
             operand=None
         )
@@ -360,6 +428,7 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     B: batch_size
     '''
     all_outputs, iterations, all_neuron_states, buffer = (predict)(params, key, weights, empty_neuron_states, batch_data, grad=True)
+    # jax.debug.print("rank {}, layer activity: {} max: {}, ending values: {}", rank, all_neuron_states.layer_activity[0], jax.vmap(jnp.max)(all_neuron_states.layer_activity), all_neuron_states.values[0])
     w_sum = l2_weight_regularization(mpi_config, weights)
 
     # Receive the gradients from the later layers
@@ -367,14 +436,21 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
 
     # Compute input's gradient and weight gradient
     weight_grad, th_grad, weight_res = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
-    weight_grad += 2 * params.w_reg * weights
+    # weight_grad += 2 * params.w_reg * weights
 
-    recurrent_weight_grad, _ = RNN_back_prop(params, all_neuron_states, next_grad, layer_idx)
+    weight_grad, recurrent_weight_grad, weight_res = RNN_back_prop(params, all_neuron_states, next_grad, layer_idx)
 
     if layer_idx > 1:
+        cur_relu_mask = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)
+
         # Send gradient to the previous layer
-        send_grad = jnp.dot(next_grad, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
-        send_grad *= (~jnp.all(weight_res == 0, axis=2)) 
+        # With tanh: dL/d(input) = W^T @ (dL/dO * ReLU' * tanh'), where tanh' = 1 - z^2
+        if params.use_tanh:
+            # values = tanh(z); derivative of relu(tanh(z)) = (tanh(z) > 0) * (1 - tanh(z)^2)
+            cur_tanh_mask = ((all_neuron_states.values > 0) * (1.0 - all_neuron_states.values**2)).astype(next_grad.dtype)
+            send_grad = jnp.dot(next_grad * cur_relu_mask * cur_tanh_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
+        else:
+            send_grad = jnp.dot(next_grad * cur_relu_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
         send(send_grad, dest=rank-process_per_layer, tag=2, comm=comm)
     
     # Sparsity loss gradients 
@@ -407,12 +483,13 @@ def loss_fn(params, key, weights, empty_neuron_states, target, batch_data):
     w_sum = l2_weight_regularization(mpi_config, weights)
 
     # Compute Loss and loss gradient
-    loss, loss_grad = jax.value_and_grad(mean_loss)(all_outputs, target)
+    loss, loss_grad = jax.value_and_grad(loss_func)(all_outputs, target)
     loss_grad /= process_per_layer # Shape (B, 10)
     loss += params.w_reg * w_sum
 
     # Compute output gradient and weight gradient
     out_grad, weight_grad = jax.vmap(loss_bpp, in_axes=(None, 0, 0))(weights, all_neuron_states, loss_grad) # Shape (B, 128), (B, 128, 10)
+    # jax.debug.print("Rank {}, loss: {}, loss grad mean: {}, weight grad mean: {}", rank, loss, (loss_grad.shape), (weight_grad.shape))
     mean_weight_grad = jnp.mean(weight_grad, axis=0) # Shape: (128, 10)
     mean_weight_grad += 2 * params.w_reg * weights
     mean_weight_grad = jnp.expand_dims(mean_weight_grad, axis=0)  # Shape: (1, 128, 10)
@@ -613,31 +690,21 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
 
                         recurrent_updates, recurrent_opt_state = solver.update(recurrent_weight_grad, recurrent_opt_state, rw)
                         new_recurrence_weights = optax.apply_updates(rw, recurrent_updates)
-                        # new_recurrence_weights = neuron_states.recurrent_weight - params.learning_rate * recurrent_weight_grad
                     else:
                         new_recurrence_weights = neuron_states.recurrent_weight
-                    # new_recurrence_weights = neuron_states.recurrent_weight
                     
                     b = empty_neuron_states.bias
-                    bias_updates, bias_opt_state = solver.update(next_grad, bias_opt_state, b)
-                    new_bias = optax.apply_updates(b, bias_updates)
-                    empty_neuron_states = NeuronStates(
-                                            values=empty_neuron_states.values, 
+                    if params.use_bias:
+                        bias_updates, bias_opt_state = solver.update(next_grad, bias_opt_state, b)
+                        new_bias = optax.apply_updates(b, bias_updates)
+                    else:
+                        new_bias = b 
+
+           
+                    empty_neuron_states = empty_neuron_states.replace(
                                             bias=new_bias,
-                                            thresholds=new_thresholds, 
-                                            input_residuals=empty_neuron_states.input_residuals, 
-                                            output_residuals=empty_neuron_states.output_residuals, 
-                                            input_order=empty_neuron_states.input_order, 
-                                            input_activity=empty_neuron_states.input_activity,
-                                            layer_activity=empty_neuron_states.layer_activity,
-                                            output_activity=empty_neuron_states.output_activity,
-                                            last_sent_iteration=empty_neuron_states.last_sent_iteration,
-                                            input_vector=empty_neuron_states.input_vector,
-                                            output_vector=empty_neuron_states.output_vector,
-                                            sync_rate_vector=empty_neuron_states.sync_rate_vector,
-                                            recurrent_weight=new_recurrence_weights,
-                                            values_history=empty_neuron_states.values_history,
-                                            history_index=empty_neuron_states.history_index)
+                                            thresholds=new_thresholds,
+                                            recurrent_weight=new_recurrence_weights,)
                 # Update weights
                 if solver is not None:
                     # Optax optimizer
@@ -663,6 +730,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         if layer_idx != 0 and trial is None:
             jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points and a mean threshold of {}", rank, mean, epoch_iterations.shape[0], jnp.mean(empty_neuron_states.thresholds))
         
+        # print("rank {} bias {}".format(rank, empty_neuron_states.bias))
         # Inference on the validation set
         val_accuracy, val_mean, _ = batch_predict(params, key, total_batches, weights, empty_neuron_states, dataset="val", save=False, debug=False)
         
@@ -808,9 +876,9 @@ def init_params(key, batch_size, layer_sizes, load_file=False, best=False):
         else:
             raise ValueError("Unsupported shape for Kaiming init")
         
-        dtype=jnp.float32
-        bound = 1.0/jnp.sqrt(fan_in)
-        weights = random_layer_params(layer_sizes[layer_idx], layer_sizes[layer_idx-1], keys[layer_idx])
+        std = jnp.sqrt(2/fan_in)
+        print("std: ", std)
+        weights = random_layer_params(layer_sizes[layer_idx], layer_sizes[layer_idx-1], keys[layer_idx], scale=std)
         # print(f"rank {rank} Weights shape: {weights.shape}")
         return weights
     else:
@@ -821,8 +889,9 @@ def init_recurrent(key, N, gain=1.0):
     """
     Initialize recurrent weights ~ N(0, gain^2 / N)
     """
-    W = jax.random.normal(key, (N, N))
+    W = jax.random.normal(key, shape=(N, N))
     W = W * (gain / jnp.sqrt(N))
+    # W = jnp.eye(N)
     print(f"rank {rank} Recurrent Weights shape: {W.shape}")
     return W
 
@@ -1070,6 +1139,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     config = load_config_with_defaults(config_path)
     config = parse_unknown_args_and_overrides_config(unknown, config)
 
+    print(f"Rank {rank} loaded config: {config["recurrence"]}")
+
     # Extract configuration parameters
     dataset = config['dataset']
     layer_sizes = tuple(config['layer_sizes'])
@@ -1172,10 +1243,13 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             top_weights=config['top_weights'],
             history_size=config['history_size'],
             recurrence=config['recurrence'],
+            use_bias=config['use_bias'],
+            use_tanh=config['use_tanh'],
         )
         if trial is not None:
             params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
 
+        print("recurrence in params:", params.recurrence)
         if rerun is not None:                  
             override_list = config.get('override_params', None)
             params, weights, thresholds = rerun_init(
@@ -1184,14 +1258,16 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 params, 
                 override_params=override_list
             )
-        
+        print("rank recurrence in params:", rank, params.recurrence)
+
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
             print(params)
         
         # Instantiate the neuron states with the correct shapes and initial values
         layer_key = jax.random.fold_in(key, layer_idx)
-        sync_rate_vector = jax.random.randint(layer_key, shape=(layer_sizes[layer_idx],), minval=1, maxval=params.sync_rate)
+        # sync_rate_vector = jax.random.randint(layer_key, shape=(layer_sizes[layer_idx],), minval=1, maxval=params.sync_rate)
+        sync_rate_vector = jnp.full(shape=(layer_sizes[layer_idx],), fill_value=params.sync_rate)
 
         key, subkey = jax.random.split(key) 
         empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
@@ -1209,10 +1285,17 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                                             sync_rate_vector=sync_rate_vector,
                                             recurrent_weight=init_recurrent(subkey, layer_sizes[layer_idx], gain=0.5),
                                             values_history=jnp.zeros((params.history_size, layer_sizes[layer_idx])),
-                                            history_index=jnp.array(0, dtype=jnp.int32))
-        print(f"rank {rank} sync rates: {sync_rate_vector}")
+                                            history_index=jnp.array(0, dtype=jnp.int32),
+                                            rnn_running_sum=jnp.zeros((layer_sizes[layer_idx-1], layer_sizes[layer_idx])),
+                                            rnn_total_sum=jnp.zeros((layer_sizes[layer_idx-1], layer_sizes[layer_idx])),
+                                            rnn_running_product=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                            rnn_total_product_sum=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                            prev_active=jnp.zeros((layer_sizes[layer_idx],), dtype=int),
+                                            prev_activated_output=jnp.zeros((layer_sizes[layer_idx],)),
+                                            )
+        # print(f"rank {rank} sync rates: {sync_rate_vector}")
         total_batches = (total_train_batches, total_val_batches, total_test_batches)
-
+        print(empty_neuron_states.recurrent_weight.shape)
         mode = config['mode']
         if mode == 'inference':
             # To only run inference
@@ -1245,5 +1328,9 @@ if __name__ == "__main__":
     rank = comm.Get_rank()      # Real rank
     size = comm.Get_size()
 
+
+    # config = load_config_with_defaults(args.config)
+    # config = parse_unknown_args_and_overrides_config(unknown, config)
+    # print(config['recurrence'])
     main(random_seed, key, rank, size, comm, config_path=args.config, data_dir=args.data_dir)
 # JAX_PLATFORMS=cpu mpirun -n 4 python async_MLP.py --config "MLP_config.yaml"

@@ -2,20 +2,11 @@ import jax
 import jax.numpy as jnp
 
 @jax.jit
-def softmax_cross_entropy_with_logits(logits, labels):
-    # Compute the softmax in a numerically stable way
-    logits_max = jnp.max(logits, axis=0, keepdims=True)
-    exps = jnp.exp(logits - logits_max)
-    softmax = exps / (jnp.sum(exps, axis=0, keepdims=True) + 1e-8)
-    # Compute the cross-entropy loss
-    cross_entropy = -jnp.sum(labels * jnp.log(softmax + 1e-8), axis=0)
-    return cross_entropy
-
-@jax.jit
-def mean_loss(logits, labels):
-    batched_softmax_cross_entropy = jax.vmap(softmax_cross_entropy_with_logits, in_axes=(0, 0))
-    losses = batched_softmax_cross_entropy(logits, labels)
-    # jax.debug.print("Losses per batch element: {}", jnp.mean(losses))
+def loss_func(logits, labels):
+    # Numerically stable cross-entropy: matches PyTorch's CrossEntropyLoss exactly.
+    # Uses log-sum-exp via jax.nn.log_softmax, no epsilon clamping.
+    log_probs = jax.nn.log_softmax(logits, axis=-1)  # (B, C)
+    losses = -jnp.sum(labels * log_probs, axis=-1)    # (B,)
     return jnp.mean(losses)
 
 @jax.jit

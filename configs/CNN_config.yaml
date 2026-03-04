@@ -12,7 +12,7 @@
 
 # Choose either 'training' or 'inference'
 mode: training
-mode: inference
+# mode: inference
 # ============================================================================
 # CNN ARCHITECTURE
 # ============================================================================
@@ -48,13 +48,13 @@ layer_sizes:
 #   - [10]                                   # Output: 10 classes
 
 # ---------- LeNet-5 Style (MNIST) ----------
-# layer_sizes:
-#   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
-#   - [6, [5, 5], [0, 0], [1, 1], "max"]    # Conv: 6 filters, 5x5 kernel, max pool
-#   - [16, [5, 5], [0, 0], [1, 1], "max"]   # Conv: 16 filters, 5x5 kernel, max pool
-#   - [120]                                  # FC: 120 units
-#   - [84]                                   # FC: 84 units
-#   - [10]                                   # Output: 10 classes
+layer_sizes:
+  - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+  - [6, [5, 5], [0, 0], [1, 1], "max"]    # Conv: 6 filters, 5x5 kernel, max pool
+  - [16, [5, 5], [0, 0], [1, 1], "max"]   # Conv: 16 filters, 5x5 kernel, max pool
+  - [120]                                  # FC: 120 units
+  - [84]                                   # FC: 84 units
+  - [10]                                   # Output: 10 classes
 
 # ---------- VGG-8 Style (MNIST) ----------
 # layer_sizes:
@@ -140,7 +140,7 @@ layer_sizes:
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36              # Number of samples per batch
-num_epochs: 2              # Number of training epochs
+num_epochs: 20              # Number of training epochs
 learning_rate: 0.0001       # Learning rate for optimizer
 optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
 
@@ -158,7 +158,7 @@ best: false                 # Legacy parameter, keep as false
 # rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_P2x2_L15_L10_acc0.912_adam_.json"
 
 rerun : network_results/mnist/training/CNN/sync/load_false/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json
-# rerun: null
+rerun: null
 
 # List of parameters to override from the loaded model
 # Leave empty or null to use all parameters from the file

@@ -29,9 +29,11 @@
 
 dataset: mnist
 layer_sizes: [784, 256, 256, 10]
-# layer_sizes: [784, 256, 10]
+# layer_sizes: [784, 256, 256, 256, 10]
+
+layer_sizes: [784, 256, 10]
 # layer_sizes: [784, 128, 128, 10]
-layer_sizes: [784, 128, 10]
+# layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
@@ -62,8 +64,8 @@ mode: training
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 1            # Number of training epochs
-learning_rate: 0.0001       # Learning rate for optimizer
+num_epochs: 20            # Number of training epochs
+learning_rate: 0.001       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 
 load_file: false

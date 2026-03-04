@@ -120,147 +120,153 @@ def output_vector_to_event(key, arr: jnp.ndarray, params, max_len):
     return pairs_out
 
 #region NeuronStates
+# @jax.tree_util.register_pytree_node_class
+# class NeuronStates:
+#     def __init__(self, 
+#                  values, 
+#                  bias,
+#                  thresholds, 
+#                  input_residuals, 
+#                  output_residuals,
+#                  input_order, 
+#                  input_activity, 
+#                  layer_activity, 
+#                  output_activity, 
+#                  last_sent_iteration, 
+#                  input_vector, 
+#                  output_vector, 
+#                  sync_rate_vector=None,
+#                  recurrent_weight=None,
+#                  values_history=None,
+#                  history_index=None,
+#                  weights_shape=None, 
+#                  is_conv=False):
+#         '''
+#         Shapes are referenced for a layer with weights of shape: (784, 128)
+
+#         values: jnp.ndarray             # Current state of the neurons in the layer, shape: (layer_sizes[rank],) __ (128,)
+#         thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
+#         input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
+#         output_residuals: jnp.ndarray   # Sum of all output neurons, shape: (layer_sizes[rank],) __ (128,)
+#         input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
+#         input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
+#         layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
+#         output activity                 # For each input neuron stores the hidden neurons that fire, shape: (layer_sizes[rank-1], layer_sizes[rank]) __ (784, 128)  
+        
+#         ____ Convolution fields
+#         weights_shape                   # Shape of the weights
+#         is_conv                         # Is convolution layer               
+#         '''
+#         self.values = values
+#         self.bias = bias
+#         self.thresholds = thresholds
+#         self.input_residuals = input_residuals
+#         self.output_residuals = output_residuals
+#         self.input_order = input_order
+#         self.input_activity = input_activity
+#         self.layer_activity = layer_activity
+#         self.output_activity = output_activity
+#         self.last_sent_iteration = last_sent_iteration
+#         self.input_vector = input_vector
+#         self.output_vector = output_vector
+#         self.sync_rate_vector = sync_rate_vector
+#         self.recurrent_weight = recurrent_weight
+#         self.values_history = values_history
+#         self.history_index = history_index
+#         self.weights_shape = weights_shape
+#         self.is_conv = is_conv
+
+#     # Tell JAX how to flatten this object
+#     def tree_flatten(self):
+#         children = (self.values, self.bias, self.thresholds, self.input_residuals, self.output_residuals,
+#                     self.input_order, self.input_activity, self.layer_activity,
+#                     self.output_activity, self.last_sent_iteration, 
+#                     self.input_vector, self.output_vector, self.sync_rate_vector,
+#                     self.recurrent_weight, self.values_history, self.history_index,
+#                     self.weights_shape, self.is_conv)
+#         aux_data = None  # no extra static data
+#         return children, aux_data
+
+#     @classmethod
+#     def tree_unflatten(cls, aux_data, children):
+#         return cls(*children)
+    
+#     def replace(self, **updates):
+#         """Return a new NeuronStates object with some fields replaced."""
+#         return NeuronStates(
+#             values=updates.get("values", self.values),
+#             bias=updates.get("bias", self.bias),
+#             thresholds=updates.get("thresholds", self.thresholds),
+#             input_residuals=updates.get("input_residuals", self.input_residuals),
+#             output_residuals=updates.get("output_residuals", self.output_residuals),
+#             input_order=updates.get("input_order", self.input_order),
+#             input_activity=updates.get("input_activity", self.input_activity),
+#             layer_activity=updates.get("layer_activity", self.layer_activity),
+#             output_activity=updates.get("output_activity", self.output_activity),
+#             last_sent_iteration=updates.get("last_sent_iteration", self.last_sent_iteration),
+#             input_vector=updates.get("input_vector", self.input_vector),
+#             output_vector=updates.get("output_vector", self.output_vector),
+#             sync_rate_vector=updates.get("sync_rate_vector", self.sync_rate_vector),
+#             recurrent_weight=updates.get("recurrent_weight", self.recurrent_weight),
+#             values_history=updates.get("values_history", self.values_history),
+#             history_index=updates.get("history_index", self.history_index),
+#             weights_shape=updates.get("weights_shape", self.weights_shape),
+#             is_conv=updates.get("is_conv", self.is_conv),
+#         )
+
 @jax.tree_util.register_pytree_node_class
 class NeuronStates:
-    def __init__(self, 
-                 values, 
-                 bias,
-                 thresholds, 
-                 input_residuals, 
-                 output_residuals,
-                 input_order, 
-                 input_activity, 
-                 layer_activity, 
-                 output_activity, 
-                 last_sent_iteration, 
-                 input_vector, 
-                 output_vector, 
-                 sync_rate_vector=None,
-                 recurrent_weight=None,
-                 values_history=None,
-                 history_index=None,
-                 weights_shape=None, 
-                 is_conv=False):
-        '''
-        Shapes are referenced for a layer with weights of shape: (784, 128)
+    # Define which fields are always arrays (JAX leaves) vs static scalars
+    _ARRAY_FIELDS = frozenset({
+        "values", "bias", "thresholds", "input_residuals", "output_residuals",
+        "input_order", "input_activity", "layer_activity", "output_activity",
+        "last_sent_iteration", "input_vector", "output_vector",
+    })
+    _OPTIONAL_ARRAY_FIELDS = frozenset({
+        "sync_rate_vector", "recurrent_weight", "values_history",
+        "history_index", "weights_shape",
+    })
+    _STATIC_FIELDS = frozenset({"is_conv"})  # non-array, treated as aux
 
-        values: jnp.ndarray             # Current state of the neurons in the layer, shape: (layer_sizes[rank],) __ (128,)
-        thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
-        input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
-        output_residuals: jnp.ndarray   # Sum of all output neurons, shape: (layer_sizes[rank],) __ (128,)
-        input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
-        input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
-        layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
-        output activity                 # For each input neuron stores the hidden neurons that fire, shape: (layer_sizes[rank-1], layer_sizes[rank]) __ (784, 128)  
-        
-        ____ Convolution fields
-        weights_shape                   # Shape of the weights
-        is_conv                         # Is convolution layer               
-        '''
-        self.values = values
-        self.bias = bias
-        self.thresholds = thresholds
-        self.input_residuals = input_residuals
-        self.output_residuals = output_residuals
-        self.input_order = input_order
-        self.input_activity = input_activity
-        self.layer_activity = layer_activity
-        self.output_activity = output_activity
-        self.last_sent_iteration = last_sent_iteration
-        self.input_vector = input_vector
-        self.output_vector = output_vector
-        self.sync_rate_vector = sync_rate_vector
-        self.recurrent_weight = recurrent_weight
-        self.values_history = values_history
-        self.history_index = history_index
-        self.weights_shape = weights_shape
-        self.is_conv = is_conv
+    def __init__(self, **fields):
+        for k, v in fields.items():
+            setattr(self, k, v)
+        self._fields = dict(fields)  # preserve insertion order
 
-    # Tell JAX how to flatten this object
     def tree_flatten(self):
-        children = (self.values, self.bias, self.thresholds, self.input_residuals, self.output_residuals,
-                    self.input_order, self.input_activity, self.layer_activity,
-                    self.output_activity, self.last_sent_iteration, 
-                    self.input_vector, self.output_vector, self.sync_rate_vector,
-                    self.recurrent_weight, self.values_history, self.history_index,
-                    self.weights_shape, self.is_conv)
-        aux_data = None  # no extra static data
-        return children, aux_data
+        # Split into leaves (arrays) and statics (aux_data)
+        array_keys = []
+        array_vals = []
+        static_items = {}
+
+        for k, v in self._fields.items():
+            if k in self._STATIC_FIELDS:
+                static_items[k] = v
+            else:
+                array_keys.append(k)
+                array_vals.append(v)
+
+        # aux_data is a hashable tuple of (ordered keys, static values)
+        aux_data = (tuple(array_keys), tuple(sorted(static_items.items())))
+        return array_vals, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        return cls(*children)
-    
+        array_keys, static_items = aux_data
+        fields = dict(zip(array_keys, children))
+        fields.update(dict(static_items))
+        return cls(**fields)
+
     def replace(self, **updates):
-        """Return a new NeuronStates object with some fields replaced."""
-        return NeuronStates(
-            values=updates.get("values", self.values),
-            bias=updates.get("bias", self.bias),
-            thresholds=updates.get("thresholds", self.thresholds),
-            input_residuals=updates.get("input_residuals", self.input_residuals),
-            output_residuals=updates.get("output_residuals", self.output_residuals),
-            input_order=updates.get("input_order", self.input_order),
-            input_activity=updates.get("input_activity", self.input_activity),
-            layer_activity=updates.get("layer_activity", self.layer_activity),
-            output_activity=updates.get("output_activity", self.output_activity),
-            last_sent_iteration=updates.get("last_sent_iteration", self.last_sent_iteration),
-            input_vector=updates.get("input_vector", self.input_vector),
-            output_vector=updates.get("output_vector", self.output_vector),
-            sync_rate_vector=updates.get("sync_rate_vector", self.sync_rate_vector),
-            recurrent_weight=updates.get("recurrent_weight", self.recurrent_weight),
-            values_history=updates.get("values_history", self.values_history),
-            history_index=updates.get("history_index", self.history_index),
-            weights_shape=updates.get("weights_shape", self.weights_shape),
-            is_conv=updates.get("is_conv", self.is_conv),
-        )
+        new_fields = {**self._fields, **updates}
+        return NeuronStates(**new_fields)
+
+    def __getattr__(self, name):
+        # Fallback for fields not set — return None for optional fields
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return None
     
-    def print_state_info(self, print_values=False):
-        """
-        Prints the shape and dtype of every JAX array field, and the value/type of scalar fields.
-
-        Args:
-            print_values (bool): If True, prints the full values of the arrays and scalars.
-        """
-        print(f"## 🧠 NeuronStates Information (is_conv: {self.is_conv}, weights_shape: {self.weights_shape})")
-        print("---")
-
-        # Dictionary of fields to inspect
-        fields = {
-            "values": self.values,
-            "thresholds": self.thresholds,
-            "input_residuals": self.input_residuals,
-            "input_order": self.input_order,
-            "input_activity": self.input_activity,
-            "layer_activity": self.layer_activity,
-            "output_activity": self.output_activity,
-            "last_sent_iteration": self.last_sent_iteration,
-            "input_vector": self.input_vector,
-            "output_vector": self.output_vector,
-            "values_history": self.values_history,
-            "history_index": self.history_index,
-            "weights_shape": self.weights_shape,
-            "is_conv": self.is_conv
-        }
-
-        for name, field in fields.items():
-            if field is None:
-                print(f"* **{name}**: **None**")
-            elif isinstance(field, jnp.ndarray):
-                print(f"* **{name}**: **Shape**={field.shape}, **Dtype**={field.dtype}")
-                if print_values:
-                    print(f"  * **Values**:")
-                    print(field)
-            elif isinstance(field, (int, float, bool, tuple, list)):
-                # Handle scalar-like types (like last_sent_iteration, is_conv, weights_shape)
-                print(f"* **{name}**: **Type**={type(field).__name__}")
-                if print_values:
-                    # Always show non-array values for context
-                    print(f"  * **Value**: {field}")
-            else:
-                print(f"* **{name}**: **Type**={type(field).__name__}")
-                if print_values:
-                    print(f"  * **Value**: {field}")
-
 #region Params
 @dataclasses.dataclass(frozen=True)
 class Params:
@@ -287,6 +293,8 @@ class Params:
     max_kernel: int = None      # The maximum size of flattened kernel
     flat_layer_sizes: tuple[int, ...] = None
     recurrence: tuple[int, ...] | None = None
+    use_bias: bool = False
+    use_tanh: bool = False  # Wrap the hidden state update with tanh: z^t = tanh(W*x + z^{t-1} - R^{t-1} + W_hh*R^{t-1})
 
 #region RERUN
 def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
@@ -422,7 +430,10 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         rerun=data_file_path,
         top_weights=top_weights_val,
         history_size=history_size_val,
-        max_kernel=new_params.max_kernel
+        max_kernel=new_params.max_kernel,
+        recurrence=new_params.recurrence,
+        use_bias=new_params.use_bias,
+        use_tanh=new_params.use_tanh,
     )
     
     # Load weights and thresholds
@@ -552,9 +563,11 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "threshold init": params.init_thresholds,
         "threshold lr": params.threshold_lr,
         "test accuracy": test_accuracy,
-        "layer_sizes": params.layer_sizes,
         "batch_size": params.batch_size,
         "learning rate": params.learning_rate,
+        "use_bias": params.use_bias,
+        "layer_sizes": params.layer_sizes,
+        "recurrence": params.recurrence,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
         "validation accuracy": np.array(all_validation_accuracies).tolist(),
         "iterations mean": np.array(all_iteration_mean).tolist(),
@@ -768,7 +781,8 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'dataset': 'mnist',
 
         'mode': 'training', # Choose either train or inference
-
+        'use_bias': False, # Whether to use bias in the network
+        'use_tanh': False, # Whether to apply tanh to the hidden state update
         # Network architecture: tuple of layer sizes (input, hidden1, hidden2, ..., output)
         # Examples:
         #   MNIST: (784, 256, 10) or (28*28, 128, 128, 10)
@@ -811,8 +825,6 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'top_weights': -1,  # Top k weights to use (-1 for all)
         'history_size': 0,  # Number of output states to keep for plotting
         
-        # Experiment settings
-        'new_epoch_number': 50,  # Epochs to run when rerunning a model
     }
 
     if is_cnn:
