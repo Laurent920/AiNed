@@ -37,6 +37,7 @@ from dataset_helpers.network_helper import one_hot_encode
 from dataset_helpers.nmnist_helper import torch_nmnist_loader
 from dataset_helpers.shd_helper import torch_SHD_loader
 from dataset_helpers.dvs_helper import torch_DVSGesture_loader
+from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.cnn_mnist import get_weights_for_rank
 
 from other_helpers.helpers import Params, NeuronStates
@@ -864,7 +865,7 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     next_grad = recv(jnp.zeros((batch_part,) + params.flat_layer_sizes[layer_idx]), source=rank + process_per_layer, tag=2, comm=comm) # Shape: (B, 128)
 
     # Compute input's gradient and weight gradient
-    weight_grad, th_grad, weight_res = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
+    weight_grad, th_grad, weight_res, bias_grad = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
 
     if layer_idx > 1:
@@ -1640,6 +1641,10 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 case "dvs":
                     loader = partial(torch_DVSGesture_loader)
                     if layer_sizes[0][1] == 64:
+                        downsample = True
+                case "ncars":
+                    loader = partial(torch_NCARS_loader)
+                    if tuple(layer_sizes[0][1:]) == (60, 50):
                         downsample = True
                 case _:
                     raise ValueError(f"Unknown dataset: {dataset}")

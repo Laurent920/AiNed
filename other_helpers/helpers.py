@@ -295,6 +295,7 @@ class Params:
     recurrence: tuple[int, ...] | None = None
     use_bias: bool = False
     use_tanh: bool = False  # Wrap the hidden state update with tanh: z^t = tanh(W*x + z^{t-1} - R^{t-1} + W_hh*R^{t-1})
+    exploration_rate: float = 0.0  # Probability of randomly replacing a top-k fired neuron with a non-top-k non-zero neuron
 
 #region RERUN
 def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
@@ -566,6 +567,7 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "batch_size": params.batch_size,
         "learning rate": params.learning_rate,
         "use_bias": params.use_bias,
+        "use_tanh": params.use_tanh,
         "layer_sizes": params.layer_sizes,
         "recurrence": params.recurrence,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
@@ -777,7 +779,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
     """
     # Default configuration
     default_config = {
-        # Dataset selection: 'mnist', 'shd', 'nmnist', 'dvs', 'smnist'
+        # Dataset selection: 'mnist', 'shd', 'nmnist', 'dvs', 'ncars', 'smnist'
         'dataset': 'mnist',
 
         'mode': 'training', # Choose either train or inference
@@ -824,7 +826,8 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         # Advanced features
         'top_weights': -1,  # Top k weights to use (-1 for all)
         'history_size': 0,  # Number of output states to keep for plotting
-        
+        'exploration_rate': 0.0,  # Probability of replacing a top-k fired neuron with a random non-top-k non-zero neuron
+
     }
 
     if is_cnn:

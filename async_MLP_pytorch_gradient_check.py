@@ -56,12 +56,12 @@ def one_hot(y, num_classes):
     return jax.nn.one_hot(jnp.asarray(y), num_classes=num_classes)
 
 
-def forward_with_states(x, weights, sync_rate):
+def forward_with_states(x, weights, biases, sync_rate):
     activations = x
     hidden_states = []
 
-    for li, w in enumerate(weights):
-        z = activations @ w
+    for li, (w, b) in enumerate(zip(weights, biases)):
+        z = activations @ w + b
         is_last = li == (len(weights) - 1)
 
         if is_last:
@@ -109,15 +109,18 @@ def propagate_next_grad(next_grad, w, weight_res, current_state, prev_state, mod
     )
 
 
-def custom_async_like_grads(x, y, weights, layer_sizes, params, prop_mode="current"):
-    logits, hidden_states, out_state = forward_with_states(x, weights, params.sync_rate)
+def custom_async_like_grads(x, y, weights, biases, layer_sizes, params, prop_mode="current"):
+    logits, hidden_states, out_state = forward_with_states(x, weights, biases, params.sync_rate)
     targets = one_hot(y, layer_sizes[-1])
 
     loss, dlogits = jax.value_and_grad(loss_func)(logits, targets)
 
     out_grad, out_w_grad = jax.vmap(loss_bpp, in_axes=(None, 0, 0))(weights[-1], out_state, dlogits)
-    grads = [None] * len(weights)
-    grads[-1] = jnp.sum(out_w_grad, axis=0)
+    w_grads = [None] * len(weights)
+    b_grads = [None] * len(biases)
+    w_grads[-1] = jnp.sum(out_w_grad, axis=0)
+    # bias grad for output layer: sum over batch of dlogits
+    b_grads[-1] = jnp.sum(dlogits, axis=0)
     custom_deltas = {}
 
     next_grad = out_grad
@@ -125,7 +128,10 @@ def custom_async_like_grads(x, y, weights, layer_sizes, params, prop_mode="curre
         layer_idx = hidden_pos + 1
         custom_deltas[layer_idx] = next_grad
         weight_grad, _th_grad, weight_res = MLP_back_prop(params, hidden_states[hidden_pos], next_grad, layer_idx)
-        grads[hidden_pos] = weight_grad[0]
+        w_grads[hidden_pos] = weight_grad[0]
+        # bias grad: next_grad masked by whether the neuron fired (output_vector > 0), summed over batch
+        neuron_fired = (hidden_states[hidden_pos].output_vector > 0).astype(next_grad.dtype)  # (B, out_dim)
+        b_grads[hidden_pos] = jnp.sum(next_grad * neuron_fired, axis=0)
 
         if hidden_pos > 0:
             next_grad = propagate_next_grad(
@@ -137,7 +143,7 @@ def custom_async_like_grads(x, y, weights, layer_sizes, params, prop_mode="curre
                 mode=prop_mode,
             )
 
-    return float(loss), grads, custom_deltas
+    return float(loss), w_grads, b_grads, custom_deltas
 
 
 class TorchMLP(nn.Module):
@@ -146,7 +152,7 @@ class TorchMLP(nn.Module):
         self.layers = nn.ModuleList()
         for w in weights:
             in_dim, out_dim = w.shape
-            layer = nn.Linear(in_dim, out_dim, bias=False)
+            layer = nn.Linear(in_dim, out_dim, bias=True)
             self.layers.append(layer)
 
     def forward(self, x):
@@ -157,11 +163,12 @@ class TorchMLP(nn.Module):
         return x
 
 
-def pytorch_grads(x_np, y_np, weights):
+def pytorch_grads(x_np, y_np, weights, biases):
     torch_model = TorchMLP(weights)
     with torch.no_grad():
-        for layer, w in zip(torch_model.layers, weights):
+        for layer, w, b in zip(torch_model.layers, weights, biases):
             layer.weight.copy_(torch.tensor(np.asarray(w.T), dtype=torch.float32))
+            layer.bias.copy_(torch.tensor(np.asarray(b), dtype=torch.float32))
 
     x_t = torch.tensor(x_np, dtype=torch.float32)
     y_t = torch.tensor(y_np, dtype=torch.long)
@@ -177,11 +184,13 @@ def pytorch_grads(x_np, y_np, weights):
     loss = nn.CrossEntropyLoss()(logits, y_t)
     loss.backward()
 
-    grads = []
+    w_grads = []
+    b_grads = []
     for layer in torch_model.layers:
-        grads.append(layer.weight.grad.detach().cpu().numpy().T)
+        w_grads.append(layer.weight.grad.detach().cpu().numpy().T)
+        b_grads.append(layer.bias.grad.detach().cpu().numpy())
     torch_deltas = {i + 1: h.grad.detach().cpu().numpy() for i, h in enumerate(hidden_outputs)}
-    return float(loss.item()), grads, torch_deltas
+    return float(loss.item()), w_grads, b_grads, torch_deltas
 
 
 def similarity_metrics(a, b, eps=1e-12):
@@ -255,14 +264,22 @@ def main():
         rerun="",
         top_weights=-1,
         history_size=0,
-        use_bias=False,
+        use_bias=True,
     )
 
     x_np, y_np = load_mnist_inputs(args.num_inputs, batch_size=max(64, args.num_inputs), data_dir=args.data_dir)
     x = jnp.asarray(x_np, dtype=jnp.float32)
 
     weights = init_weights_from_async(layer_sizes, args.seed)
-    torch_loss, torch_layer_grads, torch_deltas = pytorch_grads(x_np, y_np, [np.asarray(w) for w in weights])
+    rng_bias = np.random.default_rng(args.seed + 1)
+    biases = [
+        jnp.asarray(rng_bias.normal(size=(layer_sizes[i],)).astype(np.float32) * 0.1)
+        for i in range(1, len(layer_sizes))
+    ]
+
+    torch_loss, torch_w_grads, torch_b_grads, torch_deltas = pytorch_grads(
+        x_np, y_np, [np.asarray(w) for w in weights], [np.asarray(b) for b in biases]
+    )
     print(f"firing_nb={params.firing_nb}, sync_rate={params.sync_rate}")
     print(f"tested_inputs={args.num_inputs}")
     print(f"torch_loss={torch_loss:.8f}")
@@ -270,20 +287,31 @@ def main():
 
     prop_modes = [m.strip() for m in args.prop_modes.split(",") if m.strip()]
     for mode in prop_modes:
-        custom_loss, custom_grads, custom_deltas = custom_async_like_grads(
-            x, y_np, weights, layer_sizes, params, prop_mode=mode
+        custom_loss, custom_w_grads, custom_b_grads, custom_deltas = custom_async_like_grads(
+            x, y_np, weights, biases, layer_sizes, params, prop_mode=mode
         )
         print(f"\n=== Propagation mode: {mode} ===")
         print(f"custom_loss={custom_loss:.8f}, torch_loss={torch_loss:.8f}")
 
         cosines = []
-        print("Per-layer gradient similarity (custom vs PyTorch):")
-        for i, (g_custom, g_torch) in enumerate(zip(custom_grads, torch_layer_grads), start=1):
+        print("Per-layer weight gradient similarity (custom vs PyTorch):")
+        for i, (g_custom, g_torch) in enumerate(zip(custom_w_grads, torch_w_grads), start=1):
             g_custom_np = np.asarray(g_custom)
             cosine, rel_l2, rel_l2_scaled, scale, mae, max_abs = similarity_metrics(g_custom_np, g_torch)
             cosines.append(cosine)
             print(
                 f"layer_{i}: cosine={cosine:.8f}, rel_l2={rel_l2:.8e}, "
+                f"rel_l2_scaled={rel_l2_scaled:.8e}, scale={scale:.8e}, "
+                f"mae={mae:.8e}, max_abs={max_abs:.8e}"
+            )
+
+        print("Per-layer bias gradient similarity (custom vs PyTorch):")
+        for i, (g_custom, g_torch) in enumerate(zip(custom_b_grads, torch_b_grads), start=1):
+            g_custom_np = np.asarray(g_custom)
+            cosine, rel_l2, rel_l2_scaled, scale, mae, max_abs = similarity_metrics(g_custom_np, g_torch)
+            cosines.append(cosine)
+            print(
+                f"bias_{i}: cosine={cosine:.8f}, rel_l2={rel_l2:.8e}, "
                 f"rel_l2_scaled={rel_l2_scaled:.8e}, scale={scale:.8e}, "
                 f"mae={mae:.8e}, max_abs={max_abs:.8e}"
             )

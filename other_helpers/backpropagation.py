@@ -88,8 +88,12 @@ def MLP_back_prop(params, all_neuron_states, next_grad, layer_idx):
     thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
     th_grad = th_grad * thresholds * (thresholds - 1)
     # jax.debug.print("{} {} {}", layer_activity.shape, thresholds, th_grad.shape)
+    neuron_fired = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)  # (B, out_dim)
+    # bias is added once per input event in the forward pass, so scale by total events per sample
+    n_events = jnp.sum(all_neuron_states.input_activity, axis=1, keepdims=True)  # (B, 1)
+    bias_grad = jnp.sum(next_grad * neuron_fired * n_events/params.max_nonzero, axis=0)
 
-    return mean_weight_grad, th_grad, weight_res
+    return mean_weight_grad, th_grad, weight_res, bias_grad
 
 # region RNN back_prop
 @partial(jax.jit, static_argnames=['params', 'layer_idx'])
@@ -148,21 +152,29 @@ def compute_full_RNN_bpp(params, all_neuron_states, next_grad, layer_idx):
         # Exact matrix trace path.
         weight_grad_hh = rnn_total_product_sum * next_grad[None, :]
 
-    return weight_grad_Ih, weight_res_Ih, weight_grad_hh
+    # --- bias gradient using bias_total_sum ---
+    # bias_total_sum shape: (n_hidden,)
+    # grad_bias[j] = bias_total_sum[j] * next_grad[j]
+    bias_total_sum = all_neuron_states.bias_total_sum  # Shape: (n_hidden,)
+    grad_bias = bias_total_sum * next_grad  # Shape: (n_hidden,)
+
+    return weight_grad_Ih, weight_res_Ih, weight_grad_hh, grad_bias
 
 @partial(jax.jit, static_argnames=['params', 'layer_idx'])
 def RNN_back_prop(params, all_neuron_states, next_grad, layer_idx):
-    weight_grad_Ih, weight_res_Ih, weight_grad_hh = jax.vmap(
+    weight_grad_Ih, weight_res_Ih, weight_grad_hh, grad_bias = jax.vmap(
         compute_full_RNN_bpp, in_axes=(None, 0, 0, None)
     )(params, all_neuron_states, next_grad, layer_idx)
     # weight_grad_Ih: (B, n_input, n_hidden)
     # weight_grad_hh: (B, n_hidden, n_hidden)
+    # grad_bias: (B, n_hidden)
 
     # Keep parity with loss scaling used in the MLP/CNN paths:
     # loss_grad already carries batch normalization from loss_func.
     # Sum here avoids an additional unintended 1/B scaling.
     mean_weight_grad_Ih = jnp.sum(weight_grad_Ih, axis=0)  # (n_input, n_hidden)
     mean_weight_grad_hh = jnp.sum(weight_grad_hh, axis=0)  # (n_hidden, n_hidden)
+    mean_bias_grad = jnp.sum(grad_bias, axis=0)  # (n_hidden,)
 
     # jax.debug.print("mean_weight_grad_Ih stats: min={}, max={}, mean={} shape: {}",
     #                 jnp.min(mean_weight_grad_Ih), jnp.max(mean_weight_grad_Ih),
@@ -171,4 +183,4 @@ def RNN_back_prop(params, all_neuron_states, next_grad, layer_idx):
     #                 jnp.min(mean_weight_grad_hh), jnp.max(mean_weight_grad_hh),
     #                 jnp.mean(mean_weight_grad_hh), mean_weight_grad_hh.shape)
 
-    return mean_weight_grad_Ih, mean_weight_grad_hh, weight_res_Ih
+    return mean_weight_grad_Ih, mean_weight_grad_hh, weight_res_Ih, mean_bias_grad

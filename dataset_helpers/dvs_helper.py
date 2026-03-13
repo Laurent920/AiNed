@@ -16,6 +16,7 @@ def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, dow
     if downsample:
         # Combining common practices: Denoise -> Downsample -> Binning
         frame_transform = transforms.Compose([
+            transforms.CropTime(max=1_500_000),
             # transforms.Denoise(filter_time=10000),             # Remove noise (keep only if other events happened within 10 ms, we can go down to 5 ms max)
             transforms.Downsample(spatial_factor=0.5),         # 128x128 -> 64x64
             # transforms.CropTime(max=500000),  # Keep only first 500ms (time in microseconds)
@@ -34,9 +35,29 @@ def torch_DVSGesture_loader(batch_size, CNN_preprocess=False, shuffle=False, dow
     os.makedirs(save_dir, exist_ok=True)
     
     print(f"Loading DVSGesture dataset from: {save_dir}")
-    
-    trainset = tonic.datasets.DVSGesture(save_to=save_dir, train=True, transform=frame_transform)
-    testset = tonic.datasets.DVSGesture(save_to=save_dir, train=False, transform=frame_transform)
+
+    try:
+        trainset = tonic.datasets.DVSGesture(save_to=save_dir, train=True, transform=frame_transform)
+        testset = tonic.datasets.DVSGesture(save_to=save_dir, train=False, transform=frame_transform)
+    except RuntimeError as e:
+        if "File not found or corrupted" in str(e):
+            # Clean up any corrupted/empty files from failed download
+            dvs_dir = os.path.join(save_dir, "DVSGesture")
+            for fname in ["ibmGestureTrain.tar.gz", "ibmGestureTest.tar.gz"]:
+                fpath = os.path.join(dvs_dir, fname)
+                if os.path.exists(fpath) and os.path.getsize(fpath) == 0:
+                    os.remove(fpath)
+            raise RuntimeError(
+                f"Automatic download of DVSGesture failed (Figshare may be blocking automated requests).\n"
+                f"Please download the dataset manually:\n"
+                f"  1. Download training data: https://figshare.com/ndownloader/files/38022171\n"
+                f"     Save as: {os.path.join(dvs_dir, 'ibmGestureTrain.tar.gz')}\n"
+                f"  2. Download test data:     https://figshare.com/ndownloader/files/38020584\n"
+                f"     Save as: {os.path.join(dvs_dir, 'ibmGestureTest.tar.gz')}\n"
+                f"  3. Extract both archives into: {dvs_dir} using the command  tar -xzf ./data/DVSGesture/ibmGestureTest.tar.gz -C ./data/DVSGesture\n"
+                f"  4. Re-run this script."
+            ) from e
+        raise
 
     # data, label = trainset[0]
     # print("Type of data:", type(data))

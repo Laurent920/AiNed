@@ -7,7 +7,7 @@
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
-# Choose one: 'mnist', 'nmnist', 'dvs'
+# Choose one: 'mnist', 'nmnist', 'dvs', 'ncars'
 # dataset: mnist
 
 # Choose either 'training' or 'inference'
@@ -127,6 +127,23 @@ layer_sizes:
 #   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
 #   - [128]                                  # FC: 128 units
 #   - [11]                                   # Output: 11 gesture classes
+
+# dataset: ncars
+# # ---------- NCARS (120x100 full resolution) ----------
+# layer_sizes:
+#   - [2, 120, 100]                         # Input: 2 polarities
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool
+#   - [128]                                  # FC
+#   - [2]                                    # car/background
+
+# ---------- NCARS (60x50 downsampled) ----------
+# layer_sizes:
+#   - [2, 60, 50]                           # Input downsampled by 2
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool
+#   - [128]                                  # FC
+#   - [2]                                    # car/background
 
 # ---------- Custom Pooling Example ----------
 # layer_sizes:

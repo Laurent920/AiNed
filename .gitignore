@@ -1,3 +1,5 @@
+*.md
+!README.md
 **/__pycache__
 **/venv
 **/venvWSL
@@ -6,3 +8,4 @@
 **/data
 **/cache
 **/big
+**/ncars

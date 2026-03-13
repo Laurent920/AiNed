@@ -26,6 +26,10 @@
 # DVS Gesture (128x128 or 64x64, 2 polarities):
 #   - [32768, 128, 11]  # 128*128*2
 #   - [8192, 128, 11]   # 64*64*2
+#
+# NCARS (120x100 or 60x50, 2 polarities):
+#   - [24000, 256, 2]   # 120*100*2
+#   - [6000, 256, 2]    # 60*50*2
 
 dataset: mnist
 layer_sizes: [784, 256, 256, 10]
@@ -59,13 +63,18 @@ layer_sizes: [784, 256, 10]
 # layer_sizes: [32768, 128, 128, 11]
 # layer_sizes: [8192, 128, 11]  # 64*64*2
 
+# dataset: ncars
+# layer_sizes: [24000, 256, 2]
+# layer_sizes: [6000, 256, 2]   # downsampled
+
 mode: training
+use_bias: false 
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 20            # Number of training epochs
-learning_rate: 0.001       # Learning rate for optimizer
+num_epochs: 50            # Number of training epochs
+learning_rate: 0.0005       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 
 load_file: false
@@ -104,6 +113,7 @@ shuffle_activations: false
 shuffle_input: false
 firing_nb: 1
 sync_rate: 1
+exploration_rate: 0.0  # Probability [0, 1] of replacing a fired top-k neuron with a random non-top-k non-zero neuron (only active when firing_nb < count of non-zero activations)
 # ============================================================================
 # LEARNING AND REGULARIZATION
 # ============================================================================

@@ -1,7 +1,7 @@
 # ============================================================================
 # DATASET CONFIGURATION
 # ============================================================================
-# Choose one: 'mnist', 'shd', 'nmnist', 'dvs', 'smnist', 'psmnist'
+# Choose one: 'mnist', 'shd', 'nmnist', 'dvs', 'ncars', 'smnist', 'psmnist'
 dataset: mnist
 
 # Choose either train or inference
@@ -34,6 +34,10 @@ mode: train
 # DVS Gesture (128x128 or 64x64, 2 polarities):
 #   - [32768, 128, 11]  # 128*128*2
 #   - [8192, 128, 11]   # 64*64*2
+#
+# NCARS (120x100 or 60x50, 2 polarities):
+#   - [24000, 256, 2]   # 120*100*2
+#   - [6000, 256, 2]    # 60*50*2
 layer_sizes: [784, 256, 10]
 
 # ============================================================================

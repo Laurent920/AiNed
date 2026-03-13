@@ -26,9 +26,6 @@ General jax efficiency tips:
     )
 to reuse the input memory for the output values
 
-2. Scanning layers for faster compilation
-
-
 
 
 

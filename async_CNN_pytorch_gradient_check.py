@@ -70,6 +70,8 @@ def init_weights_from_async_cnn(layer_sizes, seed):
     keys = jax.random.split(key, len(layer_defs))
 
     weights = []
+    biases = []
+    rng_bias = np.random.default_rng(seed + 1)
     cur_shape = tuple(int(v) for v in layer_sizes[0])  # (C, H, W)
     for i, layer_def in enumerate(layer_defs):
         if layer_def["kind"] == "conv":
@@ -89,6 +91,7 @@ def init_weights_from_async_cnn(layer_sizes, seed):
                 maxval=bound,
             )
             weights.append(w)
+            biases.append(None)  # conv layers have no bias in this checker
 
             h_out = (cur_shape[1] + 2 * ph - kh) // sh + 1
             w_out = (cur_shape[2] + 2 * pw - kw) // sw + 1
@@ -103,8 +106,10 @@ def init_weights_from_async_cnn(layer_sizes, seed):
             out_dim = layer_def["units"]
             w = 1e-2 * jax.random.normal(keys[i], (in_dim, out_dim), dtype=jnp.float32)
             weights.append(w)
+            b = jnp.asarray(rng_bias.normal(size=(out_dim,)).astype(np.float32) * 0.1)
+            biases.append(b)
             cur_shape = (out_dim,)
-    return weights, layer_defs
+    return weights, biases, layer_defs
 
 
 def apply_pool_jax(x, pooling, pool_size, pool_stride):
@@ -185,11 +190,11 @@ def conv_input_grad_batch(dy, w, stride, padding):
     )
 
 
-def forward_with_states(x, weights, layer_defs, sync_rate, fc_mask_value_mode):
+def forward_with_states(x, weights, biases, layer_defs, sync_rate, fc_mask_value_mode):
     activations = x
     records = []
 
-    for wi, (w, layer_def) in enumerate(zip(weights, layer_defs)):
+    for wi, (w, b, layer_def) in enumerate(zip(weights, biases, layer_defs)):
         if layer_def["kind"] == "conv":
             ph, pw = layer_def["padding"]
             z = jax.lax.conv_general_dilated(
@@ -225,7 +230,7 @@ def forward_with_states(x, weights, layer_defs, sync_rate, fc_mask_value_mode):
             continue
 
         fc_input = activations.reshape(activations.shape[0], -1) if activations.ndim > 2 else activations
-        z = fc_input @ w
+        z = fc_input @ w + b
         is_last = wi == (len(weights) - 1)
 
         if is_last:
@@ -260,6 +265,7 @@ def custom_async_cnn_grads(
     x,
     y,
     weights,
+    biases,
     layer_defs,
     params,
     num_classes,
@@ -271,6 +277,7 @@ def custom_async_cnn_grads(
     logits, records = forward_with_states(
         x,
         weights,
+        biases,
         layer_defs,
         sync_rate=params.sync_rate if isinstance(params.sync_rate, int) else 1,
         fc_mask_value_mode=fc_mask_value_mode,
@@ -282,8 +289,11 @@ def custom_async_cnn_grads(
     out_state = records[-1]["out_state"]
     out_grad, out_w_grad = jax.vmap(loss_bpp, in_axes=(None, 0, 0))(weights[-1], out_state, dlogits)
 
-    grads = [None] * len(weights)
-    grads[-1] = jnp.sum(out_w_grad, axis=0)
+    w_grads = [None] * len(weights)
+    b_grads = [None] * len(biases)
+    w_grads[-1] = jnp.sum(out_w_grad, axis=0)
+    # bias grad for output FC layer: sum over batch of dlogits
+    b_grads[-1] = jnp.sum(dlogits, axis=0)
     next_grad = out_grad
 
     for wi in range(len(weights) - 2, -1, -1):
@@ -292,7 +302,10 @@ def custom_async_cnn_grads(
 
         if rec["kind"] == "fc":
             weight_grad, _th_grad, weight_res = MLP_back_prop(params, rec["state"], next_grad, rec["cfg_idx"])
-            grads[wi] = weight_grad[0]
+            w_grads[wi] = weight_grad[0]
+            # bias grad: next_grad masked by whether the neuron fired (output_vector > 0), summed over batch
+            neuron_fired = (rec["state"].output_vector > 0).astype(next_grad.dtype)  # (B, out_dim)
+            b_grads[wi] = jnp.sum(next_grad * neuron_fired, axis=0)
 
             if wi > 0:
                 if fc_prop_mode == "no_mask":
@@ -337,9 +350,11 @@ def custom_async_cnn_grads(
                 rec["input_residuals"], conv_next_grad, rec["stride"], rec["padding"]
             )
             if conv_grad_reduction == "sum":
-                grads[wi] = jnp.sum(weight_grad_batch, axis=0)
+                w_grads[wi] = jnp.sum(weight_grad_batch, axis=0)
             else:
-                grads[wi] = jnp.mean(weight_grad_batch, axis=0)
+                w_grads[wi] = jnp.mean(weight_grad_batch, axis=0)
+            # conv layers have no bias in this checker
+            b_grads[wi] = None
 
             if wi > 0:
                 next_grad = conv_input_grad_batch(conv_next_grad, w, rec["stride"], rec["padding"])
@@ -347,7 +362,7 @@ def custom_async_cnn_grads(
 
         raise RuntimeError(f"Unexpected record kind: {rec['kind']}")
 
-    return float(loss), grads
+    return float(loss), w_grads, b_grads
 
 
 class TorchCNN(nn.Module):
@@ -368,7 +383,7 @@ class TorchCNN(nn.Module):
                 )
             else:
                 in_dim, out_dim = w.shape
-                layer = nn.Linear(in_dim, out_dim, bias=False)
+                layer = nn.Linear(in_dim, out_dim, bias=True)
             self.layers.append(layer)
 
     def forward(self, x):
@@ -389,14 +404,15 @@ class TorchCNN(nn.Module):
         return x
 
 
-def pytorch_grads(x_np, y_np, weights, layer_defs):
+def pytorch_grads(x_np, y_np, weights, biases, layer_defs):
     model = TorchCNN(layer_defs, weights)
     with torch.no_grad():
-        for layer, w, layer_def in zip(model.layers, weights, layer_defs):
+        for layer, w, b, layer_def in zip(model.layers, weights, biases, layer_defs):
             if layer_def["kind"] == "conv":
                 layer.weight.copy_(torch.tensor(np.asarray(w), dtype=torch.float32))
             else:
                 layer.weight.copy_(torch.tensor(np.asarray(w.T), dtype=torch.float32))
+                layer.bias.copy_(torch.tensor(np.asarray(b), dtype=torch.float32))
 
     x_t = torch.tensor(x_np, dtype=torch.float32)
     y_t = torch.tensor(y_np, dtype=torch.long)
@@ -404,13 +420,17 @@ def pytorch_grads(x_np, y_np, weights, layer_defs):
     loss = nn.CrossEntropyLoss()(logits, y_t)
     loss.backward()
 
-    grads = []
+    w_grads = []
+    b_grads = []
     for layer, layer_def in zip(model.layers, layer_defs):
         g = layer.weight.grad.detach().cpu().numpy()
         if layer_def["kind"] == "fc":
             g = g.T
-        grads.append(g)
-    return float(loss.item()), grads
+            b_grads.append(layer.bias.grad.detach().cpu().numpy())
+        else:
+            b_grads.append(None)
+        w_grads.append(g)
+    return float(loss.item()), w_grads, b_grads
 
 
 def load_mnist_cnn_inputs(num_inputs, batch_size, data_dir, input_shape):
@@ -489,7 +509,7 @@ def build_params(cfg, layer_sizes, seed, batch_size):
         rerun="",
         top_weights=-1,
         history_size=0,
-        use_bias=False,
+        use_bias=True,
     )
 
 
@@ -560,7 +580,7 @@ def main():
 
     num_classes = int(layer_sizes[-1][0])
     input_shape = tuple(int(v) for v in layer_sizes[0])
-    layer_weights, layer_defs = init_weights_from_async_cnn(layer_sizes, args.seed)
+    layer_weights, layer_biases, layer_defs = init_weights_from_async_cnn(layer_sizes, args.seed)
     params = build_params(cfg, layer_sizes, args.seed, args.num_inputs)
 
     x_np, y_np = load_inputs(
@@ -575,11 +595,16 @@ def main():
     )
     x = jnp.asarray(x_np, dtype=jnp.float32)
 
-    torch_loss, torch_layer_grads = pytorch_grads(x_np, y_np, [np.asarray(w) for w in layer_weights], layer_defs)
-    custom_loss, custom_grads = custom_async_cnn_grads(
+    torch_loss, torch_w_grads, torch_b_grads = pytorch_grads(
+        x_np, y_np, [np.asarray(w) for w in layer_weights],
+        [np.asarray(b) if b is not None else None for b in layer_biases],
+        layer_defs,
+    )
+    custom_loss, custom_w_grads, custom_b_grads = custom_async_cnn_grads(
         x,
         y_np,
         layer_weights,
+        layer_biases,
         layer_defs,
         params,
         num_classes=num_classes,
@@ -600,13 +625,26 @@ def main():
 
     names = layer_names(layer_defs)
     cosines = []
-    print("\nPer-layer gradient similarity (custom vs PyTorch):")
-    for name, g_custom, g_torch in zip(names, custom_grads, torch_layer_grads):
+    print("\nPer-layer weight gradient similarity (custom vs PyTorch):")
+    for name, g_custom, g_torch in zip(names, custom_w_grads, torch_w_grads):
         g_custom_np = np.asarray(g_custom)
         cosine, rel_l2, rel_l2_scaled, scale, mae, max_abs = similarity_metrics(g_custom_np, g_torch)
         cosines.append(cosine)
         print(
             f"{name}: cosine={cosine:.8f}, rel_l2={rel_l2:.8e}, "
+            f"rel_l2_scaled={rel_l2_scaled:.8e}, scale={scale:.8e}, "
+            f"mae={mae:.8e}, max_abs={max_abs:.8e}"
+        )
+
+    print("\nPer-layer bias gradient similarity (custom vs PyTorch, FC layers only):")
+    for name, g_custom, g_torch in zip(names, custom_b_grads, torch_b_grads):
+        if g_custom is None:
+            continue
+        g_custom_np = np.asarray(g_custom)
+        cosine, rel_l2, rel_l2_scaled, scale, mae, max_abs = similarity_metrics(g_custom_np, g_torch)
+        cosines.append(cosine)
+        print(
+            f"bias_{name}: cosine={cosine:.8f}, rel_l2={rel_l2:.8e}, "
             f"rel_l2_scaled={rel_l2_scaled:.8e}, scale={scale:.8e}, "
             f"mae={mae:.8e}, max_abs={max_abs:.8e}"
         )

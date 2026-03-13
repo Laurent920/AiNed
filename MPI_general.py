@@ -35,6 +35,7 @@ from dataset_helpers.mnist_helper import mnist_loader_manual
 from dataset_helpers.shd_helper import torch_SHD_loader
 from dataset_helpers.nmnist_helper import torch_nmnist_loader
 from dataset_helpers.dvs_helper import torch_DVSGesture_loader
+from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.network_helper import one_hot_encode
 
@@ -1224,6 +1225,10 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None):
                             loader = partial(torch_nmnist_loader, CNN_preprocess=False)
                         case "dvs":
                             loader = partial(torch_DVSGesture_loader, CNN_preprocess=False)                            
+                        case "ncars":
+                            if layer_sizes[0] == 60 * 50 * 2:
+                                downsample = True
+                            loader = partial(torch_NCARS_loader, CNN_preprocess=False)
                         case _:
                             raise ValueError(f"Unknown dataset: {dataset}")
 
