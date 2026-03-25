@@ -1,9 +1,11 @@
 try:
     from dataset_helpers.mnist_helper import mnist_loader_manual
     from dataset_helpers.nmnist_helper import torch_nmnist_loader
+    from dataset_helpers.ncars_helper import torch_NCARS_loader
 except ModuleNotFoundError:
     from mnist_helper import mnist_loader_manual
     from nmnist_helper import torch_nmnist_loader
+    from ncars_helper import torch_NCARS_loader
 
 import torch
 import torch.nn as nn
@@ -17,16 +19,27 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 5
+epochs = 20
 batch_size = 120
 
 dataset = "mnist"
 # dataset = "nmnist"
+dataset = "ncars"
+ncars_downsample = False
 
-if dataset == "mnist":
-    input_shape = (1, 28, 28)
-else:
-    input_shape = (2, 34, 34)
+def get_dataset_config(dataset_name, ncars_downsample=False):
+    if dataset_name == "mnist":
+        return (1, 28, 28), 10
+    if dataset_name == "nmnist":
+        return (2, 34, 34), 10
+    if dataset_name == "ncars":
+        if ncars_downsample:
+            return (2, 60, 50), 2
+        return (2, 120, 100), 2
+    raise ValueError(f"Unsupported dataset: {dataset_name}")
+
+
+input_shape, num_classes = get_dataset_config(dataset, ncars_downsample)
 # ==========================================================
 # CNN MODEL
 # ==========================================================
@@ -219,6 +232,162 @@ class NmnistCNN(nn.Module):
         """Helper to record average nonzero activations per sample."""
         nonzero = (x != 0).sum().item() / x.size(0)
         self.activation_stats[layer_name].append(nonzero)
+
+
+class AdaptiveEventCNN(nn.Module):
+    def __init__(self, num_classes=2, in_channels=2):
+        super(AdaptiveEventCNN, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, 3, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.drop1 = nn.Dropout2d(p=0.05)
+
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.drop2 = nn.Dropout2d(p=0.10)
+
+        self.conv5 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv6 = nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.drop3 = nn.Dropout2d(p=0.15)
+
+        self.conv7 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc1 = nn.Linear(256, 128, bias=False)
+        self.drop_fc = nn.Dropout(p=0.30)
+        self.out = nn.Linear(128, num_classes, bias=False)
+
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
+        }
+
+        self._initialize_weights()
+
+    def forward(self, x):
+        self._record_activation("input", x)
+        x = torch.log1p(x)
+
+        x = F.relu(self.conv1(x))
+        self._record_activation("conv1", x)
+        x = F.relu(self.conv2(x))
+        self._record_activation("conv2", x)
+        x = self.pool1(x)
+        self._record_activation("pool1", x)
+        x = self.drop1(x)
+
+        x = F.relu(self.conv3(x))
+        self._record_activation("conv3", x)
+        x = F.relu(self.conv4(x))
+        self._record_activation("conv4", x)
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
+        x = self.drop2(x)
+
+        x = F.relu(self.conv5(x))
+        self._record_activation("conv5", x)
+        x = F.relu(self.conv6(x))
+        self._record_activation("conv6", x)
+        x = self.pool3(x)
+        self._record_activation("pool3", x)
+        x = self.drop3(x)
+
+        x = F.relu(self.conv7(x))
+        self._record_activation("conv7", x)
+        x = self.pool4(x)
+        self._record_activation("pool4", x)
+
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        self._record_activation("fc1", x)
+        x = self.drop_fc(x)
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+
+class SmallEventCNN(nn.Module):
+    def __init__(self, num_classes=2, in_channels=2):
+        super(SmallEventCNN, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, 3, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.drop1 = nn.Dropout2d(p=0.05)
+
+        self.conv3 = nn.Conv2d(5, 8, kernel_size=3, stride=1, padding=1, bias=False)
+        # self.conv4 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        # self.pool3 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.drop2 = nn.Dropout2d(p=0.10)
+
+        self.fc1 = nn.Linear(30*25*8, 128, bias=False)
+        # self.drop_fc = nn.Dropout(p=0.30)
+        self.out = nn.Linear(128, num_classes, bias=False)
+
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
+        }
+
+        self._initialize_weights()
+
+    def forward(self, x):
+        self._record_activation("input", x)
+        x = torch.log1p(x)
+
+        x = F.relu(self.conv1(x))
+        self._record_activation("conv1", x)
+        x = self.pool1(x)
+        self._record_activation("pool1", x)
+        # x = self.drop1(x)
+
+        x = F.relu(self.conv2(x))
+        self._record_activation("conv2", x)
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
+        # x = self.drop2(x)
+
+        x = F.relu(self.conv3(x))
+        self._record_activation("conv3", x)
+        # x = self.pool3(x)
+        # self._record_activation("pool3", x)
+        # x = self.drop3(x)
+
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        self._record_activation("fc1", x)
+        # x = self.drop_fc(x)
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
 class VGG16(nn.Module):
     def __init__(self, num_classes=10, in_channels=1):
@@ -517,6 +686,9 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         # model = VGG16(num_classes=10, in_channels=2).to(device)
         # model = VGG8(num_classes=10, in_channels=2).to(device)
         model = VGG8Light(num_classes=10, in_channels=2).to(device)
+    elif dataset == "ncars":
+        # model = AdaptiveEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
+        model = SmallEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
     else:
         print("Wrong dataset")
         return
@@ -534,8 +706,8 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         running_loss, correct, total = 0, 0, 0
 
         for batch_idx, (inputs, targets) in enumerate(tqdm(iter(train_loader))):
-            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
-            targets = torch.tensor(targets, dtype=torch.long).to(device)
+            inputs = torch.as_tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
+            targets = torch.as_tensor(targets, dtype=torch.long).to(device)
 
             # UNCOMMENT to check if the two dataloader implementation are equal
             # p_inputs, p_targets = next(p_train_iter)
@@ -683,8 +855,8 @@ def evaluate(model, loader, total_batches, device):
     correct, total = 0, 0
     with torch.no_grad():
         for inputs, targets in iter(loader):
-            inputs = torch.tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
-            targets = torch.tensor(targets, dtype=torch.long).to(device)
+            inputs = torch.as_tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
+            targets = torch.as_tensor(targets, dtype=torch.long).to(device)
             outputs = model(inputs)
             _, predicted = outputs.max(1)
             total += targets.size(0)
@@ -767,6 +939,14 @@ if __name__ == "__main__":
         (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, preprocess=False)
     elif dataset == "nmnist":
         (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = torch_nmnist_loader(batch_size, binned=True, aggregate_time=True)
+    elif dataset == "ncars":
+        (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = torch_NCARS_loader(
+            batch_size=batch_size,
+            downsample=ncars_downsample,
+            full_matrix=True,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)

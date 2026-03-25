@@ -215,8 +215,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
             new_bias_total_sum = (neuron_states.bias_total_sum
                                   + new_bias_running_sum * active_tanh)  # (n_hidden,)
 
-            # --- Compact recurrent accumulator for W_hh ---
-            # Empirically better compact source term than diag(R_{i-1}):
+            # --- Compact recurrent accumulator for W_hh (diagonal approx) ---
             # source[:, n] = R_{i-1} for every target column n.
             # Recurrence: U_i = source(R_{i-1}) + U_{i-1} @ A_{i-1}
             # Total: S += U_i * (ReLU'(z_i) * T_i)[None, :]  (column-wise scale)
@@ -233,21 +232,55 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
                 + recurrent_running_sum * active_tanh[None, :]
             )
 
+            # --- Exact RTRL traces (when params.exact_rtrl is True) ---
+            # These use the full A matrix for propagation and full einsum for gradient extraction
+            # Never record exact traces for input/output layers (even if recurrence is enabled)
+            use_exact_rtrl = params.exact_rtrl and (layer_idx != 0) and (layer_idx != last_layer)
+            if use_exact_rtrl:
+                H = W_hh.shape[0]
+                eye_h = jnp.eye(H)
+
+                # Exact W_hh trace: P_hh (H, H, H)
+                # P_hh[m, n, j] = dactivations[j] / dW_hh[m, n]
+                # Propagation: P_new[m,:,:] = P_old[m,:,:] @ A for each m
+                new_exact_hh_running = jnp.einsum(
+                    "mnk,kj->mnj", neuron_states.exact_hh_running, A_T
+                )
+                # Source: P[m, n, j] += o_prev[m] * I[n, j]
+                new_exact_hh_running = new_exact_hh_running + (
+                    neuron_states.prev_activated_output[:, None, None] * eye_h[None, :, :]
+                )
+                new_exact_hh_total = (
+                    neuron_states.exact_hh_total
+                    + new_exact_hh_running * active_tanh[None, None, :]
+                )
+
+                # Exact bias trace: Q_bias (H, H)
+                # Q_bias[n, j] = dactivations[j] / dbias[n]
+                # Propagation: Q_new = Q_old @ A + I
+                new_exact_bias_running = (
+                    neuron_states.exact_bias_running @ A_T + eye_h
+                )
+                new_exact_bias_total = (
+                    neuron_states.exact_bias_total
+                    + new_exact_bias_running * active_tanh[None, :]
+                )
+
             last_neuron_idx = jnp.argmax(neuron_states.input_order) # Last neuron index in the input order
             new_neuron_idx = jax.lax.cond(neuron_idx < 0, lambda _: last_neuron_idx, lambda _: neuron_idx, None)
 
-            new_neuron_states = neuron_states.replace(
+            replace_fields = dict(
                 values=new_values,
                 input_residuals=new_input_residuals,
                 output_residuals=neuron_states.output_residuals + send_output,
                 input_activity=new_input_activity,
                 layer_activity=neuron_states.layer_activity + active_indexes,
-                input_order=neuron_states.input_order.at[new_neuron_idx].set(iteration),                    # Update the input activity by setting the input neuron to the iteration number
+                input_order=neuron_states.input_order.at[new_neuron_idx].set(iteration),                # Update the input activity by setting the input neuron to the iteration number
                 output_activity=neuron_states.output_activity.at[new_neuron_idx].add(active_indexes),
-                input_vector=neuron_states.input_vector.at[neuron_idx].set(iteration + 1),                  # Set the input neuron to the iteration at which the input was received (# Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1))
-                output_vector=jnp.where(send_output > 0, iteration + 1, neuron_states.output_vector),  # Set the output neuron to the last iteration at which it activated     (Same as above for +1)
+                input_vector=neuron_states.input_vector.at[neuron_idx].set(iteration + 1),              # Set the input neuron to the iteration at which the input was received (# Added +1 so that we can differentiate between never activated (0) and activated at iteration 0 (1))
+                output_vector=jnp.where(send_output > 0, iteration + 1, neuron_states.output_vector),   # Set the output neuron to the last iteration at which it activated     (Same as above for +1)
                 last_sent_iteration=new_last_sent_iteration,
-                # New RNN gradient fields:
+                # Diagonal RNN gradient fields:
                 rnn_running_sum=new_running_sum,
                 rnn_total_sum=new_total_sum,
                 rnn_running_product=recurrent_running_sum,
@@ -256,7 +289,16 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
                 bias_total_sum=new_bias_total_sum,
                 prev_active=active_indexes,
                 prev_activated_output=send_output,
-                prev_tanh_deriv=tanh_deriv_curr,)
+                prev_tanh_deriv=tanh_deriv_curr,
+            )
+            if use_exact_rtrl:
+                replace_fields.update(
+                    exact_hh_running=new_exact_hh_running,
+                    exact_hh_total=new_exact_hh_total,
+                    exact_bias_running=new_exact_bias_running,
+                    exact_bias_total=new_exact_bias_total,
+                )
+            new_neuron_states = neuron_states.replace(**replace_fields)
         else:
             new_neuron_states = neuron_states.replace(
                 values=new_values,
@@ -1244,6 +1286,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             recurrence=config['recurrence'],
             use_bias=config['use_bias'],
             use_tanh=config['use_tanh'],
+            exact_rtrl=config.get('exact_rtrl', False),
         )
         if trial is not None:
             params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
@@ -1269,6 +1312,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         sync_rate_vector = jnp.full(shape=(layer_sizes[layer_idx],), fill_value=params.sync_rate)
 
         key, subkey = jax.random.split(key) 
+        # Never allocate exact RTRL traces for input/output layers (even if recurrence is enabled)
+        use_exact_rtrl = params.exact_rtrl and (layer_idx != 0) and (layer_idx != last_layer)
         empty_neuron_states = NeuronStates( values=jnp.zeros(layer_sizes[layer_idx]),
                                             bias=jnp.zeros(layer_sizes[layer_idx]),
                                             thresholds=thresholds,
@@ -1294,6 +1339,12 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                                             prev_active=jnp.zeros((layer_sizes[layer_idx],), dtype=int),
                                             prev_activated_output=jnp.zeros((layer_sizes[layer_idx],)),
                                             prev_tanh_deriv=jnp.ones((layer_sizes[layer_idx],)),
+                                            **(dict(
+                                                exact_hh_running=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                                exact_hh_total=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                                exact_bias_running=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                                exact_bias_total=jnp.zeros((layer_sizes[layer_idx], layer_sizes[layer_idx])),
+                                            ) if use_exact_rtrl else {}),
                                             )
         # print(f"rank {rank} sync rates: {sync_rate_vector}")
         total_batches = (total_train_batches, total_val_batches, total_test_batches)

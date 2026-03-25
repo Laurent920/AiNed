@@ -428,10 +428,61 @@ def custom_preprocess_event_pad_collate(batch, max_len, x_size, y_size):
     label_array = jnp.array(labels, dtype=jnp.int32)
     return batch_array, label_array
 
-# region ncars loader
-def torch_NCARS_loader(batch_size, CNN_preprocess=False, shuffle=False, downsample=False, data_dir=""):
+
+def _events_to_dense_matrix(events, x_size, y_size):
     """
-    NCARS dataloader in the same output format as existing event dataloaders.
+    Aggregate all events from one sample into a dense (C, H, W) matrix.
+    Channel 0 and 1 correspond to the two polarities.
+    """
+    frame = np.zeros((NCARS_SENSOR_SIZE[2], x_size, y_size), dtype=np.float32)
+    if len(events) == 0:
+        return frame
+
+    p = events["p"].astype(np.intp)
+    x = events["x"].astype(np.intp)
+    y = events["y"].astype(np.intp)
+
+    valid = (
+        (p >= 0)
+        & (p < NCARS_SENSOR_SIZE[2])
+        & (x >= 0)
+        & (x < x_size)
+        & (y >= 0)
+        & (y < y_size)
+    )
+    if np.any(valid):
+        np.add.at(frame, (p[valid], x[valid], y[valid]), 1.0)
+    return frame
+
+
+def dense_matrix_collate(batch, x_size, y_size):
+    """
+    Returns a dense batch in shape (B, C, H, W) for regular CNN training.
+    Each matrix entry stores the event count accumulated at that location.
+    """
+    data, labels = zip(*batch)
+    batch_array = np.stack(
+        [_events_to_dense_matrix(events, x_size, y_size) for events in data],
+        axis=0,
+    )
+    label_array = np.asarray(labels, dtype=np.int32)
+    return batch_array, label_array
+
+# region ncars loader
+def torch_NCARS_loader(
+    batch_size,
+    CNN_preprocess=False,
+    shuffle=False,
+    downsample=False,
+    data_dir="",
+    full_matrix=False,
+):
+    """
+    NCARS dataloader.
+
+    By default it returns the existing event-based formats used by the async
+    models. Set ``full_matrix=True`` to aggregate each sample into a dense
+    ``(C, H, W)`` matrix for regular CNN training.
     """
     if data_dir:
         base_cache_dir = os.path.join(data_dir, "cache/NCARS")
@@ -470,23 +521,26 @@ def torch_NCARS_loader(batch_size, CNN_preprocess=False, shuffle=False, downsamp
 
     x_size = NCARS_SENSOR_SIZE[0] // 2 if downsample else NCARS_SENSOR_SIZE[0]
     y_size = NCARS_SENSOR_SIZE[1] // 2 if downsample else NCARS_SENSOR_SIZE[1]
-    max_data_length = _compute_max_data_length_once(
-        trainset,
-        testset,
-        base_cache_dir,
-        bool(CNN_preprocess),
-        x_size,
-        y_size,
-    )
-
-    if CNN_preprocess:
-        collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length)
-    elif CNN_preprocess is None:
-        collate_fn = basic_event_collate
+    if full_matrix:
+        max_data_length = x_size * y_size * NCARS_SENSOR_SIZE[2]
+        collate_fn = lambda batch: dense_matrix_collate(batch, x_size, y_size)
     else:
-        collate_fn = lambda batch: custom_preprocess_event_pad_collate(
-            batch, max_data_length, x_size, y_size
+        max_data_length = _compute_max_data_length_once(
+            trainset,
+            testset,
+            base_cache_dir,
+            bool(CNN_preprocess),
+            x_size,
+            y_size,
         )
+        if CNN_preprocess:
+            collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length)
+        elif CNN_preprocess is None:
+            collate_fn = basic_event_collate
+        else:
+            collate_fn = lambda batch: custom_preprocess_event_pad_collate(
+                batch, max_data_length, x_size, y_size
+            )
 
     trainloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=shuffle)
     valloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
@@ -514,6 +568,11 @@ def _run_standalone_test():
         action="store_true",
         help="Use CNN event format [p,x,y,1] instead of flattened indices",
     )
+    parser.add_argument(
+        "--full_matrix",
+        action="store_true",
+        help="Return dense (C, H, W) matrices for regular CNN training",
+    )
     parser.add_argument("--shuffle", action="store_true", help="Shuffle train loader")
     args = parser.parse_args()
 
@@ -524,6 +583,7 @@ def _run_standalone_test():
             "data_dir": args.data_dir,
             "downsample": args.downsample,
             "cnn_preprocess": args.cnn_preprocess,
+            "full_matrix": args.full_matrix,
             "shuffle": args.shuffle,
             "archive": NCARS_ARCHIVE_FILENAME,
             "expected_counts": NCARS_EXPECTED_SPLIT_COUNTS,
@@ -537,6 +597,7 @@ def _run_standalone_test():
             shuffle=args.shuffle,
             downsample=args.downsample,
             data_dir=args.data_dir,
+            full_matrix=args.full_matrix,
         )
         trainloader, n_train = train
         valloader, n_val = val

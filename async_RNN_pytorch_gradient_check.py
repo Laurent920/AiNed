@@ -35,55 +35,28 @@ def init_recurrent_weight(hidden_size, seed, gain=0.5):
     return w * (gain / jnp.sqrt(hidden_size))
 
 
-def load_mnist_inputs(num_inputs, batch_size, data_dir):
-    (train_loader, _), _, _, _ = mnist_loader_manual(
-        batch_size=batch_size,
-        shuffle=False,
-        preprocess=False,
-        CNN_preprocess=False,
-        downsample=False,
-        sequential=False,
-        permuted=False,
-        data_dir=data_dir,
-    )
+def load_preprocessed_inputs(num_inputs, batch_size, data_dir, sequential=False):
+    """Load preprocessed event-format data: returns x (N, T, 2), y (N,), n_input_neurons.
 
-    xs, ys = [], []
-    for bx, by in train_loader:
-        xs.append(np.asarray(bx, dtype=np.float32))
-        ys.append(np.asarray(by, dtype=np.int64))
-        if sum(arr.shape[0] for arr in xs) >= num_inputs:
-            break
-
-    x = np.concatenate(xs, axis=0)[:num_inputs]
-    y = np.concatenate(ys, axis=0)[:num_inputs]
-    return x, y
-
-
-def load_smnist_inputs(num_inputs, batch_size, data_dir):
-    """Load SMNIST: returns x shape (N, 784) raw pixel values, y shape (N,).
-    The sequential preprocessing (index, value) pairs is handled in the forward loop.
+    x[:, t, :] = (neuron_idx, value).  Padding events have neuron_idx < 0.
+    MNIST:  T=351, n_input_neurons=784
+    S-MNIST: T=784, n_input_neurons=1
     """
     (train_loader, _), _, _, _ = mnist_loader_manual(
         batch_size=batch_size,
         shuffle=False,
-        preprocess=False,
+        preprocess=True,
         CNN_preprocess=False,
         downsample=False,
-        sequential=False,
+        sequential=sequential,
         permuted=False,
         data_dir=data_dir,
     )
 
-    xs, ys = [], []
-    for bx, by in train_loader:
-        xs.append(np.asarray(bx, dtype=np.float32))
-        ys.append(np.asarray(by, dtype=np.int64))
-        if sum(arr.shape[0] for arr in xs) >= num_inputs:
-            break
-
-    x = np.concatenate(xs, axis=0)[:num_inputs]  # (N, 784), values in [0, 1]
-    y = np.concatenate(ys, axis=0)[:num_inputs]
-    return x, y
+    x = np.asarray(train_loader.X[train_loader.indices], dtype=np.float32)[:num_inputs]
+    y = np.asarray(train_loader.Y[train_loader.indices], dtype=np.int64)[:num_inputs]
+    n_input_neurons = 1 if sequential else 784
+    return x, y, n_input_neurons
 
 
 def one_hot(y, num_classes):
@@ -122,16 +95,13 @@ def custom_rule_grads(
     grad_mode="trace",
     trace_source_mode="full",
     use_tanh=False,
-    is_smnist=False,
     exact_hh_trace=False,  # If True, maintain full H^3 RTRL trace for W_hh (exact but expensive)
     exact_ih_trace=False,  # If True, maintain full (n_input, H, H) RTRL trace for W_ih + (H, H) for bias
 ):
-    batch_size, in_dim = x.shape
+    # x: (B, T, 2) — event format (neuron_idx, value), padding has idx < 0
+    batch_size, num_steps, _ = x.shape
     hidden_dim = w_ih.shape[1]
-    # For SMNIST: x is (B, T=784) pixel values, w_ih is (1, H).
-    # The loop runs T steps, always using w_ih[0].
-    # rnn_running_sum tracks only 1 input neuron, shape (B, 1, H).
-    num_input_neurons = w_ih.shape[0]  # 1 for smnist, in_dim for mnist
+    num_input_neurons = w_ih.shape[0]  # 784 for mnist, 1 for smnist
 
     # State mirrors async_RNN: values = activations - penalty (pre-tanh residual)
     state = jnp.zeros((batch_size, hidden_dim), dtype=jnp.float32)
@@ -169,21 +139,21 @@ def custom_rule_grads(
     tanh_deriv_list = []
     o_prev_list = []
     prev_active_eff = jnp.zeros((batch_size, hidden_dim), dtype=jnp.float32)
-    # For SMNIST: loop over T=784 timesteps, always use w_ih[0] (neuron_idx=0)
-    # For MNIST: loop over in_dim input neurons, use w_ih[t] for timestep t
-    num_steps = in_dim  # number of loop iterations
-    for t in range(num_steps):
-        if is_smnist:
-            x_t = x[:, t : t + 1]   # (B, 1) pixel value at timestep t
-            w_t = w_ih[0][None, :]   # (1, H) — always neuron 0
-            neuron_t = 0             # rnn_running_sum index
-        else:
-            x_t = x[:, t : t + 1]   # (B, 1)
-            w_t = w_ih[t][None, :]   # (1, H)
-            neuron_t = t
+    # Extract event arrays for the loop
+    all_neuron_idx = jnp.asarray(x[:, :, 0], dtype=jnp.int32)  # (B, T)
+    all_value = x[:, :, 1]                                       # (B, T)
 
-        # async_RNN dynamics: activations = x*w + state + bias + o_prev @ W_hh
-        activations = x_t * w_t + state + bias_h[None, :] + (o_prev @ w_hh)
+    for t in range(num_steps):
+        neuron_idx = all_neuron_idx[:, t]       # (B,)
+        value_t = all_value[:, t]               # (B,)
+        valid = (neuron_idx >= 0).astype(jnp.float32)  # (B,)
+        safe_idx = jnp.clip(neuron_idx, 0)
+
+        w_selected = w_ih[safe_idx]             # (B, H)
+        drive = value_t[:, None] * w_selected * valid[:, None]  # (B, H)
+
+        # async_RNN dynamics: activations = drive + state + bias + o_prev @ W_hh
+        activations = drive + state + bias_h[None, :] + (o_prev @ w_hh)
 
         # z_t = tanh(activations) or activations; tanh_deriv at current step
         if use_tanh:
@@ -222,7 +192,11 @@ def custom_rule_grads(
         A_prev_diag = (1.0 - prev_m_eff) + prev_m_eff * w_hh_diag[None, :]
         # W_ih trace: diagonal approx, shape (B, n_input, H)
         rnn_running_sum = rnn_running_sum * A_prev_diag[:, None, :]
-        rnn_running_sum = rnn_running_sum.at[:, neuron_t, :].add(x[:, t][:, None])
+        # Per-sample scatter: each sample may hit a different neuron_idx
+        batch_idx = jnp.arange(batch_size)
+        rnn_running_sum = rnn_running_sum.at[batch_idx, safe_idx, :].add(
+            (value_t * valid)[:, None]
+        )
         rnn_total_sum = rnn_total_sum + rnn_running_sum * m_t_eff[:, None, :]
         # Bias trace: same diagonal propagation, input is always 1
         bias_running_sum = bias_running_sum * A_prev_diag + 1.0  # (B, H)
@@ -261,10 +235,9 @@ def custom_rule_grads(
             # Q_t[k, n, j] = dactivations_t[j] / dW_ih[k, n]
             # = x_t * delta_{k=neuron_t} * delta_{nj} + sum_l Q_{t-1}[k,n,l] * A_prev[l,j]
             Q_ih_trace = jnp.einsum("bknl,blj->bknj", Q_ih_trace, A_prev)
-            # Source: x_t[b] * delta_{k=neuron_t} * I[n,j]
-            x_t_val = x[:, t]  # (B,)
-            src_ih = x_t_val[:, None, None] * eye_h[None, :, :]  # (B, H, H)
-            Q_ih_trace = Q_ih_trace.at[:, neuron_t, :, :].add(src_ih)
+            # Source: value_t[b] * valid[b] * delta_{k=safe_idx[b]} * I[n,j]
+            src_ih = (value_t * valid)[:, None, None] * eye_h[None, :, :]  # (B, H, H)
+            Q_ih_trace = Q_ih_trace.at[batch_idx, safe_idx, :, :].add(src_ih)
             T_ih_accum = T_ih_accum + Q_ih_trace * m_t_eff[:, None, None, :]
 
             # R_t[n, j] = dactivations_t[j] / dbias[n]
@@ -315,7 +288,11 @@ def custom_rule_grads(
         grad_bias = jnp.zeros((hidden_dim,), dtype=jnp.float32)
 
         for t in range(num_steps - 1, -1, -1):
-            neuron_t = 0 if is_smnist else t
+            neuron_idx_t = all_neuron_idx[:, t]       # (B,)
+            value_t_bwd = all_value[:, t]              # (B,)
+            valid_t = (neuron_idx_t >= 0).astype(jnp.float32)
+            safe_idx_t = jnp.clip(neuron_idx_t, 0)
+
             m_t = m_list[t]
             td = tanh_deriv_list[t]  # (B, H), relu'(tanh)*tanh'(act); ones when use_tanh=False
             m_t_eff = m_t * td
@@ -327,9 +304,9 @@ def custom_rule_grads(
             delta_t = out_grad * m_t_eff + jnp.einsum(
                 "bh,bhl->bl", delta_next, A_hat_t.transpose(0, 2, 1)
             )
-            grad_ih = grad_ih.at[neuron_t, :].add(
-                jnp.sum(delta_t * x[:, t][:, None], axis=0)
-            )
+            # Per-sample scatter for w_ih gradient
+            per_sample_ih = delta_t * (value_t_bwd * valid_t)[:, None]  # (B, H)
+            grad_ih = grad_ih.at[safe_idx_t, :].add(per_sample_ih)
             grad_hh = grad_hh + jnp.einsum("bm,bn->mn", o_prev_list[t], delta_t)
             grad_bias = grad_bias + jnp.sum(delta_t, axis=0)  # sum over batch
             delta_next = delta_t
@@ -341,7 +318,7 @@ def custom_rule_grads(
 
 # region pytorch autograd reference
 class TorchRuleRNN(nn.Module):
-    def __init__(self, w_ih, w_hh, w_out, bias_h, sync_rate, firing_nb, use_tanh=False, is_smnist=False):
+    def __init__(self, w_ih, w_hh, w_out, bias_h, sync_rate, firing_nb, use_tanh=False):
         super().__init__()
         self.w_ih = nn.Parameter(torch.tensor(np.asarray(w_ih), dtype=torch.float32))
         self.w_hh = nn.Parameter(torch.tensor(np.asarray(w_hh), dtype=torch.float32))
@@ -352,26 +329,30 @@ class TorchRuleRNN(nn.Module):
         self.sync_rate = int(sync_rate)
         self.firing_nb = int(firing_nb)
         self.use_tanh = bool(use_tanh)
-        self.is_smnist = bool(is_smnist)
 
     def forward(self, x):
-        batch_size, in_dim = x.shape
+        """
+        x: (B, T, 2) — each timestep is (neuron_idx, value).
+           Padding events have neuron_idx < 0 and are masked out.
+        """
+        batch_size, num_steps, _ = x.shape
         hidden_dim = self.w_ih.shape[1]
         out_dim = self.w_out.shape[1]
 
-        # State mirrors async_RNN: values = activations - penalty (pre-tanh residual)
         state = torch.zeros((batch_size, hidden_dim), dtype=x.dtype, device=x.device)
         o_prev = torch.zeros((batch_size, hidden_dim), dtype=x.dtype, device=x.device)
         logits = torch.zeros((batch_size, out_dim), dtype=x.dtype, device=x.device)
 
-        num_steps = in_dim
         for t in range(num_steps):
-            x_t = x[:, t : t + 1]
-            # SMNIST: always use w_ih[0] (single input neuron)
-            w_t = self.w_ih[0].unsqueeze(0) if self.is_smnist else self.w_ih[t].unsqueeze(0)
+            neuron_idx = x[:, t, 0].long()          # (B,)
+            value      = x[:, t, 1]                  # (B,)
+            valid      = (neuron_idx >= 0).float()   # (B,)
+            safe_idx   = neuron_idx.clamp(min=0)
 
-            # async_RNN: activations = x*w + values + bias + o_prev @ W_hh
-            activations = x_t * w_t + state + self.bias_h.unsqueeze(0) + (o_prev @ self.w_hh)
+            w_selected = self.w_ih[safe_idx]         # (B, H)
+            drive = value.unsqueeze(1) * w_selected * valid.unsqueeze(1)  # (B, H)
+
+            activations = drive + state + self.bias_h.unsqueeze(0) + (o_prev @ self.w_hh)
 
             if self.use_tanh:
                 tanh_out = torch.tanh(activations)
@@ -385,7 +366,6 @@ class TorchRuleRNN(nn.Module):
 
             logits = logits + o_t @ self.w_out
 
-            # async_RNN: new_values = activations - penalty (restrict=1 => penalty = o_t)
             state = activations - o_t
             o_prev = o_t
 
@@ -393,7 +373,7 @@ class TorchRuleRNN(nn.Module):
 
 
 def pytorch_grads(
-    x_np, y_np, w_ih, w_hh, w_out, bias_h, sync_rate, firing_nb, use_tanh=False, is_smnist=False
+    x_np, y_np, w_ih, w_hh, w_out, bias_h, sync_rate, firing_nb, use_tanh=False
 ):
     model = TorchRuleRNN(
         w_ih=w_ih,
@@ -403,10 +383,9 @@ def pytorch_grads(
         sync_rate=sync_rate,
         firing_nb=firing_nb,
         use_tanh=use_tanh,
-        is_smnist=is_smnist,
     )
 
-    x_t = torch.tensor(x_np, dtype=torch.float32)
+    x_t = torch.tensor(x_np, dtype=torch.float32)  # (B, T, 2)
     y_t = torch.tensor(y_np, dtype=torch.long)
 
     logits = model(x_t)
@@ -611,41 +590,43 @@ def main():
             f"Checker supports one hidden recurrent layer (input, hidden, output). Got {layer_sizes}."
         )
 
-    in_dim, hidden_dim, out_dim = layer_sizes
+    n_input_neurons, hidden_dim, out_dim = layer_sizes
 
     is_smnist = args.input_source == "smnist"
 
-    if args.input_source == "mnist":
-        if in_dim != 784:
-            raise ValueError(f"MNIST input-source expects in_dim=784, got {in_dim}")
-        x_np, y_np = load_mnist_inputs(
+    if args.input_source in ("mnist", "smnist"):
+        expected_n = 784 if not is_smnist else 1
+        if n_input_neurons != expected_n:
+            raise ValueError(
+                f"{args.input_source.upper()} expects n_input_neurons={expected_n}, got {n_input_neurons}"
+            )
+        x_np, y_np, _ = load_preprocessed_inputs(
             args.num_inputs,
             batch_size=max(64, args.num_inputs),
             data_dir=args.data_dir,
+            sequential=is_smnist,
         )
-    elif args.input_source == "smnist":
-        if in_dim != 1:
-            raise ValueError(f"SMNIST input-source expects in_dim=1 (single input neuron), got {in_dim}")
-        x_np, y_np = load_smnist_inputs(
-            args.num_inputs,
-            batch_size=max(64, args.num_inputs),
-            data_dir=args.data_dir,
-        )
-        # x_np shape: (N, 784) — 784 pixel values per sample, used sequentially
     else:
+        # Synthetic: generate event-format data (neuron_idx, value)
         rng = np.random.default_rng(args.seed)
-        x_np = rng.normal(size=(args.num_inputs, in_dim)).astype(np.float32)
+        num_steps = n_input_neurons  # one event per neuron
+        x_np = np.zeros((args.num_inputs, num_steps, 2), dtype=np.float32)
+        for t in range(num_steps):
+            x_np[:, t, 0] = t  # neuron index
+            x_np[:, t, 1] = rng.normal(size=(args.num_inputs,)).astype(np.float32)
         y_np = rng.integers(low=0, high=out_dim, size=(args.num_inputs,), dtype=np.int64)
 
+    num_steps = x_np.shape[1]
     x_jnp = jnp.asarray(x_np, dtype=jnp.float32)
 
-    weights = init_feedforward_weights(layer_sizes, args.seed)
-    w_ih, w_out = weights[0], weights[1]
+    # w_ih shape: (n_input_neurons, hidden_dim) — indexed by neuron_idx
+    w_ih = init_feedforward_weights([n_input_neurons, hidden_dim], args.seed)[0]
+    w_out = init_feedforward_weights([hidden_dim, out_dim], args.seed + 99)[0]
     w_hh = init_recurrent_weight(hidden_dim, args.seed, gain=0.5)
     rng_bias = np.random.default_rng(args.seed + 1)
     bias_h = jnp.asarray(rng_bias.normal(size=(hidden_dim,)).astype(np.float32) * 0.1)
 
-    sync_rates = _parse_sync_rates(args.sync_rates, args.sync_rate, in_dim)
+    sync_rates = _parse_sync_rates(args.sync_rates, args.sync_rate, num_steps)
     params = build_params(
         cfg=cfg,
         layer_sizes=layer_sizes,
@@ -660,6 +641,7 @@ def main():
         f"tested_inputs={args.num_inputs}\n"
         f"input_source={args.input_source}\n"
         f"layer_sizes={layer_sizes}\n"
+        f"num_steps={num_steps}\n"
         f"sync_rates={sync_rates}\n"
         f"firing_nb={args.firing_nb}\n"
         f"use_tanh={args.use_tanh}\n"
@@ -679,7 +661,6 @@ def main():
             sync_rate=sync_rate,
             firing_nb=args.firing_nb,
             use_tanh=args.use_tanh,
-            is_smnist=is_smnist,
         )
 
         for grad_mode in grad_modes:
@@ -697,7 +678,6 @@ def main():
                 grad_mode=grad_mode,
                 trace_source_mode=args.trace_source_mode,
                 use_tanh=args.use_tanh,
-                is_smnist=is_smnist,
                 exact_hh_trace=args.exact_hh_trace,
                 exact_ih_trace=args.exact_ih_trace,
             )
@@ -722,4 +702,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-# python async_RNN_pytorch_gradient_check.py --num-inputs 320 --input-source mnist --layer-sizes 784,128,10 --sync-rates 1,4 --firing-nb 10000 --grad-mode trace --trace-source-mode full --use-tanh
+# python async_RNN_pytorch_gradient_check.py --num-inputs 64 --input-source mnist --layer-sizes 784,128,10 --sync-rates 1 --firing-nb 10000 --grad-mode both --trace-source-mode full --use-tanh

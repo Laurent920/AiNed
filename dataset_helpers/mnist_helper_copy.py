@@ -38,17 +38,14 @@ CONFIG = dict(
     rnn_layers     = 1,           # number of stacked recurrent layers
 
     # ── training ───────────────────────────────────────────────
-    epochs         = 150,
+    epochs         = 10,
     batch_size     = 64,
-    lr             = 1e-4,  # lower default suits RNN; increase to 1e-3 for MLP/GRU/LSTM
+    lr             = 1e-3,
 
     # ── data ───────────────────────────────────────────────────
+    dataset        = "smnist",    # "mnist" | "smnist"
     data_dir       = "",          # root dir passed to mnist_loader_manual
-    shuffle        = False,
-    preprocess     = False,       # sparse (index, value) format — set True for MLP
-    cnn_preprocess = False,
-    downsample     = False,
-    sequential     = False,
+    shuffle        = True,
     permuted       = False,
 
     # ── misc ───────────────────────────────────────────────────
@@ -260,6 +257,64 @@ def mnist_loader_manual(batch_size,
     )
 
 
+def load_mnist_arrays(batch_size, data_dir, dataset="smnist"):
+    """
+    Load MNIST/S-MNIST arrays using mnist_loader_manual, matching
+    the data loading pattern from async_RNN_fptt.py.
+
+    For S-MNIST: returns x as (N, 784, 1) — sequential pixel values,
+                 normalised via (pixel/255 - 0.1307) / 0.3081.
+    For MNIST:   returns x as (N, 784) — flat pixel vectors, normalised.
+
+    Returns x_train, y_train, x_val, y_val, x_test, y_test.
+    """
+    sequential = (dataset == "smnist")
+    (train_loader, _), (val_loader, _), (test_loader, _), _ = mnist_loader_manual(
+        batch_size=batch_size,
+        shuffle=True,
+        preprocess=True,
+        CNN_preprocess=False,
+        downsample=False,
+        sequential=sequential,
+        permuted=False,
+        data_dir=data_dir,
+    )
+
+    # Extract full arrays from loaders (matching async_RNN_fptt.py pattern)
+    x_train = np.asarray(train_loader.X[train_loader.indices], dtype=np.float32)
+    y_train = np.asarray(train_loader.Y[train_loader.indices], dtype=np.int64)
+    x_val   = np.asarray(val_loader.X[val_loader.indices],     dtype=np.float32)
+    y_val   = np.asarray(val_loader.Y[val_loader.indices],     dtype=np.int64)
+    x_test  = np.asarray(test_loader.X[test_loader.indices],   dtype=np.float32)
+    y_test  = np.asarray(test_loader.Y[test_loader.indices],   dtype=np.int64)
+
+    if sequential:
+        # x shape: (N, 784, 2) with (neuron_idx=0, value) — extract values only
+        x_train = x_train[:, :, 1:2]  # (N, 784, 1)
+        x_val   = x_val[:, :, 1:2]
+        x_test  = x_test[:, :, 1:2]
+    else:
+        # MNIST: (N, max_nonzero, 2) — flatten to raw normalised pixels
+        # Reload without preprocess for flat format
+        (train_loader, _), (val_loader, _), (test_loader, _), _ = mnist_loader_manual(
+            batch_size=batch_size, shuffle=True, preprocess=False,
+            CNN_preprocess=False, downsample=False, sequential=False,
+            permuted=False, data_dir=data_dir,
+        )
+        x_train = np.asarray(train_loader.X[train_loader.indices], dtype=np.float32)
+        y_train = np.asarray(train_loader.Y[train_loader.indices], dtype=np.int64)
+        x_val   = np.asarray(val_loader.X[val_loader.indices],     dtype=np.float32)
+        y_val   = np.asarray(val_loader.Y[val_loader.indices],     dtype=np.int64)
+        x_test  = np.asarray(test_loader.X[test_loader.indices],   dtype=np.float32)
+        y_test  = np.asarray(test_loader.Y[test_loader.indices],   dtype=np.int64)
+        # Normalise
+        x_train = (x_train / 255.0 - MNIST_MEAN) / MNIST_STD
+        x_val   = (x_val   / 255.0 - MNIST_MEAN) / MNIST_STD
+        x_test  = (x_test  / 255.0 - MNIST_MEAN) / MNIST_STD
+
+    return x_train, y_train, x_val, y_val, x_test, y_test
+
+
 # ─────────────────────────────── MODELS ──────────────────────────────────────
 
 class MLP(nn.Module):
@@ -331,14 +386,12 @@ def build_model(cfg: dict, input_size: int) -> nn.Module:
 
 def prepare_batch(x, y, model_type: str, device: str):
     """
-    Convert a raw numpy batch from network_helper.DataLoader into tensors
-    shaped correctly for the target architecture.
+    Convert pre-normalised numpy arrays into tensors shaped for each model.
 
-      MLP : x (batch, 784)      — raw pixels flattened, normalised to [0, 1]
-      RNN : x (batch, 784, 1)   — raw pixels as sequence, normalised to [0, 1]
+      MLP : x (batch, 784)      — flat pixels
+      RNN : x (batch, 784, 1)   — sequential pixels
     """
-    MNIST_MEAN, MNIST_STD = 0.1307, 0.3081
-    x = (np.array(x, dtype=np.float32) / 255.0 - MNIST_MEAN) / MNIST_STD
+    x = np.array(x, dtype=np.float32)
     y = np.array(y, dtype=np.int64)
 
     if model_type.upper() in ("LSTM", "GRU", "RNN"):
@@ -351,14 +404,19 @@ def prepare_batch(x, y, model_type: str, device: str):
 
 def run_epoch(model, loader, criterion, model_type: str,
               optimiser=None, device="cpu"):
-    """One pass over a network_helper.DataLoader. optimiser=None → eval mode."""
+    """One pass over a PyTorch DataLoader. optimiser=None → eval mode."""
     training = optimiser is not None
     model.train(training)
 
     total_loss, correct, total = 0.0, 0, 0
     with torch.set_grad_enabled(training):
         for x, y in loader:
-            x, y   = prepare_batch(x, y, model_type, device)
+            x, y = x.to(device), y.to(device)
+            # Shape for model: RNN needs (B, 784, 1), MLP needs (B, 784)
+            if model_type.upper() in ("LSTM", "GRU", "RNN"):
+                x = x.reshape(x.shape[0], -1, 1)
+            else:
+                x = x.reshape(x.shape[0], -1)
             logits = model(x)
             loss   = criterion(logits, y)
 
@@ -380,26 +438,29 @@ def train(cfg: dict):
     print(f"Device: {device}")
 
     is_rnn = cfg["model_type"].upper() in ("LSTM", "GRU", "RNN")
+    dataset = cfg.get("dataset", "smnist")
 
-    # ── data — consume mnist_loader_manual output directly ───────────────────
-    (tr_loader,  total_tr_batches),  \
-    (val_loader, total_val_batches), \
-    (te_loader,  total_te_batches),  \
-    max_nonzero = mnist_loader_manual(
-        batch_size     = cfg["batch_size"],
-        shuffle        = cfg["shuffle"],
-        preprocess     = False,        # raw pixels for all architectures in this file
-        CNN_preprocess = cfg["cnn_preprocess"],
-        downsample     = cfg["downsample"],
-        sequential     = cfg["sequential"],
-        permuted       = cfg["permuted"],
-        data_dir       = cfg["data_dir"],
+    # ── data — load arrays via load_mnist_arrays (async_RNN_fptt.py style) ───
+    x_train, y_train, x_val, y_val, x_test, y_test = load_mnist_arrays(
+        batch_size=cfg["batch_size"],
+        data_dir=cfg["data_dir"],
+        dataset=dataset,
     )
+    print(f"Dataset: {dataset}  |  x_train: {x_train.shape}  y_train: {y_train.shape}")
 
-    # ── infer input size from first batch ────────────────────────────────────
-    sample_x, _ = next(iter(tr_loader))
-    sample_x     = np.array(sample_x, dtype=np.float32)
-    input_size   = 1 if is_rnn else int(np.prod(sample_x.shape[1:]))
+    # Wrap in PyTorch DataLoaders
+    from torch.utils.data import TensorDataset, DataLoader as TorchDataLoader
+
+    def make_loader(x, y, shuffle):
+        ds = TensorDataset(torch.tensor(x), torch.tensor(y))
+        return TorchDataLoader(ds, batch_size=cfg["batch_size"], shuffle=shuffle)
+
+    tr_loader  = make_loader(x_train, y_train, shuffle=cfg["shuffle"])
+    val_loader = make_loader(x_val,   y_val,   shuffle=False)
+    te_loader  = make_loader(x_test,  y_test,  shuffle=False)
+
+    # ── infer input size ─────────────────────────────────────────────────────
+    input_size = 1 if is_rnn else x_train.shape[1]
 
     # ── model ─────────────────────────────────────────────────────────────────
     model    = build_model(cfg, input_size).to(device)
@@ -463,4 +524,24 @@ def train(cfg: dict):
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    train(CONFIG)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default=None,
+                        help="MLP | LSTM | GRU | RNN  (overrides CONFIG)")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="mnist | smnist")
+    parser.add_argument("--lr", type=float, default=None)
+    args = parser.parse_args()
+
+    cfg = dict(CONFIG)
+    if args.model:
+        cfg["model_type"] = args.model
+    if args.epochs:
+        cfg["epochs"] = args.epochs
+    if args.dataset:
+        cfg["dataset"] = args.dataset
+    if args.lr:
+        cfg["lr"] = args.lr
+
+    train(cfg)

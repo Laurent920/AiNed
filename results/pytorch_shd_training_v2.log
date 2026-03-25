@@ -1,0 +1,17 @@
+Loading SHD dataset from: ./data
+FPTT training  dataset=shd  model=rule
+  seed=42  hidden=[256]  n_input_neurons=700
+  x_train=(7340, 16257, 2)  n_classes=20  epochs=50
+  batch=36  lr=0.001  alpha=0.1  beta=0.5
+  lmbda=2.0  rho=0.0  parts=10  clip=1.0
+  sync_rate=1  firing_nb=10000  use_tanh=False
+  no_reset=False  identity_hh=False  vanilla=False
+  train_samples=0  optim=adam
+  nlayers=1  dropout=0.0
+  accumulate_logits=True  avg_logits=True
+Model: rule  params=250,112  device=cuda
+epoch=1  loss=3.097806  train_acc=0.3500  val_acc=0.1127  test_acc=0.0994  time=2274.2s
+epoch=2  loss=nan  train_acc=0.0480  val_acc=0.0564  test_acc=0.0455  time=1979.5s
+epoch=3  loss=nan  train_acc=0.0480  val_acc=0.0564  test_acc=0.0455  time=2330.1s
+epoch=4  loss=nan  train_acc=0.0480  val_acc=0.0564  test_acc=0.0455  time=2214.8s
+epoch=5  loss=nan  train_acc=0.0480  val_acc=0.0564  test_acc=0.0455  time=2305.3s

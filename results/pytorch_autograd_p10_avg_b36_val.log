@@ -1,0 +1,28 @@
+MNIST CSV files already exist
+Loading cached MNIST dataset
+FPTT training  dataset=smnist  model=minimalrnn
+  seed=42  hidden=[128]  n_input_neurons=1
+  x_train=(48004, 784, 2)  epochs=15
+  batch=36  lr=0.001  alpha=0.1  beta=0.5
+  lmbda=2.0  rho=0.0  parts=10  clip=1.0
+  sync_rate=1  firing_nb=10000  use_tanh=False
+  no_reset=False  identity_hh=False  vanilla=False
+  train_samples=0  optim=adam
+  nlayers=1  dropout=0.0
+  accumulate_logits=True  avg_logits=True
+Model: minimalrnn  params=34,442  device=cpu
+epoch=1  loss=1.939712  train_acc=0.8220  val_acc=0.8280  test_acc=0.8363  time=282.3s
+epoch=2  loss=1.694762  train_acc=0.8080  val_acc=0.7867  test_acc=0.7872  time=290.6s
+epoch=3  loss=1.646858  train_acc=0.8510  val_acc=0.8594  test_acc=0.8569  time=263.7s
+epoch=4  loss=1.622210  train_acc=0.9180  val_acc=0.9211  test_acc=0.9168  time=267.5s
+epoch=5  loss=1.610450  train_acc=0.9000  val_acc=0.8821  test_acc=0.8767  time=323.8s
+epoch=6  loss=1.512939  train_acc=0.9090  val_acc=0.9124  test_acc=0.9166  time=288.0s
+epoch=7  loss=1.501033  train_acc=0.9130  val_acc=0.9203  test_acc=0.9186  time=275.6s
+epoch=8  loss=1.493638  train_acc=0.8750  val_acc=0.8662  test_acc=0.8678  time=317.0s
+epoch=9  loss=1.488200  train_acc=0.8680  val_acc=0.8805  test_acc=0.8759  time=254.6s
+epoch=10  loss=1.486145  train_acc=0.8860  val_acc=0.8835  test_acc=0.8865  time=280.6s
+epoch=11  loss=1.481165  train_acc=0.9020  val_acc=0.9113  test_acc=0.9136  time=276.0s
+epoch=12  loss=1.478538  train_acc=0.9270  val_acc=0.9194  test_acc=0.9183  time=307.4s
+epoch=13  loss=1.477237  train_acc=0.9220  val_acc=0.9174  test_acc=0.9180  time=309.0s
+epoch=14  loss=1.475137  train_acc=0.9060  val_acc=0.8990  test_acc=0.8959  time=271.9s
+epoch=15  loss=1.470126  train_acc=0.9290  val_acc=0.9191  test_acc=0.9191  time=297.8s

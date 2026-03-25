@@ -1,0 +1,10 @@
+dataset: mnist
+mode: inference
+layer_sizes: [784, 128, 10]
+batch_size: 1
+rerun: network_results/mnist/training/MLP/basic/load_false/42_ep20_batch36_784_128_10_acc0.975_adam_.json
+
+override_params:
+  - batch_size
+
+trace_event_timing: true

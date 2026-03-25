@@ -1,0 +1,35 @@
+dataset: neural_decoding
+layer_sizes:
+- 96
+- 128
+- 2
+collapse_units: true
+preserve_exact_times: false
+mode: training
+use_bias: false
+batch_size: 36
+num_epochs: 10
+learning_rate: 0.0005
+optimizer: adam
+load_file: false
+best: false
+rerun: ''
+override_params: null
+restrict: 1
+init_thresholds: 0.0
+shuffle_activations: false
+shuffle_input: false
+firing_nb: 1
+sync_rate: 1
+exploration_rate: 0.0
+threshold_lr: 0.0
+sparsity_impact:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+w_reg: 0.0
+top_weights: -1
+history_size: 0

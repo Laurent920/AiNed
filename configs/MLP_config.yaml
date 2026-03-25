@@ -36,7 +36,7 @@ layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 256, 256, 10]
 
 layer_sizes: [784, 256, 10]
-# layer_sizes: [784, 128, 128, 10]
+layer_sizes: [784, 128, 128, 10]
 # layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
@@ -67,13 +67,30 @@ layer_sizes: [784, 256, 10]
 # layer_sizes: [24000, 256, 2]
 # layer_sizes: [6000, 256, 2]   # downsampled
 
+# dataset: neural_decoding  # alias: primate_reaching
+# filename: indy_20160622_01.mat
+# collapse_units: false       # true: one feature per channel, false: one feature per channel-unit slot
+# preserve_exact_times: true  # true: raw spike-time order, false: time-binned windows
+# Neural decoding input sizes:
+#   - Indy,   collapse_units=true:  96 inputs
+#   - Indy,   collapse_units=false: 480 inputs (96 channels * 5 unit slots)
+#   - Loco,   collapse_units=true:  192 inputs
+#   - Loco,   collapse_units=false: 960 inputs (192 channels * 5 unit slots)
+# layer_sizes: [96, 128, 2]         # Indy collapsed
+# layer_sizes: [96, 256, 256, 2]    # Indy collapsed, deeper
+# layer_sizes: [480, 128, 2]      # Indy separated units
+# layer_sizes: [480, 256, 256, 2] # Indy separated units, deeper
+
+# layer_sizes: [192, 128, 2]      # Loco collapsed
+# layer_sizes: [960, 128, 2]      # Loco separated units
+
 mode: training
 use_bias: false 
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 50            # Number of training epochs
+num_epochs: 20            # Number of training epochs
 learning_rate: 0.0005       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 
@@ -83,6 +100,7 @@ best: false
 # Set to null or remove to train from scratch
 # Example: rerun = network_results/mnist/training/MLP/42_ep10_b36_784_128_10_acc0.974_adam_.json
 # rerun: network_results/mnist/training/MLP/42_ep2_b36_784_256_256_10_acc0.963_adam_.json
+rerun: ""
 rerun: null
 # rerun: network_results/mnist/training/MLP/sync1_fnb1_2/42_ep200_b36_784_256_256_10_acc0.981_adam_.json
 
@@ -160,3 +178,337 @@ history_size: 0
 # rerun = "network_results/shd/training/MLP/w_reg/42_ep1_b36_700_256_20_acc0.431_adam_.json"
 # rerun = "network_results/shd/training/MLP/42_ep100_b36_700_256_256_256_20_acc0.662_adam_.json"
 # rerun = "network_results/shd/training/MLP/42_ep50_b36_700_256_20_acc0.677_adam_.json"
+# # Config 1: Larger hidden, fewer parts (most promising)
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 256 --epochs 50 --batch-size 128 --lr 1e-3 --parts 5 --train-samples 0 --warm-epochs 15 --device cuda
+
+# # Config 2: No FPTT chunking (standard BPTT baseline)
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 256 --epochs 50 --batch-size 128 --lr 5e-4 --parts 1 --train-samples 0 --warm-epochs 0 --device cuda
+
+# # Config 3: Original size but fewer parts
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 128 --epochs 50 --batch-size 128 --lr 1e-3 --parts 5 --train-samples 0 --warm-epochs 15 --device cuda
+
+
+
+
+
+
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 128 --epochs 50 --batch-size 128 --lr 1e-3 --parts 10 --device cuda --train-samples 0
+# MNIST CSV files already exist
+# Loading cached MNIST dataset
+# FPTT training  dataset=smnist  model=minimalrnn
+#   seed=42  hidden=[128]  n_input_neurons=1
+#   x_train=(48004, 784, 2)  epochs=50
+#   batch=128  lr=0.001  alpha=0.1  beta=0.5
+#   lmbda=2.0  rho=0.0  parts=10  clip=1.0
+#   sync_rate=1  firing_nb=10000  use_tanh=False
+#   no_reset=False  identity_hh=False  vanilla=False
+#   train_samples=0  optim=adam
+#   nlayers=1  dropout=0.0
+# Model: minimalrnn  params=34,442  device=cuda
+# epoch=1  loss=2.127610  train_acc=0.3750  test_acc=0.2921  time=52.3s
+# epoch=2  loss=1.805760  train_acc=0.6090  test_acc=0.5724  time=53.4s
+# epoch=3  loss=1.692782  train_acc=0.8050  test_acc=0.7591  time=53.5s
+# epoch=4  loss=1.638152  train_acc=0.7510  test_acc=0.7034  time=53.0s
+# epoch=5  loss=1.614861  train_acc=0.7940  test_acc=0.7198  time=53.9s
+# epoch=6  loss=1.609027  train_acc=0.7210  test_acc=0.6787  time=52.9s
+# epoch=7  loss=1.591931  train_acc=0.8780  test_acc=0.8486  time=70.1s
+# epoch=8  loss=1.576699  train_acc=0.8640  test_acc=0.8258  time=76.0s
+# epoch=9  loss=1.563592  train_acc=0.7740  test_acc=0.7401  time=64.9s
+# epoch=10  loss=1.556364  train_acc=0.8440  test_acc=0.8069  time=71.2s
+# epoch=11  loss=1.550566  train_acc=0.9040  test_acc=0.8642  time=68.7s
+# epoch=12  loss=1.545733  train_acc=0.8670  test_acc=0.8397  time=70.1s
+# epoch=13  loss=1.544631  train_acc=0.8420  test_acc=0.8086  time=74.9s
+# epoch=14  loss=1.543144  train_acc=0.7110  test_acc=0.6882  time=71.6s
+# epoch=15  loss=1.540135  train_acc=0.8930  test_acc=0.8630  time=68.5s
+# epoch=16  loss=1.539061  train_acc=0.8660  test_acc=0.8230  time=68.0s
+# epoch=17  loss=1.531320  train_acc=0.8520  test_acc=0.8424  time=63.4s
+# epoch=18  loss=1.533088  train_acc=0.7230  test_acc=0.6439  time=63.0s
+# epoch=19  loss=1.532646  train_acc=0.9030  test_acc=0.8892  time=67.9s
+# epoch=20  loss=1.523713  train_acc=0.8950  test_acc=0.8682  time=69.8s
+# epoch=21  loss=1.523993  train_acc=0.9150  test_acc=0.8924  time=70.9s
+# epoch=22  loss=1.525343  train_acc=0.7200  test_acc=0.7336  time=62.6s
+# epoch=23  loss=1.527142  train_acc=0.9160  test_acc=0.8930  time=76.6s
+# epoch=24  loss=1.522913  train_acc=0.9160  test_acc=0.8918  time=77.8s
+# epoch=25  loss=1.520757  train_acc=0.9350  test_acc=0.9166  time=70.4s
+# epoch=26  loss=1.520868  train_acc=0.8630  test_acc=0.8414  time=68.8s
+# epoch=27  loss=1.522890  train_acc=0.8300  test_acc=0.8159  time=64.1s
+# epoch=28  loss=1.522876  train_acc=0.9040  test_acc=0.8922  time=71.3s
+# epoch=29  loss=1.521323  train_acc=0.8940  test_acc=0.8599  time=63.0s
+# epoch=30  loss=1.518717  train_acc=0.8170  test_acc=0.8067  time=71.3s
+# epoch=31  loss=1.513368  train_acc=0.9260  test_acc=0.9132  time=79.3s
+# epoch=32  loss=1.511258  train_acc=0.9080  test_acc=0.8895  time=68.5s
+# epoch=33  loss=1.513865  train_acc=0.8340  test_acc=0.8113  time=78.0s
+# epoch=34  loss=1.513568  train_acc=0.9040  test_acc=0.8818  time=87.5s
+# epoch=35  loss=1.512814  train_acc=0.8850  test_acc=0.8501  time=147.0s
+# epoch=36  loss=1.512528  train_acc=0.8720  test_acc=0.8538  time=145.6s
+# epoch=37  loss=1.509883  train_acc=0.8770  test_acc=0.8572  time=155.1s
+# epoch=38  loss=1.513019  train_acc=0.8610  test_acc=0.8592  time=148.6s
+# epoch=39  loss=1.515181  train_acc=0.9200  test_acc=0.9089  time=121.5s
+# epoch=40  loss=1.512352  train_acc=0.9470  test_acc=0.9430  time=66.5s
+# epoch=41  loss=1.512942  train_acc=0.8770  test_acc=0.8536  time=67.0s
+# epoch=42  loss=1.512329  train_acc=0.9180  test_acc=0.9118  time=62.1s
+# epoch=43  loss=1.507941  train_acc=0.9260  test_acc=0.9102  time=74.8s
+# epoch=44  loss=1.514092  train_acc=0.8860  test_acc=0.8690  time=72.4s
+# epoch=45  loss=1.510417  train_acc=0.9020  test_acc=0.8771  time=72.4s
+# epoch=46  loss=1.512688  train_acc=0.6730  test_acc=0.6224  time=61.3s
+# epoch=47  loss=1.516367  train_acc=0.9090  test_acc=0.8905  time=65.7s
+# epoch=48  loss=1.516413  train_acc=0.9150  test_acc=0.8854  time=65.0s
+# epoch=49  loss=1.513396  train_acc=0.8650  test_acc=0.8607  time=74.3s
+# epoch=50  loss=1.514815  train_acc=0.8080  test_acc=0.7897  time=67.2s
+
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 256 --epochs 50 --batch-size 128 --lr 1e-3 --parts 5 --train-samples 0 --warm-epochs 15 --device cuda
+# MNIST CSV files already exist
+# Loading cached MNIST dataset
+# FPTT training  dataset=smnist  model=minimalrnn
+#   seed=42  hidden=[256]  n_input_neurons=1
+#   x_train=(48004, 784, 2)  epochs=50
+#   batch=128  lr=0.001  alpha=0.1  beta=0.5
+#   lmbda=2.0  rho=0.0  parts=5  clip=1.0
+#   sync_rate=1  firing_nb=10000  use_tanh=False
+#   no_reset=False  identity_hh=False  vanilla=False
+#   train_samples=0  optim=adam
+#   nlayers=1  dropout=0.0
+# Model: minimalrnn  params=134,410  device=cuda
+# epoch=1  loss=2.111458  train_acc=0.3510  test_acc=0.3618  time=67.0s
+# epoch=2  loss=1.802955  train_acc=0.7650  test_acc=0.7730  time=66.2s
+# epoch=3  loss=1.694863  train_acc=0.7590  test_acc=0.7869  time=59.8s
+# epoch=4  loss=1.645730  train_acc=0.6390  test_acc=0.6939  time=61.0s
+# epoch=5  loss=1.625432  train_acc=0.8050  test_acc=0.8341  time=55.7s
+# epoch=6  loss=1.605429  train_acc=0.7790  test_acc=0.8019  time=62.5s
+# epoch=7  loss=1.589747  train_acc=0.7350  test_acc=0.7479  time=61.2s
+# epoch=8  loss=1.569880  train_acc=0.8460  test_acc=0.8618  time=63.8s
+# epoch=9  loss=1.557207  train_acc=0.8180  test_acc=0.8110  time=67.7s
+# epoch=10  loss=1.551578  train_acc=0.8690  test_acc=0.8925  time=65.2s
+# epoch=11  loss=1.547944  train_acc=0.9090  test_acc=0.9220  time=67.2s
+# epoch=12  loss=1.542292  train_acc=0.9240  test_acc=0.9268  time=66.5s
+# epoch=13  loss=1.542246  train_acc=0.7930  test_acc=0.8157  time=59.1s
+# epoch=14  loss=1.542305  train_acc=0.6590  test_acc=0.6436  time=60.0s
+# epoch=15  loss=1.544741  train_acc=0.8900  test_acc=0.9063  time=54.7s
+# epoch=16  loss=1.441619  train_acc=0.9170  test_acc=0.9257  time=57.6s
+# epoch=17  loss=1.435312  train_acc=0.7020  test_acc=0.7013  time=71.0s
+# epoch=18  loss=1.437977  train_acc=0.9130  test_acc=0.9270  time=65.0s
+# epoch=19  loss=1.434408  train_acc=0.9230  test_acc=0.9221  time=60.1s
+# epoch=20  loss=1.436029  train_acc=0.9080  test_acc=0.9176  time=61.8s
+# epoch=21  loss=1.432634  train_acc=0.6470  test_acc=0.6752  time=65.4s
+# epoch=22  loss=1.433938  train_acc=0.7630  test_acc=0.7464  time=59.5s
+# epoch=23  loss=1.428652  train_acc=0.8400  test_acc=0.8344  time=70.9s
+# epoch=24  loss=1.434404  train_acc=0.8860  test_acc=0.8795  time=58.4s
+# epoch=25  loss=1.439821  train_acc=0.9040  test_acc=0.9071  time=59.6s
+# epoch=26  loss=1.432888  train_acc=0.8620  test_acc=0.8639  time=61.6s
+# epoch=27  loss=1.433250  train_acc=0.9280  test_acc=0.9362  time=60.2s
+# epoch=28  loss=1.436230  train_acc=0.8770  test_acc=0.9045  time=61.2s
+# epoch=29  loss=1.436299  train_acc=0.9030  test_acc=0.9218  time=59.6s
+# epoch=30  loss=1.435231  train_acc=0.9250  test_acc=0.9351  time=63.4s
+# epoch=31  loss=1.438754  train_acc=0.9230  test_acc=0.9359  time=59.3s
+# epoch=32  loss=1.442006  train_acc=0.9010  test_acc=0.9151  time=60.8s
+# epoch=33  loss=1.444596  train_acc=0.8260  test_acc=0.8476  time=69.7s
+# epoch=34  loss=1.444861  train_acc=0.7710  test_acc=0.7637  time=60.6s
+# epoch=35  loss=1.453110  train_acc=0.9160  test_acc=0.9212  time=68.8s
+# epoch=36  loss=1.449815  train_acc=0.7770  test_acc=0.8208  time=63.6s
+# epoch=37  loss=1.448688  train_acc=0.9350  test_acc=0.9415  time=60.0s
+# epoch=38  loss=1.453650  train_acc=0.8880  test_acc=0.8990  time=63.5s
+# epoch=39  loss=1.453194  train_acc=0.8850  test_acc=0.9193  time=60.3s
+# epoch=40  loss=1.453057  train_acc=0.7180  test_acc=0.7392  time=67.1s
+# epoch=41  loss=1.456336  train_acc=0.7330  test_acc=0.7637  time=65.2s
+# epoch=42  loss=1.455506  train_acc=0.9140  test_acc=0.9246  time=62.2s
+# epoch=43  loss=1.468232  train_acc=0.8110  test_acc=0.8604  time=65.9s
+# epoch=44  loss=1.463613  train_acc=0.9150  test_acc=0.9222  time=69.6s
+# epoch=45  loss=1.469419  train_acc=0.8900  test_acc=0.9004  time=61.5s
+# epoch=46  loss=1.469605  train_acc=0.5750  test_acc=0.6533  time=67.9s
+# epoch=47  loss=1.468455  train_acc=0.8670  test_acc=0.8805  time=57.9s
+# epoch=48  loss=1.466208  train_acc=0.8680  test_acc=0.9033  time=72.5s
+# epoch=49  loss=1.474643  train_acc=0.8670  test_acc=0.8890  time=64.3s
+# epoch=50  loss=1.479464  train_acc=0.8350  test_acc=0.8731  time=63.7s
+
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 256 --epochs 50 --batch-size 128 --lr 5e-4 --parts 1 --train-samples 0 --warm-epochs 0 --device cuda
+# MNIST CSV files already exist
+# Loading cached MNIST dataset
+# FPTT training  dataset=smnist  model=minimalrnn
+#   seed=42  hidden=[256]  n_input_neurons=1
+#   x_train=(48004, 784, 2)  epochs=50
+#   batch=128  lr=0.0005  alpha=0.1  beta=0.5
+#   lmbda=2.0  rho=0.0  parts=1  clip=1.0
+#   sync_rate=1  firing_nb=10000  use_tanh=False
+#   no_reset=False  identity_hh=False  vanilla=False
+#   train_samples=0  optim=adam
+#   nlayers=1  dropout=0.0
+# Model: minimalrnn  params=134,410  device=cuda
+# epoch=1  loss=1.993185  train_acc=0.5090  test_acc=0.4249  time=56.5s
+# epoch=2  loss=1.404992  train_acc=0.5460  test_acc=0.5206  time=51.6s
+# epoch=3  loss=1.259073  train_acc=0.5820  test_acc=0.5398  time=56.7s
+# epoch=4  loss=1.196070  train_acc=0.5890  test_acc=0.5626  time=54.2s
+# epoch=5  loss=1.149443  train_acc=0.5920  test_acc=0.5629  time=55.2s
+# epoch=6  loss=1.106648  train_acc=0.6050  test_acc=0.5925  time=55.8s
+# epoch=7  loss=1.069406  train_acc=0.6320  test_acc=0.6114  time=54.7s
+# epoch=8  loss=0.995931  train_acc=0.6610  test_acc=0.6628  time=56.6s
+# epoch=9  loss=0.882645  train_acc=0.7060  test_acc=0.7077  time=53.6s
+# epoch=10  loss=0.784913  train_acc=0.7620  test_acc=0.7462  time=59.8s
+# epoch=11  loss=0.712686  train_acc=0.7610  test_acc=0.7593  time=51.6s
+# epoch=12  loss=0.660181  train_acc=0.8150  test_acc=0.7746  time=53.6s
+# epoch=13  loss=0.618595  train_acc=0.7530  test_acc=0.7688  time=53.1s
+# epoch=14  loss=0.581409  train_acc=0.8120  test_acc=0.8088  time=54.6s
+# epoch=15  loss=0.546410  train_acc=0.8200  test_acc=0.8042  time=57.0s
+# epoch=16  loss=0.514933  train_acc=0.8220  test_acc=0.8297  time=58.4s
+# epoch=17  loss=0.485398  train_acc=0.8260  test_acc=0.8323  time=55.0s
+# epoch=18  loss=0.460407  train_acc=0.8690  test_acc=0.8472  time=54.2s
+# epoch=19  loss=0.437505  train_acc=0.8460  test_acc=0.8463  time=54.4s
+# epoch=20  loss=0.419019  train_acc=0.8700  test_acc=0.8627  time=55.7s
+# epoch=21  loss=0.395991  train_acc=0.8700  test_acc=0.8610  time=53.3s
+# epoch=22  loss=0.376014  train_acc=0.8640  test_acc=0.8755  time=54.9s
+# epoch=23  loss=0.358832  train_acc=0.8870  test_acc=0.8905  time=56.5s
+# epoch=24  loss=0.335957  train_acc=0.8860  test_acc=0.8971  time=54.0s
+# epoch=25  loss=0.319014  train_acc=0.9060  test_acc=0.9097  time=53.7s
+# epoch=26  loss=0.302806  train_acc=0.8760  test_acc=0.8872  time=53.9s
+# epoch=27  loss=0.290852  train_acc=0.8990  test_acc=0.9000  time=56.7s
+# epoch=28  loss=0.278742  train_acc=0.9010  test_acc=0.9048  time=53.8s
+# epoch=29  loss=0.262012  train_acc=0.9240  test_acc=0.9297  time=58.6s
+# epoch=30  loss=0.247779  train_acc=0.9100  test_acc=0.9238  time=57.5s
+# epoch=31  loss=0.240949  train_acc=0.9020  test_acc=0.9080  time=56.1s
+# epoch=32  loss=0.226780  train_acc=0.9300  test_acc=0.9365  time=53.9s
+# epoch=33  loss=0.214720  train_acc=0.9240  test_acc=0.9293  time=55.1s
+# epoch=34  loss=0.207210  train_acc=0.9230  test_acc=0.9253  time=57.1s
+# epoch=35  loss=0.196647  train_acc=0.9360  test_acc=0.9436  time=55.6s
+# epoch=36  loss=0.191967  train_acc=0.9060  test_acc=0.9072  time=58.6s
+# epoch=37  loss=0.187244  train_acc=0.9330  test_acc=0.9408  time=56.2s
+# epoch=38  loss=0.178636  train_acc=0.9420  test_acc=0.9476  time=54.0s
+# epoch=39  loss=0.175768  train_acc=0.9460  test_acc=0.9486  time=52.9s
+# epoch=40  loss=0.166749  train_acc=0.9450  test_acc=0.9509  time=53.6s
+# epoch=41  loss=0.162917  train_acc=0.9490  test_acc=0.9545  time=52.3s
+# epoch=42  loss=0.153324  train_acc=0.9420  test_acc=0.9495  time=54.8s
+# epoch=43  loss=0.151395  train_acc=0.9510  test_acc=0.9519  time=53.5s
+# epoch=44  loss=0.145469  train_acc=0.9480  test_acc=0.9538  time=53.9s
+# epoch=45  loss=0.141492  train_acc=0.9500  test_acc=0.9576  time=54.8s
+# epoch=46  loss=0.140237  train_acc=0.9580  test_acc=0.9540  time=54.4s
+# epoch=47  loss=0.138335  train_acc=0.9570  test_acc=0.9546  time=52.8s
+# epoch=48  loss=0.132243  train_acc=0.9510  test_acc=0.9560  time=56.9s
+# epoch=49  loss=0.125988  train_acc=0.9370  test_acc=0.9390  time=53.8s
+# epoch=50  loss=0.129328  train_acc=0.9620  test_acc=0.9589  time=54.3s
+
+# python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 128 --epochs 50 --batch-size 128 --lr 1e-3 --parts 5 --train-samples 0 --warm-epochs 15 --device cuda
+# MNIST CSV files already exist
+# Loading cached MNIST dataset
+# FPTT training  dataset=smnist  model=minimalrnn
+#   seed=42  hidden=[128]  n_input_neurons=1
+#   x_train=(48004, 784, 2)  epochs=50
+#   batch=128  lr=0.001  alpha=0.1  beta=0.5
+#   lmbda=2.0  rho=0.0  parts=5  clip=1.0
+#   sync_rate=1  firing_nb=10000  use_tanh=False
+#   no_reset=False  identity_hh=False  vanilla=False
+#   train_samples=0  optim=adam
+#   nlayers=1  dropout=0.0
+# Model: minimalrnn  params=34,442  device=cuda
+# epoch=1  loss=2.159104  train_acc=0.3910  test_acc=0.3518  time=77.1s
+# epoch=2  loss=1.875369  train_acc=0.7730  test_acc=0.7334  time=72.6s
+# epoch=3  loss=1.742256  train_acc=0.6270  test_acc=0.5920  time=74.8s
+# epoch=4  loss=1.693398  train_acc=0.8310  test_acc=0.7924  time=68.6s
+# epoch=5  loss=1.658804  train_acc=0.7920  test_acc=0.7799  time=86.2s
+# epoch=6  loss=1.637168  train_acc=0.8330  test_acc=0.8280  time=82.4s
+# epoch=7  loss=1.622672  train_acc=0.7910  test_acc=0.7618  time=89.1s
+# epoch=8  loss=1.613622  train_acc=0.7930  test_acc=0.7770  time=89.2s
+# epoch=9  loss=1.604448  train_acc=0.7980  test_acc=0.7927  time=71.6s
+# epoch=10  loss=1.589308  train_acc=0.7550  test_acc=0.7577  time=81.4s
+# epoch=11  loss=1.582377  train_acc=0.8450  test_acc=0.8367  time=70.2s
+# epoch=12  loss=1.572617  train_acc=0.8190  test_acc=0.8023  time=86.6s
+# epoch=13  loss=1.569394  train_acc=0.8700  test_acc=0.8302  time=67.2s
+# epoch=14  loss=1.566966  train_acc=0.8770  test_acc=0.8620  time=71.2s
+# epoch=15  loss=1.564150  train_acc=0.8750  test_acc=0.8685  time=65.7s
+# epoch=16  loss=1.460242  train_acc=0.8950  test_acc=0.8819  time=67.5s
+# epoch=17  loss=1.450780  train_acc=0.8640  test_acc=0.8383  time=80.9s
+# epoch=18  loss=1.448842  train_acc=0.8830  test_acc=0.8740  time=73.0s
+# epoch=19  loss=1.446544  train_acc=0.8050  test_acc=0.7954  time=71.6s
+# epoch=20  loss=1.442976  train_acc=0.9010  test_acc=0.8879  time=62.3s
+# epoch=21  loss=1.447135  train_acc=0.8740  test_acc=0.8810  time=91.0s
+# epoch=22  loss=1.440339  train_acc=0.8600  test_acc=0.8656  time=80.2s
+# epoch=23  loss=1.442725  train_acc=0.9110  test_acc=0.9081  time=73.0s
+# epoch=24  loss=1.441317  train_acc=0.8410  test_acc=0.8514  time=65.2s
+# epoch=25  loss=1.440873  train_acc=0.9080  test_acc=0.9004  time=66.3s
+# epoch=26  loss=1.442463  train_acc=0.7370  test_acc=0.7291  time=73.6s
+# epoch=27  loss=1.437767  train_acc=0.8540  test_acc=0.8411  time=72.6s
+# epoch=28  loss=1.442358  train_acc=0.8830  test_acc=0.8854  time=67.4s
+# epoch=29  loss=1.445856  train_acc=0.8330  test_acc=0.8411  time=103.6s
+# epoch=30  loss=1.446582  train_acc=0.9310  test_acc=0.9166  time=96.2s
+# epoch=31  loss=1.447695  train_acc=0.8810  test_acc=0.8766  time=104.9s
+# epoch=32  loss=1.444408  train_acc=0.8910  test_acc=0.8711  time=93.8s
+# epoch=33  loss=1.446240  train_acc=0.9350  test_acc=0.9182  time=78.6s
+# epoch=34  loss=1.442825  train_acc=0.8920  test_acc=0.8757  time=65.9s
+# epoch=35  loss=1.448946  train_acc=0.8980  test_acc=0.9046  time=75.3s
+# epoch=36  loss=1.446978  train_acc=0.8300  test_acc=0.8012  time=61.6s
+# epoch=37  loss=1.442580  train_acc=0.7630  test_acc=0.7732  time=67.7s
+# epoch=38  loss=1.448950  train_acc=0.9170  test_acc=0.8968  time=60.8s
+# epoch=39  loss=1.447651  train_acc=0.8970  test_acc=0.8997  time=71.8s
+# epoch=40  loss=1.444404  train_acc=0.9130  test_acc=0.8925  time=72.8s
+# epoch=41  loss=1.449613  train_acc=0.9280  test_acc=0.9281  time=81.2s
+# epoch=42  loss=1.450017  train_acc=0.9070  test_acc=0.8885  time=67.3s
+# epoch=43  loss=1.448734  train_acc=0.9070  test_acc=0.9007  time=76.2s
+# epoch=44  loss=1.451068  train_acc=0.9240  test_acc=0.9160  time=69.0s
+# epoch=45  loss=1.454418  train_acc=0.8250  test_acc=0.8271  time=69.3s
+# epoch=46  loss=1.454768  train_acc=0.8790  test_acc=0.8854  time=61.1s
+# epoch=47  loss=1.454995  train_acc=0.9020  test_acc=0.8997  time=75.7s
+# epoch=48  loss=1.450558  train_acc=0.9180  test_acc=0.9109  time=67.0s
+# epoch=49  loss=1.449830  train_acc=0.7240  test_acc=0.7170  time=74.2s
+# epoch=50  loss=1.451039  train_acc=0.8440  test_acc=0.8129  time=106.6s
+
+# source venv/bin/activate && python -u async_RNN_fptt.py --dataset smnist --model minimalrnn --hidden-size 128 --epochs 50 --batch-size 128 --lr 1e-3 --parts 10 --device cuda --train-samples 0 --accumulate-logits --avg-logits
+# MNIST CSV files already exist
+# Loading cached MNIST dataset
+# FPTT training  dataset=smnist  model=minimalrnn
+#   seed=42  hidden=[128]  n_input_neurons=1
+#   x_train=(48004, 784, 2)  epochs=50
+#   batch=128  lr=0.001  alpha=0.1  beta=0.5
+#   lmbda=2.0  rho=0.0  parts=10  clip=1.0
+#   sync_rate=1  firing_nb=10000  use_tanh=False
+#   no_reset=False  identity_hh=False  vanilla=False
+#   train_samples=0  optim=adam
+#   nlayers=1  dropout=0.0
+#   accumulate_logits=True  avg_logits=True
+# Model: minimalrnn  params=34,442  device=cuda
+# epoch=1  loss=2.131258  train_acc=0.4040  test_acc=0.4214  time=48.8s
+# epoch=2  loss=1.716726  train_acc=0.7580  test_acc=0.7387  time=50.1s
+# epoch=3  loss=1.615784  train_acc=0.6990  test_acc=0.6566  time=50.2s
+# epoch=4  loss=1.581460  train_acc=0.8360  test_acc=0.8210  time=50.6s
+# epoch=5  loss=1.552032  train_acc=0.5340  test_acc=0.5024  time=50.4s
+# epoch=6  loss=1.536091  train_acc=0.7850  test_acc=0.8185  time=51.1s
+# epoch=7  loss=1.530269  train_acc=0.8460  test_acc=0.8281  time=53.7s
+# epoch=8  loss=1.516394  train_acc=0.8270  test_acc=0.8160  time=54.6s
+# epoch=9  loss=1.511493  train_acc=0.7960  test_acc=0.7684  time=54.2s
+# epoch=10  loss=1.509289  train_acc=0.8480  test_acc=0.8248  time=54.6s
+# epoch=11  loss=1.502263  train_acc=0.8430  test_acc=0.8218  time=53.6s
+# epoch=12  loss=1.496598  train_acc=0.7460  test_acc=0.6991  time=54.7s
+# epoch=13  loss=1.496660  train_acc=0.8550  test_acc=0.8141  time=54.9s
+# epoch=14  loss=1.491690  train_acc=0.8510  test_acc=0.8291  time=55.2s
+# epoch=15  loss=1.485143  train_acc=0.5310  test_acc=0.6039  time=54.3s
+# epoch=16  loss=1.482311  train_acc=0.9170  test_acc=0.9060  time=53.8s
+# epoch=17  loss=1.478679  train_acc=0.8440  test_acc=0.8262  time=54.1s
+# epoch=18  loss=1.477563  train_acc=0.8470  test_acc=0.8337  time=53.8s
+# epoch=19  loss=1.475420  train_acc=0.7330  test_acc=0.7117  time=54.5s
+# epoch=20  loss=1.474900  train_acc=0.8600  test_acc=0.8541  time=52.8s
+# epoch=21  loss=1.470690  train_acc=0.9330  test_acc=0.9379  time=54.1s
+# epoch=22  loss=1.470652  train_acc=0.7140  test_acc=0.7290  time=53.7s
+# epoch=23  loss=1.469945  train_acc=0.8980  test_acc=0.9043  time=55.1s
+# epoch=24  loss=1.465521  train_acc=0.8590  test_acc=0.8798  time=54.1s
+# epoch=25  loss=1.460703  train_acc=0.9010  test_acc=0.9078  time=54.9s
+# epoch=26  loss=1.461923  train_acc=0.6620  test_acc=0.7823  time=52.8s
+# epoch=27  loss=1.457015  train_acc=0.9180  test_acc=0.8951  time=51.5s
+# epoch=28  loss=1.454345  train_acc=0.6800  test_acc=0.6382  time=51.6s
+# epoch=29  loss=1.459896  train_acc=0.8840  test_acc=0.8820  time=51.3s
+# epoch=30  loss=1.457028  train_acc=0.8300  test_acc=0.8041  time=51.3s
+# epoch=31  loss=1.455581  train_acc=0.9560  test_acc=0.9418  time=51.3s
+# epoch=32  loss=1.456689  train_acc=0.8080  test_acc=0.7820  time=51.3s
+# epoch=33  loss=1.456800  train_acc=0.7560  test_acc=0.7385  time=51.7s
+# epoch=34  loss=1.455950  train_acc=0.7090  test_acc=0.6731  time=51.5s
+# epoch=35  loss=1.452957  train_acc=0.8040  test_acc=0.7770  time=51.4s
+# epoch=36  loss=1.453204  train_acc=0.8840  test_acc=0.8708  time=51.3s
+# epoch=37  loss=1.448755  train_acc=0.8680  test_acc=0.8611  time=51.3s
+# epoch=38  loss=1.453132  train_acc=0.9210  test_acc=0.9113  time=51.2s
+# epoch=39  loss=1.446224  train_acc=0.9320  test_acc=0.9150  time=51.4s
+# epoch=40  loss=1.446904  train_acc=0.8960  test_acc=0.8749  time=51.3s
+# epoch=41  loss=1.448513  train_acc=0.9300  test_acc=0.9141  time=51.5s
+# epoch=42  loss=1.445966  train_acc=0.8520  test_acc=0.8458  time=51.5s
+# epoch=43  loss=1.446180  train_acc=0.8420  test_acc=0.8263  time=51.5s
+# epoch=44  loss=1.448051  train_acc=0.9630  test_acc=0.9489  time=51.5s
+# epoch=45  loss=1.446578  train_acc=0.8620  test_acc=0.8350  time=51.6s
+# epoch=46  loss=1.444626  train_acc=0.3250  test_acc=0.3467  time=51.5s
+# epoch=47  loss=1.451734  train_acc=0.8340  test_acc=0.8261  time=51.4s
+# epoch=48  loss=1.443587  train_acc=0.9380  test_acc=0.9264  time=51.6s
+# epoch=49  loss=1.443946  train_acc=0.8420  test_acc=0.7970  time=51.9s
+# epoch=50  loss=1.445049  train_acc=0.9350  test_acc=0.9198  time=51.4s

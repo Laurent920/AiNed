@@ -40,9 +40,9 @@ layer_sizes: [784, 128, 10]
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
-# dataset: smnist
-# layer_sizes: [1, 128, 128, 10] 
-# layer_sizes: [1, 256, 10] 
+dataset: smnist
+layer_sizes: [1, 128, 128, 10] 
+layer_sizes: [1, 256, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
 # dataset: psmnist
@@ -71,8 +71,9 @@ mode: training
 use_bias: true
 use_tanh: true  # Set to true to apply tanh to the hidden state update
 
-# use_bias: false
+use_bias: false
 use_tanh: false
+exact_rtrl: true
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================

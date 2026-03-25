@@ -8,6 +8,7 @@ os.environ.pop("JAX_TRACEBACK_FILTERING", None)
 import jax
 import jax.numpy as jnp
 from jax import jit
+from jax.experimental import io_callback
 from functools import partial
 import optax
 
@@ -17,6 +18,7 @@ import json
 import sys
 import numpy as np
 import random
+import argparse
 import matplotlib.pyplot as plt
 import pickle
 from tqdm import tqdm
@@ -48,6 +50,11 @@ TQDM_DISABLE = False
 STORE_EACH_EPOCH = False
 BUFFER_SIZE = 0
 END_SIGNAL = jnp.array([-1.0, -1.0], dtype=jnp.float32)
+EVENT_TRACE_COLUMNS = 4
+EVENT_TRACE_EMPTY = -1.0
+EVENT_TRACE_TAG = 30
+EVENT_TRACE_ZERO_NS = time.perf_counter_ns()
+EVENT_TRACE_TIME_SHAPE = jax.ShapeDtypeStruct((), jnp.float32)
 
 # Initialize empty global MPI variables
 comm = None
@@ -63,6 +70,123 @@ mpi_config = None
 training_generator = None
 validation_generator = None
 test_generator = None
+
+
+def get_event_trace_buffer_size(params: Params) -> int:
+    if not params.trace_event_timing:
+        return 0
+    input_size = params.layer_sizes[0]
+    f_nb = params.firing_nb if isinstance(params.firing_nb, int) else max(params.firing_nb)
+    return max(1024, input_size * f_nb + 8)
+
+
+def init_event_buffer(params: Params):
+    return jnp.full(
+        (get_event_trace_buffer_size(params), EVENT_TRACE_COLUMNS),
+        EVENT_TRACE_EMPTY,
+        dtype=jnp.float32,
+    )
+
+
+def reset_event_trace_clock():
+    global EVENT_TRACE_ZERO_NS
+    EVENT_TRACE_ZERO_NS = time.perf_counter_ns()
+
+
+def _host_event_time_us(_):
+    return np.asarray((time.perf_counter_ns() - EVENT_TRACE_ZERO_NS) / 1e3, dtype=np.float32)
+
+
+def record_event_time_us(trigger):
+    return io_callback(_host_event_time_us, EVENT_TRACE_TIME_SHAPE, trigger, ordered=True)
+
+
+def append_event_to_buffer(params: Params, buffer, slot, event_idx, neuron_idx, value, trigger):
+    if not params.trace_event_timing:
+        return buffer
+
+    timestamp_us = record_event_time_us(trigger)
+    row = jnp.array(
+        [
+            jnp.asarray(event_idx, dtype=jnp.float32),
+            jnp.asarray(neuron_idx, dtype=jnp.float32),
+            jnp.asarray(value, dtype=jnp.float32),
+            timestamp_us,
+        ],
+        dtype=jnp.float32,
+    )
+    return jax.lax.cond(
+        slot < buffer.shape[0],
+        lambda b: b.at[slot].set(row),
+        lambda b: b,
+        buffer,
+    )
+
+
+def trim_event_buffer(buffer):
+    arr = np.asarray(buffer, dtype=np.float32)
+    if arr.size == 0:
+        return []
+    arr = np.squeeze(arr)
+
+    if arr.ndim == 1:
+        rows = arr.reshape(-1, EVENT_TRACE_COLUMNS)
+    elif arr.ndim == 2 and arr.shape[-1] == EVENT_TRACE_COLUMNS:
+        rows = arr.reshape(-1, EVENT_TRACE_COLUMNS)
+    elif arr.ndim == 2 and arr.shape[0] == EVENT_TRACE_COLUMNS:
+        rows = np.moveaxis(arr, 0, -1).reshape(-1, EVENT_TRACE_COLUMNS)
+    else:
+        rows = arr.reshape(-1, EVENT_TRACE_COLUMNS)
+
+    return [row.tolist() for row in rows if row[-1] >= 0]
+
+
+def store_event_timing_trace(params: Params, dataset: str, buffer, sample_label=None, sample_prediction=None):
+    capacity = get_event_trace_buffer_size(params)
+    if capacity == 0:
+        return
+
+    leader_rank = last_layer * process_per_layer
+    recv_template = jnp.full((capacity, EVENT_TRACE_COLUMNS), EVENT_TRACE_EMPTY, dtype=jnp.float32)
+
+    if rank != leader_rank:
+        send(buffer, dest=leader_rank, tag=EVENT_TRACE_TAG, comm=comm)
+        return
+
+    trace_payload = {
+        "dataset": params.dataset,
+        "split": dataset,
+        "rerun": params.rerun,
+        "buffer_columns": ["event_index", "neuron_idx", "value", "time_us"],
+        "time_unit": "microseconds_from_rank_local_barrier",
+        "ranks": {},
+    }
+    if sample_label is not None:
+        trace_payload["label"] = int(sample_label)
+    if sample_prediction is not None:
+        trace_payload["prediction"] = int(sample_prediction)
+
+    for source_rank in range(size):
+        if source_rank == leader_rank:
+            source_buffer = buffer
+        else:
+            source_buffer = recv(recv_template, source=source_rank, tag=EVENT_TRACE_TAG, comm=comm)
+
+        source_layer_idx = source_rank // process_per_layer
+        trace_payload["ranks"][f"rank_{source_rank}"] = {
+            "layer_idx": int(source_layer_idx),
+            "mode": "send" if source_layer_idx == 0 else "receive",
+            "buffer": trim_event_buffer(source_buffer),
+        }
+
+    output_dir = os.path.join("network_results", params.dataset, "inference", "MLP")
+    os.makedirs(output_dir, exist_ok=True)
+    rerun_name = os.path.splitext(os.path.basename(params.rerun))[0] if params.rerun else "scratch"
+    output_path = os.path.join(output_dir, f"{rerun_name}_event_timing_trace.json")
+    with open(output_path, "w") as f:
+        json.dump(trace_payload, f, indent=2)
+
+    print(f"Event timing trace saved to {output_path}")
 
 # region INFERENCE
 @partial(jax.jit, static_argnames=['params', 'grad'])
@@ -122,6 +246,7 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     def hidden_layer_case(_):
         # APPLY THE SYNC RATE
         sync_fire = (iteration - neuron_states.last_sent_iteration >= neuron_states.sync_rate_vector).astype(jnp.int32)
+        sync_fire = jax.lax.cond(invalid_idx, lambda _: jnp.ones(sync_fire.shape, dtype=jnp.int32), lambda _: sync_fire, None)
         activated_output = activations * sync_fire # Mask out the neurons that don't meet the sync rate condition
         # jax.debug.print("rank {}, sync_fire: {}, iteration {}, sync rate vector {}, sync rate {}", rank, sync_fire.shape, iteration.shape, neuron_states.last_sent_iteration.shape,  neuron_states.sync_rate_vector.shape)
 
@@ -239,6 +364,8 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
         neuron_states, x = args # x is shape (input_layer_size,)
         x_p = jnp.array(x)
 
+        buffer = init_event_buffer(params)
+
         # 2 Ways to compute and send the inputs (depending on the dataset one or the other is more efficient) 
         # TODO: Determine when one is better than the other
         # @jit
@@ -270,23 +397,37 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
             x_p = x_p[perm]
             
         def send_input(i, carry):
-            count = carry
+            count, buffer = carry
             data = x_p[i]
+            flat_data = jnp.ravel(jnp.atleast_1d(data))
+            event_neuron_idx = flat_data[0]
+            event_value = flat_data[1] if flat_data.shape[0] > 1 else flat_data[0]
+            buffer = append_event_to_buffer(params, buffer, i, i, event_neuron_idx, event_value, flat_data)
             send(data, dest=rank+process_per_layer, tag=0, comm=comm)
             # jax.debug.print("rank {} sending data {}", rank, data)
-            return i
+            return i, buffer
 
         def first_not_minus2(row):
             return (row != -2)
         mask = jax.vmap(first_not_minus2)(x_p)
         loop_iterations = (jnp.count_nonzero(mask)/2).astype(int)
 
-        iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
+        iteration, buffer = jax.lax.fori_loop(0, loop_iterations, send_input, (0, buffer))
+
+        buffer = append_event_to_buffer(
+            params,
+            buffer,
+            loop_iterations,
+            loop_iterations,
+            END_SIGNAL[0],
+            END_SIGNAL[1],
+            END_SIGNAL,
+        )
 
         # Send end signal
         send(END_SIGNAL, dest=rank+process_per_layer, tag=0, comm=comm)
 
-        return jnp.zeros(()), neuron_states, iteration, jnp.zeros((BUFFER_SIZE, 2)), key
+        return jnp.zeros(()), neuron_states, iteration, buffer, key
     
     @jit
     def other_layers(args):
@@ -311,6 +452,15 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
             
             # Receive neuron values from previous layers and compute the activations
             (neuron_idx, layer_input) = recv(jnp.zeros((2,)), source=rank-process_per_layer, tag=0, comm=comm)
+            buffer = append_event_to_buffer(
+                params,
+                buffer,
+                iteration,
+                iteration,
+                neuron_idx,
+                layer_input,
+                jnp.array([neuron_idx, layer_input], dtype=jnp.float32),
+            )
             loop_iterations, activated_output, new_neuron_states, new_key = layer_computation(params, key, neuron_idx.astype(int), layer_input, weights, neuron_states, iteration, grad)
 
             # buffer = jax.lax.cond(
@@ -325,7 +475,7 @@ def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, 
         
         neuron_idx = 0
         layer_input = jnp.zeros(())
-        initial_state = (layer_input, neuron_states, neuron_idx, 0, jnp.zeros((BUFFER_SIZE, 2)), key)
+        initial_state = (layer_input, neuron_states, neuron_idx, 0, init_event_buffer(params), key)
         
         # Loop until the rank receives a -1 neuron_idx
         layer_input, neuron_states, neuron_idx, iteration, buffer, new_key = jax.lax.while_loop(cond, forward_pass, initial_state)
@@ -1095,6 +1245,11 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
     else:
         print("INVALID DATASET")
         return
+
+    trace_batch_idx = 0
+    if params.trace_event_timing:
+        total_batches = min(total_batches, 2)
+        trace_batch_idx = 1 if total_batches > 1 else 0
     if total_batches == 0:
         return -0.01, -1.0, -1.0 # arbitrary code for empty dataset
     
@@ -1104,8 +1259,13 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
         all_history = []
     
     epoch_iterations = []
+    trace_buffer = None
+    trace_label = None
+    trace_prediction = None
     for i in tqdm(range(total_batches), disable=TQDM_DISABLE):
         neuron_states = empty_neuron_states
+        trace_this_batch = params.trace_event_timing and i == trace_batch_idx
+        collect_this_batch = (not params.trace_event_timing) or trace_this_batch
         
         if layer_idx == 0: # Input layer  
             if readInputJson: # Test with stored input
@@ -1118,12 +1278,20 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                 batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 2)
             # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_input.json", batch_x.tolist()) # Store for hardware usage
 
+            if trace_this_batch:
+                comm.Barrier()
+                reset_event_trace_clock()
+
             # Run the forward pass
             outputs, iterations, all_neuron_states, buffer, new_key = (predict)(params, key, weights, neuron_states, jnp.array(batch_x))
 
             # Send label to the last layer
             send(batch_y, dest=last_layer * process_per_layer + rank, tag=10,comm=comm)
         else:
+            if trace_this_batch:
+                comm.Barrier()
+                reset_event_trace_clock()
+
             # Run forward pass for hidden and output layers
             outputs, iterations, all_neuron_states, buffer, new_key = (predict)(params, key, weights, neuron_states, jnp.zeros((batch_part, params.layer_sizes[0]))) 
         
@@ -1131,13 +1299,17 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                 # Receive the labels from the input layer and compute the accuracy
                 y = recv(jnp.zeros((batch_part,)), source=rank - (last_layer * process_per_layer), tag=10, comm=comm)   
                 
-                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
-                
-                epoch_correct += batch_correct
-                epoch_total += valid_y.shape[0]
+                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)
+
+                if collect_this_batch:
+                    epoch_correct += batch_correct
+                    epoch_total += valid_y.shape[0]
+                if trace_this_batch:
+                    trace_label = y[0]
+                    trace_prediction = jnp.argmax(outputs[0])
                 # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_output.json", outputs.tolist(), y.tolist())
 
-                if params.history_size > 0: # For history plots
+                if collect_this_batch and params.history_size > 0: # For history plots
                     # One-hot target → scalar class index
                     history = process_history(all_neuron_states.values_history, all_neuron_states.history_index, y)
                     all_history.append(history)
@@ -1147,7 +1319,11 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
         #     store_data_to_json(f"{len(params.layer_sizes)}hidden_event_buffer_layer{rank}.json", buffer.tolist())
         # store_data_to_json(f"{len(params.layer_sizes)}hidden_iterations_layer{rank}.json", iterations.tolist())
 
-        epoch_iterations.append(iterations[iterations > 1])
+        if trace_this_batch:
+            trace_buffer = buffer
+
+        if collect_this_batch:
+            epoch_iterations.append(iterations[iterations > 1])
         # if i >= 100: # Run a single epoch for testing
         #     break
     
@@ -1169,6 +1345,9 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
         if debug:
             jax.debug.print("Epoch Accuracy: {:.10f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
+
+    if params.trace_event_timing and trace_buffer is not None:
+        store_event_timing_trace(params, dataset, trace_buffer, trace_label, trace_prediction)
     
     # Gather the weights and iteration values at the last layer
     weights_dict, all_iteration_mean, thresholds_dict = gather_w_it_th(params, weights, mean, empty_neuron_states.thresholds)
@@ -1365,6 +1544,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             history_size=config['history_size'],
             use_bias=config['use_bias'],
             exploration_rate=config['exploration_rate'],
+            trace_event_timing=config['trace_event_timing'],
         )
         if trial is not None:
             params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
@@ -1419,8 +1599,6 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             sys.exit(1)
             
 if __name__ == "__main__":
-    import argparse
-    
     parser = argparse.ArgumentParser(description='Train async neural network')
     parser.add_argument('--config', type=str, default=None, 
                        help='Path to YAML configuration file')

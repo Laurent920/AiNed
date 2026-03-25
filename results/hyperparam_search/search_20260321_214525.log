@@ -1,0 +1,8 @@
+=== Hyperparameter Search Started at Sat Mar 21 09:45:25 PM CET 2026 ===
+Target: R² >= 0.687 (SNN benchmark on indy_20160622_01)
+
+=== ROUND 1: Learning rate + epochs sweep (3-layer, hidden=128) ===
+[21:45:25] Starting: r1a_lr001_ep30_b64_h128_bias (cores=0-2, nprocs=3)
+[21:45:25] Starting: r1b_lr0005_ep30_b64_h128_bias (cores=3-5, nprocs=3)
+[21:45:25] Starting: r1d_lr001_ep30_b252_h128_bias (cores=9-11, nprocs=3)
+[21:45:25] Starting: r1c_lr001_ep30_b64_h256_bias (cores=6-8, nprocs=3)

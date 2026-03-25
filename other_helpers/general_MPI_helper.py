@@ -71,13 +71,17 @@ def gather_batch(data, mpi_config, average=True):
         avg = recv(data, source=mpi_config.get_batch_leader, tag=20, comm=comm)
     return avg
 
-def pad_batch(batch_x, batch_y, batch_size):
-    # Pad the x data with 0 and the y data with nan for the last batch
+def pad_batch(batch_x, batch_y, batch_size, label_pad_value=-1.0):
+    """
+    Pad the last batch to a fixed size.
+    Works for both scalar labels (classification) and vector labels (regression).
+    """
     current_size = batch_y.shape[0]
     if current_size < batch_size:
         pad_amount = batch_size - current_size
-        pad_y = jnp.full((pad_amount,), -1.0, dtype=jnp.float32)
-        pad_x = jnp.zeros((pad_amount,) + batch_x.shape[1:], dtype=batch_x.dtype)  
+        label_tail_shape = batch_y.shape[1:] if batch_y.ndim > 1 else ()
+        pad_y = jnp.full((pad_amount,) + label_tail_shape, label_pad_value, dtype=batch_y.dtype)
+        pad_x = jnp.zeros((pad_amount,) + batch_x.shape[1:], dtype=batch_x.dtype)
         # jax.debug.print("rank {}, has batch size: {} and pad batch size: {}", rank, current_size, pad_x.shape)
         batch_y = jnp.concatenate([batch_y, pad_y], axis=0)
         batch_x = jnp.concatenate([batch_x, pad_x], axis=0)
@@ -85,7 +89,7 @@ def pad_batch(batch_x, batch_y, batch_size):
     return batch_x, batch_y
 
 #region split_batch
-def split_batch(params, batch_iterator, mpi_config, tuple_size):
+def split_batch(params, batch_iterator, mpi_config, tuple_size, label_shape=None, label_pad_value=-1.0):
     # tuple_size =2 for MLP and =4 for CNN 
     rank = mpi_config.rank
     comm = mpi_config.comm
@@ -101,7 +105,9 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
         all_batch_y = jnp.array(all_batch_y, dtype=jnp.float32)
         all_batch_x = jnp.array(all_batch_x, dtype=jnp.float32)
         # print('shape before pad batch: {}', all_batch_x[0])
-        all_batch_x, all_batch_y = pad_batch(all_batch_x, all_batch_y, batch_size)
+        all_batch_x, all_batch_y = pad_batch(
+            all_batch_x, all_batch_y, batch_size, label_pad_value=label_pad_value
+        )
         
         for process, b_partition in batch_distrib:
             # print("rank in split batch:", rank, process, b_partition)
@@ -118,7 +124,11 @@ def split_batch(params, batch_iterator, mpi_config, tuple_size):
     else:
         # print(f"rank {rank} waiting for shape {(batch_part.get_size, params.max_nonzero, tuple_size)}")
         batch_x = recv(jnp.zeros((batch_part.get_size, params.max_nonzero, tuple_size)), source=0, tag=4, comm=comm)  
-        batch_y = recv(jnp.zeros((batch_part.get_size,)), source=0, tag=4, comm=comm) 
+        if label_shape is None:
+            label_shape = ()
+        elif isinstance(label_shape, int):
+            label_shape = (label_shape,)
+        batch_y = recv(jnp.zeros((batch_part.get_size,) + tuple(label_shape), dtype=jnp.float32), source=0, tag=4, comm=comm) 
     # jax.debug.print("rank {} batch y {}", rank, batch_y)
     # print(f'rank {rank} finished splitting batch')
     return batch_x, batch_y

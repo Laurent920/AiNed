@@ -296,6 +296,22 @@ class Params:
     use_bias: bool = False
     use_tanh: bool = False  # Wrap the hidden state update with tanh: z^t = tanh(W*x + z^{t-1} - R^{t-1} + W_hh*R^{t-1})
     exploration_rate: float = 0.0  # Probability of randomly replacing a top-k fired neuron with a non-top-k non-zero neuron
+    exact_rtrl: bool = False  # Use exact RTRL traces: W_hh (H,H,H), bias (H,H) instead of diagonal approximations
+    trace_event_timing: bool = False
+    dataset_file: str | None = None
+    collapse_units: bool = True
+    preserve_exact_times: bool = False
+    # FPTT (Forward Propagation Through Time) parameters
+    cell_type: str = "aed"          # "aed" (default AED rule) or "minimalrnn"
+    fptt_parts: int = 1             # P: number of chunks (1 = standard BPTT, no FPTT)
+    fptt_alpha: float = 0.1         # Consensus regularizer alpha
+    fptt_beta: float = 0.5          # Consensus running average decay for shadow params
+    fptt_lambda: float = 2.0        # Consensus quadratic penalty scale
+    fptt_rho: float = 0.0           # Consensus lm*param coefficient
+    fptt_clip: float = 1.0          # Gradient clipping max norm
+    fptt_warm_epochs: int = 1       # Epochs using uniform oracle before learned oracle
+    fptt_accumulate_logits: bool = True  # Accumulate logits across chunks (AED-specific)
+    fptt_avg_logits: bool = False       # Average accumulated logits by chunk count
 
 #region RERUN
 def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
@@ -383,9 +399,26 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
                 value = transform(value)
             return value
     
+    def tuple_if_sequence(value):
+        """
+        Keep scalar hyperparameters as scalars while normalizing saved lists to tuples.
+        Older result files sometimes store values like `restrict: 1` instead of `(1, ...)`.
+        """
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return tuple(value)
+        return value
+
     # Extract all parameters using the helper function
-    shuffle_activations_val = get_param('shuffle_activations', 'shuffle activations')
-    shuffle_input_val = get_param('shuffle_input', 'shuffle input')
+    shuffle_activations_val = get_param(
+        'shuffle_activations',
+        'shuffle activations',
+        default=new_params.shuffle_activations,
+    )
+    shuffle_input_val = get_param(
+        'shuffle_input',
+        'shuffle input',
+        default=new_params.shuffle_input,
+    )
 
     firing_nb_val = get_param('firing_nb', 'firing number')    
     sync_rate_val = get_param('sync_rate', 'synchronization rate')
@@ -398,8 +431,8 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     else:
         init_thresholds_val = extract_scalar(stored_data["thresholds"]["thresholds_1"])
     
-    restrict_val = get_param('restrict', transform=tuple)
-    sparsity_impact_val = get_param('sparsity_impact','sparsity impact', default=0, transform=tuple)
+    restrict_val = get_param('restrict', transform=tuple_if_sequence)
+    sparsity_impact_val = get_param('sparsity_impact','sparsity impact', default=0, transform=tuple_if_sequence)
     w_reg_val = get_param('w_reg', 'weight regularization', default=0.0)
     threshold_lr_val = get_param('threshold_lr', 'threshold lr')
     top_weights_val = get_param('top_weights', 'top weights', default=-1)
@@ -412,6 +445,9 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     # Create new Params object with merged values
     params = Params(
         dataset=new_params.dataset,
+        dataset_file=stored_data.get("dataset_file", new_params.dataset_file),
+        collapse_units=stored_data.get("collapse_units", new_params.collapse_units),
+        preserve_exact_times=stored_data.get("preserve_exact_times", new_params.preserve_exact_times),
         random_seed=new_params.random_seed,
         layer_sizes=layer_sizes, 
         init_thresholds=init_thresholds_val, 
@@ -435,6 +471,8 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         recurrence=new_params.recurrence,
         use_bias=new_params.use_bias,
         use_tanh=new_params.use_tanh,
+        exact_rtrl=new_params.exact_rtrl,
+        trace_event_timing=new_params.trace_event_timing,
     )
     
     # Load weights and thresholds
@@ -549,6 +587,10 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
 
     # Store the results
     result_data = {
+        "dataset": params.dataset,
+        "dataset_file": params.dataset_file,
+        "collapse_units": params.collapse_units,
+        "preserve_exact_times": params.preserve_exact_times,
         "time": float(execution_time),
         "loadfile": params.load_file,
         "shuffle activations": params.shuffle_activations,
@@ -568,6 +610,7 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "learning rate": params.learning_rate,
         "use_bias": params.use_bias,
         "use_tanh": params.use_tanh,
+        "exact_rtrl": params.exact_rtrl,
         "layer_sizes": params.layer_sizes,
         "recurrence": params.recurrence,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
@@ -781,10 +824,14 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
     default_config = {
         # Dataset selection: 'mnist', 'shd', 'nmnist', 'dvs', 'ncars', 'smnist'
         'dataset': 'mnist',
+        'filename': None,
+        'collapse_units': True,
+        'preserve_exact_times': False,
 
         'mode': 'training', # Choose either train or inference
         'use_bias': False, # Whether to use bias in the network
         'use_tanh': False, # Whether to apply tanh to the hidden state update
+        'exact_rtrl': False, # Use exact RTRL traces (H^3 memory) instead of diagonal approximations
         # Network architecture: tuple of layer sizes (input, hidden1, hidden2, ..., output)
         # Examples:
         #   MNIST: (784, 256, 10) or (28*28, 128, 128, 10)
@@ -827,7 +874,19 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'top_weights': -1,  # Top k weights to use (-1 for all)
         'history_size': 0,  # Number of output states to keep for plotting
         'exploration_rate': 0.0,  # Probability of replacing a top-k fired neuron with a random non-top-k non-zero neuron
+        'trace_event_timing': False,  # Capture one-batch event timing traces during inference
 
+        # FPTT parameters
+        'cell_type': 'aed',         # "aed" or "minimalrnn"
+        'fptt_parts': 1,            # Number of FPTT chunks (1 = no FPTT)
+        'fptt_alpha': 0.1,
+        'fptt_beta': 0.5,
+        'fptt_lambda': 2.0,
+        'fptt_rho': 0.0,
+        'fptt_clip': 1.0,
+        'fptt_warm_epochs': 1,
+        'fptt_accumulate_logits': True,
+        'fptt_avg_logits': False,
     }
 
     if is_cnn:

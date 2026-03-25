@@ -1,0 +1,10 @@
+dataset: mnist
+mode: inference
+layer_sizes: [784, 256, 10]
+batch_size: 1
+rerun: network_results/mnist/training/MLP/sync_training/42_ep20_b36_784_256_10_acc0.975_adam_.json
+
+override_params:
+  - batch_size
+
+trace_event_timing: true

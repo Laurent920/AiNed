@@ -142,21 +142,29 @@ def compute_full_RNN_bpp(params, all_neuron_states, next_grad, layer_idx):
     # Weight residual for W_Ih: nonzero wherever rnn_total_sum is nonzero
     weight_res_Ih = jnp.where(rnn_total_sum != 0, 1, 0)  # Shape: (n_input, n_hidden)
 
-    # --- W_hh gradient using exact recurrence accumulator ---
-    rnn_total_product_sum = all_neuron_states.rnn_total_product_sum
-
-    if rnn_total_product_sum.ndim == 1:
-        # Backward-compat path for previously stored diagonal approximation.
-        weight_grad_hh = jnp.outer(rnn_total_product_sum, next_grad)
+    # --- W_hh gradient ---
+    # Check if exact RTRL traces are available (H, H, H)
+    exact_hh_total = all_neuron_states.exact_hh_total
+    if exact_hh_total is not None:
+        # Exact RTRL: grad_hh[m,n] = sum_j next_grad[j] * exact_hh_total[m,n,j]
+        weight_grad_hh = jnp.einsum("j,mnj->mn", next_grad, exact_hh_total)
     else:
-        # Exact matrix trace path.
-        weight_grad_hh = rnn_total_product_sum * next_grad[None, :]
+        # Compact trace approximation
+        rnn_total_product_sum = all_neuron_states.rnn_total_product_sum
+        if rnn_total_product_sum.ndim == 1:
+            weight_grad_hh = jnp.outer(rnn_total_product_sum, next_grad)
+        else:
+            weight_grad_hh = rnn_total_product_sum * next_grad[None, :]
 
-    # --- bias gradient using bias_total_sum ---
-    # bias_total_sum shape: (n_hidden,)
-    # grad_bias[j] = bias_total_sum[j] * next_grad[j]
-    bias_total_sum = all_neuron_states.bias_total_sum  # Shape: (n_hidden,)
-    grad_bias = bias_total_sum * next_grad  # Shape: (n_hidden,)
+    # --- bias gradient ---
+    exact_bias_total = all_neuron_states.exact_bias_total
+    if exact_bias_total is not None:
+        # Exact RTRL: grad_bias[n] = sum_j next_grad[j] * exact_bias_total[n,j]
+        grad_bias = jnp.einsum("j,nj->n", next_grad, exact_bias_total)
+    else:
+        # Diagonal approximation
+        bias_total_sum = all_neuron_states.bias_total_sum  # Shape: (n_hidden,)
+        grad_bias = bias_total_sum * next_grad  # Shape: (n_hidden,)
 
     return weight_grad_Ih, weight_res_Ih, weight_grad_hh, grad_bias
 

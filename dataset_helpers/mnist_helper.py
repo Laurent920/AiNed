@@ -328,7 +328,7 @@ def mnist_loader_manual(batch_size,
     
     # Define test set dataloader object
     test_indices, _ = network_helper.train_validate_split(mnist_data_y_test, val_ratio=0, shuffle=shuffle)
-    test_dataloader = network_helper.DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices)
+    test_dataloader = network_helper.DataLoader(mnist_data_x_test, mnist_data_y_test, batch_size, test_indices, shuffle=False)
     
     # Calculate total batches for train, val, test data
     total_train_batches = network_helper.get_total_batches(batch_size, train_indices)
