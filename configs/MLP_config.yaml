@@ -32,18 +32,21 @@
 #   - [6000, 256, 2]    # 60*50*2
 
 dataset: mnist
-layer_sizes: [784, 256, 256, 10]
+layer_sizes: [784, 256, 10]
+# layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 256, 256, 10]
 
-layer_sizes: [784, 256, 10]
-layer_sizes: [784, 128, 128, 10]
+# CIFAR-10 (row-by-row, RGB interleaved per pixel; 3072 input neurons, one per pixel/channel)
+# dataset: cifar10
+# layer_sizes: [3072, 256, 10]
+# layer_sizes: [784, 128, 128, 10]
 # layer_sizes: [784, 128, 10]
 
 # layer_sizes: [196, 32, 32, 10] # Downsampled
 # layer_sizes: [196, 32, 10]
 
-# dataset: smnist
-# layer_sizes: [1, 256, 256, 10] 
+dataset: smnist
+layer_sizes: [1, 256, 256, 10] 
 # layer_sizes: [1, 256, 10] 
 # layer_sizes: [1, 128, 128, 128, 10] 
 
@@ -85,12 +88,19 @@ layer_sizes: [784, 128, 128, 10]
 # layer_sizes: [960, 128, 2]      # Loco separated units
 
 mode: training
-use_bias: false 
+use_bias: false
+
+# Number of MPI processes per layer (must have one entry per layer, must sum to total MPI size)
+# Leave null to use uniform split (requires MPI size to be a multiple of the number of layers)
+# Example: [1, 2, 1] → 4 total processes, layer 0 gets 1, layer 1 gets 2, layer 2 gets 1
+# Run with: mpirun -n 4 python MPI_general.py --config configs/MLP_config.yaml
+processes_per_layer: null
+# processes_per_layer: [1, 2, 1]
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
 batch_size: 36             # Number of samples per batch
-num_epochs: 20            # Number of training epochs
+num_epochs: 10            # Number of training epochs
 learning_rate: 0.0005       # Learning rate for optimizer
 optimizer: adam             # Choice of the optimizer (adam, sgd, adamw, rmsprop, ...)
 

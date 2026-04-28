@@ -269,49 +269,78 @@ class NeuronStates:
     
 #region Params
 @dataclasses.dataclass(frozen=True)
-class Params:
-    dataset: str 
+class BaseParams:
+    """
+    Universal hyperparameters shared by every async network file.
+
+    Each file defines its own frozen dataclass that inherits from this one and
+    adds only the fields that file actually uses.  Example:
+
+        @dataclasses.dataclass(frozen=True)
+        class Params(BaseParams):
+            fptt_parts: int = 1
+            fptt_alpha: float = 0.1
+
+    JAX JIT treats frozen dataclasses as static (hashable), so subclasses work
+    identically to the original monolithic Params — no changes to JIT decorators
+    or @partial calls are needed.
+
+    rerun_init() works with any subclass: it reads the base fields from the JSON,
+    then calls dataclasses.replace(new_params, **base_overrides) so that subclass
+    fields are preserved automatically.
+    """
+    dataset: str
     random_seed: int
     layer_sizes: tuple[int, ...]
-    init_thresholds: float      # Starting thresholds
-    num_epochs: int 
+    init_thresholds: float       # Starting thresholds
+    num_epochs: int
     learning_rate: float
     batch_size: int
     load_file: bool
-    shuffle_activations: bool   # Shuffle the activations in the network
-    restrict: float| tuple[float]               # The amount of times a single neuron can fire accross all inputs, if negative then no restriction
-    firing_nb: int| tuple[int]              # The maximum number of neurons that can fire for one input at each layer
-    sync_rate: int| tuple[int]              # The number of inputs that needs to be accumulated before firing  
+    shuffle_activations: bool    # Shuffle the activations in the network
+    restrict: float | tuple[float]   # Soft reset multiplier applied to fired neuron values
+    firing_nb: int | tuple[int]      # Max neurons that can fire per event per layer
+    sync_rate: int | tuple[int]      # Events to accumulate before a neuron can fire again
     max_nonzero: int
-    shuffle_input:bool          # Shuffle the input data 
+    shuffle_input: bool          # Shuffle the input data
     threshold_lr: float
-    sparsity_impact: float| tuple[float]
-    w_reg: float                # Weight regularization factor
+    sparsity_impact: float | tuple[float]
+    w_reg: float                 # L2 weight regularisation coefficient
     rerun: str
-    top_weights: int            # The top number of weights ranked by absolute value that we want to use to integrate an input value, -1 means use all the weights # The layer that is training asynchronously while all other layers are training sync, if -1 then all layers are async
-    history_size: int = 0       # Size of history you want to store
-    max_kernel: int = None      # The maximum size of flattened kernel
-    flat_layer_sizes: tuple[int, ...] = None
-    recurrence: tuple[int, ...] | None = None
+    top_weights: int             # Top-k weights by absolute value used per neuron (-1 = all)
+    history_size: int = 0        # Output states to keep for history plots
     use_bias: bool = False
-    use_tanh: bool = False  # Wrap the hidden state update with tanh: z^t = tanh(W*x + z^{t-1} - R^{t-1} + W_hh*R^{t-1})
-    exploration_rate: float = 0.0  # Probability of randomly replacing a top-k fired neuron with a non-top-k non-zero neuron
-    exact_rtrl: bool = False  # Use exact RTRL traces: W_hh (H,H,H), bias (H,H) instead of diagonal approximations
-    trace_event_timing: bool = False
     dataset_file: str | None = None
     collapse_units: bool = True
     preserve_exact_times: bool = False
+
+# Backwards-compatible alias: files that haven't switched yet can still import
+# `Params` and get a class that already has all the old optional fields.
+@dataclasses.dataclass(frozen=True)
+class Params(BaseParams): #TODO Make params a file-local subclass of BaseParams in each file and remove the legacy Params class
+    """
+    Legacy all-in-one params class kept for backwards compatibility.
+    Prefer defining a file-local subclass of BaseParams instead.
+    """
+    use_tanh: bool = False
+    exact_rtrl: bool = False
+    exploration_rate: float = 0.0
+    trace_event_timing: bool = False
+    max_kernel: int | None = None
+    flat_layer_sizes: tuple[int, ...] | None = None
+    recurrence: tuple[int, ...] | None = None
     # FPTT (Forward Propagation Through Time) parameters
-    cell_type: str = "aed"          # "aed" (default AED rule) or "minimalrnn"
-    fptt_parts: int = 1             # P: number of chunks (1 = standard BPTT, no FPTT)
-    fptt_alpha: float = 0.1         # Consensus regularizer alpha
-    fptt_beta: float = 0.5          # Consensus running average decay for shadow params
-    fptt_lambda: float = 2.0        # Consensus quadratic penalty scale
-    fptt_rho: float = 0.0           # Consensus lm*param coefficient
-    fptt_clip: float = 1.0          # Gradient clipping max norm
-    fptt_warm_epochs: int = 1       # Epochs using uniform oracle before learned oracle
-    fptt_accumulate_logits: bool = True  # Accumulate logits across chunks (AED-specific)
-    fptt_avg_logits: bool = False       # Average accumulated logits by chunk count
+    cell_type: str = "aed"
+    fptt_parts: int = 1
+    fptt_alpha: float = 0.1
+    fptt_beta: float = 0.5
+    fptt_lambda: float = 2.0
+    fptt_rho: float = 0.0
+    fptt_clip: float = 1.0
+    fptt_warm_epochs: int = 1
+    fptt_accumulate_logits: bool = True
+    fptt_avg_logits: bool = False
+    fptt_relu_output: bool = False
 
 #region RERUN
 def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
@@ -442,17 +471,19 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     if isinstance(firing_nb_val, list):
         firing_nb_val = tuple(firing_nb_val)
 
-    # Create new Params object with merged values
-    params = Params(
+    # Build the set of BaseParams fields to restore from the JSON, then call
+    # dataclasses.replace(new_params, ...) so that any subclass-specific fields
+    # (fptt_*, rhythm_*, etc.) are preserved from new_params unchanged.
+    base_overrides = dict(
         dataset=new_params.dataset,
         dataset_file=stored_data.get("dataset_file", new_params.dataset_file),
         collapse_units=stored_data.get("collapse_units", new_params.collapse_units),
         preserve_exact_times=stored_data.get("preserve_exact_times", new_params.preserve_exact_times),
         random_seed=new_params.random_seed,
-        layer_sizes=layer_sizes, 
-        init_thresholds=init_thresholds_val, 
+        layer_sizes=layer_sizes,
+        init_thresholds=init_thresholds_val,
         num_epochs=new_params.num_epochs,
-        learning_rate=learning_rate_val, 
+        learning_rate=learning_rate_val,
         batch_size=batch_size_val,
         load_file=load_file,
         shuffle_activations=shuffle_activations_val,
@@ -467,13 +498,12 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         rerun=data_file_path,
         top_weights=top_weights_val,
         history_size=history_size_val,
-        max_kernel=new_params.max_kernel,
-        recurrence=new_params.recurrence,
-        use_bias=new_params.use_bias,
-        use_tanh=new_params.use_tanh,
-        exact_rtrl=new_params.exact_rtrl,
-        trace_event_timing=new_params.trace_event_timing,
     )
+    # Only pass fields that actually exist on this subclass (guards against
+    # files that use BaseParams directly without the optional base fields)
+    all_fields = {f.name for f in dataclasses.fields(new_params)}
+    base_overrides = {k: v for k, v in base_overrides.items() if k in all_fields}
+    params = dataclasses.replace(new_params, **base_overrides)
     
     # Load weights and thresholds
     threshold_dict = stored_data["thresholds"]
@@ -523,7 +553,7 @@ def extract_scalar(x):
         return extract_scalar(x[0])
 
 # region SAVING DATA
-def store_training_data(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname, network_type, all_history=None, total_batches=None): 
+def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname, network_type, extra_fields=None):
     filename_add_on = ""
     if optiname is not None:
         filename_add_on = f"_{optiname}_"
@@ -539,14 +569,15 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
     if mode == "train":
         result_dir = os.path.join("network_results", params.dataset, "training", network_type)
         filename = f"{params.random_seed}" + f"_ep{params.num_epochs}" + filename_nn
+        iteration_mean_payload = np.array(all_iteration_mean).tolist()
     elif mode == "inference":
         result_dir = os.path.join("network_results", params.dataset, "inference", network_type)
         filename = f"{params.random_seed}" + f"_load{params.load_file}" + filename_nn
-        all_iteration_mean = np.array(all_iteration_mean).flatten().tolist()
+        iteration_mean_payload = np.array(all_iteration_mean).flatten().tolist()
     else:
         print("Wrong mode for storing data choose 'train' or 'inference'. No data is saved")
-        return          
-    
+        return None, None
+
     train_accuracy = float(all_epoch_accuracies[-1])
     val_accuracy = float(all_validation_accuracies[-1])   
     test_accuracy = float(test_accuracy)    
@@ -558,13 +589,14 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         test=test_accuracy * 100 if test_accuracy != -1 else jnp.nan,
     )
     
+    accuracy = -1.0
     for acc in [train_accuracy, val_accuracy, test_accuracy]:
         if acc >= 0:
             accuracy = acc
 
     # Set up file path and changing the name if same name exists already 
     # filename = filename_header + "_".join(map(str, params.layer_sizes)) 
-    filename += f"_acc{accuracy:.3f}" 
+    filename += f"_acc{accuracy:.4f}" 
     # if best:
     #     filename = "best_" + filename         
 
@@ -581,11 +613,6 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
                 result_path = new_result_path
                 break                
     
-    if all_history is not None and len(all_history) > 0 and total_batches is not None:
-        # Output history analysis  
-        store_history(jnp.array(all_history), result_path, total_batches)
-
-    # Store the results
     result_data = {
         "dataset": params.dataset,
         "dataset_file": params.dataset_file,
@@ -609,22 +636,30 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         "batch_size": params.batch_size,
         "learning rate": params.learning_rate,
         "use_bias": params.use_bias,
-        "use_tanh": params.use_tanh,
-        "exact_rtrl": params.exact_rtrl,
         "layer_sizes": params.layer_sizes,
-        "recurrence": params.recurrence,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
         "validation accuracy": np.array(all_validation_accuracies).tolist(),
-        "iterations mean": np.array(all_iteration_mean).tolist(),
+        "iterations mean": iteration_mean_payload,
         "loss": [float(loss) for loss in all_loss],
         "thresholds": thresholds_dict,
         "weights": weights_dict
     }
+    if extra_fields:
+        items = list(result_data.items())
+        for i, (k, _) in enumerate(items):
+            if k == "processes":
+                items = items[:i+1] + list(extra_fields.items()) + items[i+1:]
+                break
+        else:
+            items = items + list(extra_fields.items())
+        result_data = dict(items)
 
-    with open(result_path + ".json", "w") as f:
-        json.dump(result_data, f, indent=4)
+    return result_path, result_data
 
-    print(f"Results saved to {result_path}")
+
+def store_result_artifacts(result_path, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, all_loss, all_iteration_mean, all_history=None, total_batches=None):
+    if all_history is not None and len(all_history) > 0 and total_batches is not None:
+        store_history(jnp.array(all_history), result_path, total_batches)
 
     if mode == "train":
         epochs = [i + 1 for i in range(len(all_epoch_accuracies))]        
@@ -663,6 +698,43 @@ def store_training_data(size, network, mode, all_epoch_accuracies, all_validatio
         plt.tight_layout()
         plt.savefig(result_path + "_activations.png") 
         plt.close()
+
+
+def store_training_data(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights_dict, all_loss, thresholds_dict, optiname, network_type, all_history=None, total_batches=None, extra_fields=None):
+    result_path, result_data = prepare_result_payload(
+        size,
+        network,
+        mode,
+        all_epoch_accuracies,
+        all_validation_accuracies,
+        test_accuracy,
+        execution_time,
+        all_iteration_mean,
+        weights_dict,
+        all_loss,
+        thresholds_dict,
+        optiname,
+        network_type,
+        extra_fields=extra_fields,
+    )
+    if result_path is None:
+        return
+
+    with open(result_path + ".json", "w") as f:
+        json.dump(result_data, f, indent=4)
+
+    print(f"Results saved to {result_path}")
+    store_result_artifacts(
+        result_path,
+        mode,
+        all_epoch_accuracies,
+        all_validation_accuracies,
+        test_accuracy,
+        all_loss,
+        all_iteration_mean,
+        all_history,
+        total_batches,
+    )
     return result_path + ".json"
 
 #region HISTORY
@@ -852,6 +924,11 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'rerun': None,  # Path to a previous training JSON to continue/rerun
         "override_params": None,  # List of parameter names to override when rerunning from a previous file
 
+        # Number of MPI processes per layer (tuple, must match number of layers and sum to MPI size)
+        # Example: [1, 2, 1] for 3 layers with 4 total processes
+        # If None, falls back to uniform split (requires MPI size % nb_layers == 0)
+        'processes_per_layer': None,
+
         # Reset rate for each layer (tuple, must match number of layers)
         # Example: (1, 1, 1) for 3 layers, (2, 2, 1) for different reset rates
         'restrict': None,  # Will be auto-generated as (1,) * len(layer_sizes) if None
@@ -887,6 +964,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'fptt_warm_epochs': 1,
         'fptt_accumulate_logits': True,
         'fptt_avg_logits': False,
+        'fptt_relu_output': False,
     }
 
     if is_cnn:

@@ -111,8 +111,27 @@ layer_sizes:
 #   - [128]                                  # FC: 128 units
 #   - [10]                                   # Output: 10 classes
 
-# dataset: dvs
+# ---------- CIFAR-10 (32x32) need to set the sync rate to 32*3 to simulate the row by row processing ----------
+dataset: cifar10
+layer_sizes:
+  - [3, 32, 32]                           # Input: 2 polarities, 34x34
+  - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+  - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+  - [128]                                  # FC: 128 units
+  - [10]                                   # Output: 10 classes
+
+# layer_sizes:
+#   - [3, 32, 32]                           # Input
+#   - [32, [3, 3], [1, 1], [1, 1], "max"]      # Conv block 1: 64 filters
+#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+#   - [128, [3, 3], [1, 1], [1, 1], "max"]     # Conv block 2: 128 filters
+#   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
+#   - [256]                                  # FC layer
+#   - [128]                                  # FC layer
+#   - [10]   
+
 # ---------- DVS Gesture (64x64 downsampled) ----------
+# dataset: dvs
 # layer_sizes:
 #   - [2, 64, 64]                           # Input: 2 polarities, 64x64
 #   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
@@ -128,14 +147,14 @@ layer_sizes:
 #   - [128]                                  # FC: 128 units
 #   - [11]                                   # Output: 11 gesture classes
 
-dataset: ncars
-# ---------- NCARS (120x100 full resolution) ----------
-layer_sizes:
-  - [2, 120, 100]                         # Input: 2 polarities
-  - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv
-  - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool
-  - [128]                                  # FC
-  - [2]                                    # car/background
+# # ---------- NCARS (120x100 full resolution) ----------
+# dataset: ncars
+# layer_sizes:
+#   - [2, 120, 100]                         # Input: 2 polarities
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool
+#   - [128]                                  # FC
+#   - [2]                                    # car/background
 
 # ---------- NCARS (60x50 downsampled) ----------
 # layer_sizes:
@@ -156,9 +175,9 @@ layer_sizes:
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
-batch_size: 36              # Number of samples per batch
+batch_size: 120              # Number of samples per batch
 num_epochs: 20              # Number of training epochs
-learning_rate: 0.0001       # Learning rate for optimizer
+learning_rate: 0.0005       # Learning rate for optimizer
 optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
 
 # ============================================================================
@@ -200,9 +219,9 @@ init_thresholds: 0.0
 shuffle_activations: false
 shuffle_input: false
 
-firing_nb: 100000
+firing_nb: 1
 # firing_nb: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-sync_rate: 100000
+sync_rate: [96, 96, 1, 1, 1, 1, 1, 1, 1, 1]
 
 # ============================================================================
 # LEARNING AND REGULARIZATION

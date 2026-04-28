@@ -1,0 +1,23 @@
+dataset: mnist
+layer_sizes: [784, 256, 256, 10]
+
+dataset: smnist
+layer_sizes: [1, 256, 256, 10] 
+
+# layer_sizes: [784, 256, 10]
+num_epochs: 20
+batch_size: 36
+learning_rate: 0.0005
+firing_nb: 1
+sync_rate: 1
+restrict: 1
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0]
+w_reg: 0.0
+# processes_per_layer: null means uniform distribution (size / num_layers processes per layer)
+# Set to a list to assign custom process counts per layer, e.g. [1, 3, 2, 1] for 7 processes
+processes_per_layer: [1, 2, 2, 1]
+# processes_per_layer: [1, 1, 2]
+# processes_per_layer: [1, 2, 1]
+# processes_per_layer: [1, 2, 2]
+# processes_per_layer: null
+

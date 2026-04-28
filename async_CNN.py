@@ -32,6 +32,7 @@ import mpi4jax
 from mpi4jax import send, recv, bcast
 
 from dataset_helpers.mnist_helper import mnist_loader_manual
+from dataset_helpers.cifar10_helper import cifar10_loader_manual
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.network_helper import one_hot_encode
 from dataset_helpers.nmnist_helper import torch_nmnist_loader
@@ -41,7 +42,7 @@ from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.cnn_mnist import get_weights_for_rank
 
 from other_helpers.helpers import Params, NeuronStates
-from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
+from other_helpers.helpers import accuracy, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from other_helpers.backpropagation import MLP_back_prop
@@ -463,7 +464,9 @@ def fc_layer_computation(params, key, neuron_idx, layer_input, weights, neuron_s
     
     @jit
     def hidden_layer_case(_):
-        fire = (iteration-neuron_states.last_sent_iteration) >= params.sync_rate # Fire if sync rate reached
+        sr = params.sync_rate
+        sr = sr if isinstance(sr, int) else sr[layer_idx]
+        fire = (iteration-neuron_states.last_sent_iteration) >= sr # Fire if sync rate reached
         fire = jnp.logical_or(fire, neuron_idx < 0) # Fire if last input received
 
         # APPLY THE SYNC RATE  
@@ -569,7 +572,9 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
         # Step 4: Apply sync rate: Add 1 to the internal counter for sync rate, if counter exceeds it we fire
         activity_slice = jax.lax.dynamic_slice(neuron_states.output_activity, start_indices, slice_shape)
         ne_activity_slice = activity_slice + 1
-        activations = jnp.where(ne_activity_slice >= params.sync_rate, activations, 0.0)  # Only fire where the sync rate is reached
+        sr = params.sync_rate
+        sr = sr if isinstance(sr, int) else sr[layer_idx]
+        activations = jnp.where(ne_activity_slice >= sr, activations, 0.0)  # Only fire where the sync rate is reached
 
         # Step 5: Compute ReLu on the updated slice if fire is True
         activated_output = activation_func(thresholds_sliced, activations)
@@ -672,7 +677,9 @@ def conv_layer_computation(params, key, neuron_idx, layer_input, weights, neuron
 
     @jit
     def last_input(neuron_states):
-        if params.sync_rate == 1:
+        sr = params.sync_rate
+        sr = sr if isinstance(sr, int) else sr[layer_idx]
+        if sr == 1:
             C, H, W = params.flat_layer_sizes[layer_idx]
             return jnp.array(0), jnp.zeros((C*H*W, 4)), neuron_states
 
@@ -1132,10 +1139,11 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     global test_generator
         
     # Initialize the lists for storing the intermediate values
+    all_epoch_accuracies = []
+    all_validation_accuracies = []
+    all_loss = []
+    all_history = None
     if layer_idx == last_layer:
-        all_epoch_accuracies = []
-        all_validation_accuracies = []
-        all_loss = []
         all_history = []
     all_mean_iterations = []
     
@@ -1174,7 +1182,8 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             epoch_total = 0
             epoch_loss = []
             
-        epoch_iterations = []
+        epoch_iter_sum = 0.0
+        epoch_iter_count = 0
         if layer_idx == 0:
             batch_iterator = None
             if rank == 0:
@@ -1185,15 +1194,18 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             if layer_idx == 0: # Input layer
                 batch_x, batch_y = split_batch(params, batch_iterator, mpi_config, 4)
 
-                send(batch_y, dest=last_layer * process_per_layer + rank, tag=10,comm=comm) # Send the labels to the output layer
+                # Send labels to the output layer via plain mpi4py to avoid mpi4jax cache pollution
+                comm.Send(np.ascontiguousarray(np.asarray(batch_y, dtype=np.float32)), dest=last_layer * process_per_layer + rank, tag=10)
 
                 # Run the forward pass
                 outputs, iterations, all_neuron_states = (conv_predict)(params, subkey, weights, neuron_states, layer_computation, jnp.array(batch_x))
                 all_activations, all_iterations, sparsity_L = sparsity_loss(params, all_neuron_states, iterations)
             else:
                 if layer_idx==last_layer: # Output layer
-                    # Receive the labels from the input layer
-                    y = recv(jnp.zeros((batch_part,)), source=rank - (last_layer * process_per_layer), tag=10, comm=comm)  # Source rank opposite operation: rank - (last_layer * process_per_layer)
+                    # Receive the labels from the input layer via plain mpi4py
+                    y_buf = np.empty((batch_part,), dtype=np.float32)
+                    comm.Recv(y_buf, source=rank - (last_layer * process_per_layer), tag=10)
+                    y = y_buf
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=params.layer_sizes[-1][0]))
 
                     # Run the forward and backward pass for the output layer
@@ -1206,10 +1218,10 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                     # Store the accuracy, loss and history                    
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
                     # print(f"Batch {i}, Accuracy: {batch_correct}/{valid_y.shape[0]} ")
-                    epoch_correct += batch_correct
+                    epoch_correct += int(batch_correct)
                     epoch_total += valid_y.shape[0]
-                    
-                    epoch_loss.append(loss)
+
+                    epoch_loss.append(float(loss))
                     if params.history_size > 0:
                         all_history.append(history)
                 else:
@@ -1248,17 +1260,17 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             # if i > 3: # Run a few epochs for testing
             #     break
             # return
-            epoch_iterations.append(iterations[iterations > 1])
-        
+            valid_mask = iterations > 1
+            epoch_iter_sum += float(jnp.sum(jnp.where(valid_mask, iterations, 0.0)))
+            epoch_iter_count += int(jnp.sum(valid_mask))
+
         # Compute the average iterations for each layer
-        epoch_iterations = jnp.concatenate(epoch_iterations)
-        mean = jnp.mean(epoch_iterations)
-        all_mean_iterations.append(mean)
-        all_mean_iterations = gather_batch(all_mean_iterations, mpi_config)
-        all_mean_iterations = all_mean_iterations.tolist()
-        
+        mean = epoch_iter_sum / epoch_iter_count if epoch_iter_count > 0 else 0.0
+        mean = gather_batch(jnp.array(mean), mpi_config)
+        all_mean_iterations.append(float(mean))
+
         if layer_idx != 0:
-            jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points and a mean threshold of {}", rank, mean, epoch_iterations.shape[0], jnp.mean(empty_neuron_states.thresholds))
+            jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points and a mean threshold of {}", rank, mean, epoch_iter_count, jnp.mean(empty_neuron_states.thresholds))
         
         # Inference on the validation set
         val_accuracy, val_mean, _ = batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset="val", save=False, debug=False)
@@ -1267,16 +1279,14 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         if layer_idx == last_layer:
             # Store loss values
             mean_loss = jnp.mean(jnp.array(epoch_loss))
-            all_loss.append(mean_loss)
             mean_loss = gather_batch(mean_loss, mpi_config)
+            all_loss.append(float(mean_loss))
 
             # Store training and validation accuracies
             epoch_accuracy = epoch_correct / epoch_total
-            all_epoch_accuracies.append(epoch_accuracy)
-            all_validation_accuracies.append(val_accuracy)
-            all_epoch_accuracies = gather_batch(all_epoch_accuracies, mpi_config)
-            all_validation_accuracies = gather_batch(all_validation_accuracies, mpi_config)
-            all_epoch_accuracies, all_validation_accuracies = all_epoch_accuracies.tolist(), all_validation_accuracies.tolist()
+            epoch_accuracy = gather_batch(epoch_accuracy, mpi_config)
+            all_epoch_accuracies.append(float(epoch_accuracy))
+            all_validation_accuracies.append(float(val_accuracy))
             if rank == size-1:
                 jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, all_epoch_accuracies[-1] * 100, val_accuracy * 100, mean_loss, val_mean)
                 jax.debug.print("----------------------------\n")
@@ -1284,111 +1294,195 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         if epoch_accuracy >= 0.9999:
             break
         if STORE_EACH_EPOCH: 
-            # Gather the weights and iteration values at the last layer
-            layer_weights_sizes = [] # Retrieve the shapes of all the weights 
-            for layer in network.layers:
-                layer_weights_sizes.append(layer.weights_shape)
-            weights_dict, all_iteration_mean, thresholds_dict = gather_w_iter_th(network, layer_weights_sizes, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
-
-            if rank == last_layer * process_per_layer:
-                result_path_str = store_training_data(
-                                size,
-                                network, 
-                                "train",
-                                all_epoch_accuracies, 
-                                all_validation_accuracies, 
-                                -1.0,
-                                time.time() - start_time,
-                                all_iteration_mean,
-                                weights_dict,
-                                all_loss, 
-                                thresholds_dict,
-                                opti,
-                                "CNN_temp",
-                                all_history,
-                                total_batches[0])
+            all_iteration_mean = gather_iteration_means(jnp.array(all_mean_iterations))
+            result_path_str = store_training_data_distributed(
+                size,
+                network,
+                "train",
+                all_epoch_accuracies,
+                all_validation_accuracies,
+                -1.0,
+                time.time() - start_time,
+                all_iteration_mean,
+                weights,
+                empty_neuron_states.thresholds,
+                all_loss,
+                opti,
+                "CNN_temp",
+                all_history,
+                total_batches[0],
+            )
 
     # Inference on the test set
     test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset="test", save=False, debug=False)
     
-    # Gather the weights and iteration values at the last layer
-    layer_weights_sizes = [] # Retrieve the shapes of all the weights 
-    for layer in network.layers:
-        layer_weights_sizes.append(layer.weights_shape)
-    weights_dict, all_iteration_mean, thresholds_dict = gather_w_iter_th(network, layer_weights_sizes, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
+    all_iteration_mean = gather_iteration_means(jnp.array(all_mean_iterations))
     
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
     end_time = time.time()
     
-    # Compute processing time and store all the results in a json file
-    MAX_LEN = 256
-    result_path = jnp.zeros(MAX_LEN, dtype=jnp.uint8)
+    execution_time = end_time - start_time
     if rank == last_layer * process_per_layer:
-        # Execution time
-        execution_time = end_time - start_time
         print(f"Execution Time: {execution_time:.6f} seconds")
-        result_path_str = store_training_data(
-                            size,
-                            network, 
-                            "train",
-                            all_epoch_accuracies, 
-                            all_validation_accuracies, 
-                            test_accuracy,
-                            execution_time,
-                            all_iteration_mean,
-                            weights_dict,
-                            all_loss, 
-                            thresholds_dict,
-                            opti,
-                            "CNN",
-                            all_history,
-                            total_batches[0])
-        
-        encoded = np.frombuffer(result_path_str.encode("utf-8"), dtype=np.uint8)
-        if encoded.size > MAX_LEN:
-            raise ValueError("result_path too long")
-        padded = np.pad(encoded, (0, MAX_LEN - encoded.size), constant_values=0)
-        result_path = jnp.array(padded)
-    result_path = bcast(result_path, root=last_layer*process_per_layer, comm=comm)
-    result_path = bytes(result_path).decode("utf-8").rstrip("\x00")
+
+    result_path = store_training_data_distributed(
+        size,
+        network,
+        "train",
+        all_epoch_accuracies,
+        all_validation_accuracies,
+        test_accuracy,
+        execution_time,
+        all_iteration_mean,
+        weights,
+        empty_neuron_states.thresholds,
+        all_loss,
+        opti,
+        "CNN",
+        all_history,
+        total_batches[0],
+    )
 
     return result_path
 
-def gather_w_iter_th(network, layer_weights_sizes, weights, mean_iterations, thresholds):
-    # Gather all the weights and iteration values at the last layer to store them
+def _flush_json_file(handle):
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _write_result_json_prefix(result_path, result_data):
+    metadata = dict(result_data)
+    metadata.pop("thresholds", None)
+    metadata.pop("weights", None)
+    metadata_lines = json.dumps(metadata, indent=4).splitlines()
+    body_lines = metadata_lines[1:-1]
+
+    with open(result_path + ".json", "w", encoding="utf-8") as f:
+        f.write("{\n")
+        if body_lines:
+            body_lines[-1] = body_lines[-1] + ","
+            for line in body_lines:
+                f.write(line + "\n")
+        f.write('    "thresholds": {\n')
+        _flush_json_file(f)
+
+
+def _append_json_section_entry(result_path, key, value, trailing_comma):
+    serializable_value = np.asarray(value).tolist()
+    with open(result_path + ".json", "a", encoding="utf-8") as f:
+        f.write(f"        {json.dumps(key)}: ")
+        json.dump(serializable_value, f)
+        if trailing_comma:
+            f.write(",")
+        f.write("\n")
+        _flush_json_file(f)
+
+
+def _switch_result_json_to_weights(result_path):
+    with open(result_path + ".json", "a", encoding="utf-8") as f:
+        f.write("    },\n")
+        f.write('    "weights": {\n')
+        _flush_json_file(f)
+
+
+def _finalize_result_json(result_path):
+    with open(result_path + ".json", "a", encoding="utf-8") as f:
+        f.write("    }\n")
+        f.write("}\n")
+        _flush_json_file(f)
+
+
+def gather_iteration_means(mean_iterations):
     leader_rank = layer_idx * process_per_layer
-
-    weights_dict = {}
+    save_root = last_layer * process_per_layer
     all_iteration_mean = []
-    thresholds_dict = {}
-    if layer_idx != last_layer and rank == leader_rank:
-        send(mean_iterations, dest=last_layer * process_per_layer, tag=5,comm=comm)
-        if layer_idx != 0:
-            send(weights, dest=last_layer * process_per_layer, tag=5,comm=comm)
-            send(thresholds, dest=last_layer * process_per_layer, tag=5,comm=comm)
-    elif layer_idx == last_layer and rank == leader_rank:
-        for i in range(last_layer):
-            # Storing mean iterations
-            iter_mean = recv(mean_iterations, source=i * process_per_layer, tag=5, comm=comm)
-            all_iteration_mean.append(iter_mean)
-            if i == 0:
-                continue
-            
-            # Storing the weights 
-            w = recv(jnp.zeros(layer_weights_sizes[i]), source=i * process_per_layer, tag=5, comm=comm)   
-            weights_dict[f"layer_{i}"] = w.tolist()
-            
-            # Storing the thresholds
-            thr = recv(jnp.zeros(network.conv_layer_sizes[i]), source=i * process_per_layer, tag=5, comm=comm)
-            thresholds_dict[f"thresholds_{i}"]= thr.tolist()
-            
-        all_iteration_mean.append(mean_iterations)  # Append the mean iterations of the last layer
-        weights_dict[f"layer_{last_layer}"] = weights.tolist()
-        all_iteration_mean = all_iteration_mean[1:] # Don't keep the value of the input layer
-        print("all iteration mean: rank", rank, all_iteration_mean)
 
-    return weights_dict, all_iteration_mean, thresholds_dict
+    if rank == leader_rank:
+        payload = np.asarray(mean_iterations).tolist()
+        if rank == save_root:
+            collected = {layer_idx: payload}
+            for i in range(last_layer):
+                src = i * process_per_layer
+                collected[i] = comm.recv(source=src, tag=51)
+            all_iteration_mean = [collected[i] for i in range(1, last_layer + 1)]
+            print("all iteration mean: rank", rank, all_iteration_mean)
+        else:
+            comm.send(payload, dest=save_root, tag=51)
+
+    return all_iteration_mean
+
+
+def store_training_data_distributed(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights, thresholds, all_loss, optiname, network_type, all_history=None, total_batches=None):
+    save_root = last_layer * process_per_layer
+    result_path = None
+
+    if rank == save_root:
+        result_path, result_data = prepare_result_payload(
+            size,
+            network,
+            mode,
+            all_epoch_accuracies,
+            all_validation_accuracies,
+            test_accuracy,
+            execution_time,
+            all_iteration_mean,
+            {},
+            all_loss,
+            thresholds_dict={},
+            optiname=optiname,
+            network_type=network_type,
+        )
+        if result_path is not None:
+            _write_result_json_prefix(result_path, result_data)
+
+    result_path = comm.bcast(result_path, root=save_root)
+    if result_path is None:
+        return None
+
+    comm.Barrier()
+
+    for current_layer in range(1, last_layer):
+        if rank == current_layer * process_per_layer:
+            _append_json_section_entry(
+                result_path,
+                f"thresholds_{current_layer}",
+                thresholds,
+                trailing_comma=current_layer < last_layer - 1,
+            )
+        comm.Barrier()
+
+    if rank == save_root:
+        _switch_result_json_to_weights(result_path)
+    comm.Barrier()
+
+    for current_layer in range(1, last_layer + 1):
+        if rank == current_layer * process_per_layer:
+            _append_json_section_entry(
+                result_path,
+                f"layer_{current_layer}",
+                weights,
+                trailing_comma=current_layer < last_layer,
+            )
+        comm.Barrier()
+
+    if rank == save_root:
+        _finalize_result_json(result_path)
+        print(f"Results saved to {result_path}")
+        store_result_artifacts(
+            result_path,
+            mode,
+            all_epoch_accuracies,
+            all_validation_accuracies,
+            test_accuracy,
+            all_loss,
+            all_iteration_mean,
+            all_history,
+            total_batches,
+        )
+
+    comm.Barrier()
+    return result_path + ".json"
 
 
 # region Inference loop
@@ -1427,12 +1521,14 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
     if total_batches == 0:
         return -0.01, -1.0, -1.0 # arbitrary code for empty dataset
 
+    all_history = None
     if layer_idx == last_layer:
         epoch_correct = 0
         epoch_total = 0
         all_history = []
 
-    epoch_iterations = []
+    epoch_iter_sum = 0.0
+    epoch_iter_count = 0
     for i in tqdm(range(total_batches), disable=TQDM_DISABLE):
         if layer_idx == 0:         
             # readInputJson = True        
@@ -1457,8 +1553,8 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
 
             outputs, iterations, all_neuron_states = (conv_predict)(params, key, weights, empty_neuron_states, layer_computation, jnp.array(batch_x))
 
-            # Send label to the last layer
-            send(batch_y, dest=last_layer * process_per_layer + rank, tag=10,comm=comm)
+            # Send label to the last layer via plain mpi4py
+            comm.Send(np.ascontiguousarray(np.asarray(batch_y, dtype=np.float32)), dest=last_layer * process_per_layer + rank, tag=10)
         else:
             # outputs, iterations, all_neuron_states = (predict)(params, key, weights, neuron_states, jnp.zeros((batch_part, layer_sizes[0])))
             batch_data = jnp.zeros((batch_part, 1, 4))
@@ -1469,11 +1565,13 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             if layer_idx == last_layer:
                 # jax.debug.print("Rank {} All neuron states values shape: {}, output shape : {}", rank, all_neuron_states.values.shape, outputs)
 
-                y = recv(jnp.zeros((batch_part,)), source=rank - (last_layer * process_per_layer), tag=10, comm=comm)   
+                y_buf = np.empty((batch_part,), dtype=np.float32)
+                comm.Recv(y_buf, source=rank - (last_layer * process_per_layer), tag=10)
+                y = y_buf
                 
                 valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
                 
-                epoch_correct += batch_correct
+                epoch_correct += int(batch_correct)
                 epoch_total += valid_y.shape[0]
                 # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_output.json", outputs.tolist(), y.tolist())
 
@@ -1484,22 +1582,17 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             # store_data_to_json(f"{len(params.layer_sizes)}hidden_intermediates_layer{rank}.json", outputs.tolist())
 
         # store_data_to_json(f"{len(params.layer_sizes)}hidden_iterations_layer{rank}.json", iterations.tolist())
-        epoch_iterations.append(iterations[iterations > 1])
-        # jax.debug.print("Rank {}, iterations: {}", rank, iterations)
+        valid_mask = iterations > 1
+        epoch_iter_sum += float(jnp.sum(jnp.where(valid_mask, iterations, 0.0)))
+        epoch_iter_count += int(jnp.sum(valid_mask))
         # if i >= 0:
         #     break
-    
-    # print(f"Shape iterations before flattening: {jnp.array(epoch_iterations).shape}")
-    epoch_iterations = jnp.concatenate(epoch_iterations)
-    mean = jnp.mean(epoch_iterations)
-    # print(f"Rank {rank} finished epoch with mean {mean} with {epoch_iterations.shape} iterations")
 
-    if layer_idx != 0:
-        mean = gather_batch(mean, mpi_config)
-    # jax.debug.print("Rank {}, all iterations shape: {}", rank, (epoch_iterations.shape[0]))
-    
+    mean = epoch_iter_sum / epoch_iter_count if epoch_iter_count > 0 else 0.0
+    mean = gather_batch(jnp.array(mean), mpi_config)
+
     if rank != 0 and debug:
-        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, epoch_iterations.shape[0]*process_per_layer)
+        jax.debug.print("Rank {} finished all batches with an average iteration of {} out of {} data points", rank, mean, epoch_iter_count*process_per_layer)
     
     epoch_accuracy = -1.0
     if layer_idx == last_layer:
@@ -1508,44 +1601,39 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
-    
-    
-    layer_weights_sizes = []
-    for layer in network.layers:
-        layer_weights_sizes.append(layer.weights_shape)
-    print(f"rank {rank}: {layer_weights_sizes}")
-    
-    weights_dict, all_iteration_mean, thresholds_dict = gather_w_iter_th(network, layer_weights_sizes, weights, mean, empty_neuron_states.thresholds)
+    all_iteration_mean = []
+    if save:
+        all_iteration_mean = gather_iteration_means(mean)
 
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
     end_time = time.time()
 
-    if rank == last_layer * process_per_layer:
-        execution_time = end_time - start_time
+    execution_time = end_time - start_time
+    if rank == last_layer * process_per_layer and debug:            
+        print(f"Execution Time: {execution_time:.6f} seconds")
+    if save:
+        accuracies = {"train": [-1], "val": [-1], "test": [-1]}
+        if dataset in accuracies:
+            accuracies[dataset] = [epoch_accuracy]
 
-        if debug:            
-            print(f"Execution Time: {execution_time:.6f} seconds")
-        if save:
-            accuracies = {"train": [-1], "val": [-1], "test": [-1]}
-            if dataset in accuracies:
-                accuracies[dataset] = [epoch_accuracy]
-
-            store_training_data(size,
-                                network, 
-                                "inference",
-                                accuracies["train"], 
-                                accuracies["val"], 
-                                accuracies["test"][0],
-                                execution_time,
-                                all_iteration_mean,
-                                weights_dict,
-                                [],
-                                thresholds_dict,
-                                None,
-                                "CNN",
-                                all_history,
-                                total_batches)
+        store_training_data_distributed(
+            size,
+            network,
+            "inference",
+            accuracies["train"],
+            accuracies["val"],
+            accuracies["test"][0],
+            execution_time,
+            all_iteration_mean,
+            weights,
+            empty_neuron_states.thresholds,
+            [],
+            None,
+            "CNN",
+            all_history,
+            total_batches,
+        )
     return epoch_accuracy, mean, end_time - start_time
 
 def get_layer_idx(batch_size, layer_sizes):
@@ -1646,6 +1734,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     loader = partial(torch_NCARS_loader)
                     if tuple(layer_sizes[0][1:]) == (60, 50):
                         downsample = True
+                case "cifar10":
+                    loader = cifar10_loader_manual
                 case _:
                     raise ValueError(f"Unknown dataset: {dataset}")
                 
@@ -1684,7 +1774,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             threshold_lr=config['threshold_lr'],               # Threshold learning rate
             sparsity_impact=tuple(config['sparsity_impact']), # Beta sparse (Sparsity loss's impact)
             w_reg=config['w_reg'],                      # Weight regularization impact
-            rerun="",
+            rerun=None,
             top_weights=config['top_weights'],
             max_kernel=max_kernel,
             flat_layer_sizes=(),            # Each layer's shape
@@ -1757,4 +1847,7 @@ if __name__ == "__main__":
     size = comm.Get_size()
 
     main(random_seed, key, rank, size, comm, config_path=args.config, data_dir=args.data_dir)
-# JAX_PLATFORMS=cpu mpirun -n 5 python async_CNN.py --config "CNN_config.yaml"
+
+'''
+JAX_PLATFORMS=cpu mpirun -n 5 python async_CNN.py --config "configs/CNN_config.yaml"
+'''

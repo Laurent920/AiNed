@@ -1,0 +1,55 @@
+# ============================================================================
+# S-MNIST + Rhythm modulation (Rhythm-SNN, Nature Communications 2025)
+# Architecture matching paper Table S1: Rhythm-FFSNN, S-MNIST row
+#   Layer sizes: 1 -> 256 -> 256 -> 10
+#   Rhythm Period: U[10, 50], Duty Cycle: U[0.02, 0.1], Phase: U[0, 0.5]
+# ============================================================================
+
+dataset: smnist
+layer_sizes: [1, 256, 256, 10]
+
+mode: training
+use_bias: false
+
+# ============================================================================
+# TRAINING PARAMETERS
+# ============================================================================
+batch_size: 36
+num_epochs: 50
+learning_rate: 0.005
+optimizer: adam
+
+load_file: false
+best: false
+rerun: null
+override_params: null
+
+# ============================================================================
+# NEURON BEHAVIOR
+# firing_nb controls sparsity — low value prevents runaway activations
+# ============================================================================
+restrict: 1
+init_thresholds: 0.0
+shuffle_activations: false
+shuffle_input: false
+firing_nb: 10          # limit to 10 firings per event to keep the network sparse
+sync_rate: 1
+exploration_rate: 0.0
+
+# ============================================================================
+# RHYTHM MODULATION PARAMETERS
+# Per-neuron oscillatory gating: m[t] = 1 if (t - floor(phi*c)) mod c < floor(d*c)
+# c ~ U[period_min, period_max], d ~ U[duty_min, duty_max], phi ~ U[phase_min, phase_max]
+# ============================================================================
+rhythm_period_range: [10, 50]     # Rhythm period c ~ U[10, 50]  (paper Table S1)
+rhythm_duty_range:   [0.02, 0.1]  # Duty cycle   d ~ U[0.02, 0.1]
+rhythm_phase_range:  [0.0, 0.5]   # Phase        phi ~ U[0, 0.5]
+
+# ============================================================================
+# LEARNING AND REGULARIZATION
+# ============================================================================
+threshold_lr: 0.0
+sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+w_reg: 0.0
+top_weights: -1
+history_size: 0

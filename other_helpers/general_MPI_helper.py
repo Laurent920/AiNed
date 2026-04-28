@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from functools import partial
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from mpi4py import MPI
 from mpi4jax import send, recv
@@ -21,12 +22,14 @@ def combine_batch_avg(data, mpi_config):
     '''
     rank = mpi_config.rank
     comm = mpi_config.comm
+    batch_distrib = mpi_config.batch_distribution
 
-    data = jnp.array(data)        
+    data = jnp.array(data)   
+    if len(batch_distrib) == 1:
+        return data.squeeze(axis=0)
     # jax.debug.print("rank {} data shape {}", rank, data.shape)
     if mpi_config.is_batch_leader:
         avg = data
-        batch_distrib = mpi_config.batch_distribution
         for r, _ in batch_distrib: # Receive the data from all the corresponding ranks in one split rank
             if r == rank: continue
             received_data = recv(data, source=r, tag=20, comm=comm)
@@ -51,11 +54,14 @@ def gather_batch(data, mpi_config, average=True):
     '''
     rank = mpi_config.rank
     comm = mpi_config.comm
+    batch_distrib = mpi_config.batch_distribution
 
     data = jnp.array(data)
+    if len(batch_distrib) == 1:
+        return data
+    
     if mpi_config.is_batch_leader:
         avg = data
-        batch_distrib = mpi_config.batch_distribution
         for r, _ in batch_distrib: # Receive the data from all the corresponding ranks in one split rank
             if r == rank: continue
             received_data = recv(data, source=r, tag=20, comm=comm)
@@ -417,18 +423,23 @@ class MPIConfig:
     def MPI_partition(self, weights, empty_neuron_states):
         start = self.model_part.start_idx
         end = self.model_part.end_idx+1
-        part_empty_neuron_states = NeuronStates(values=empty_neuron_states.values[start:end],
-                                                thresholds=empty_neuron_states.thresholds[start:end],
-                                                input_residuals=empty_neuron_states.input_residuals,
-                                                input_order=empty_neuron_states.input_order, 
-                                                input_activity=empty_neuron_states.input_activity,
-                                                layer_activity=empty_neuron_states.layer_activity[start:end],
-                                                output_activity=empty_neuron_states.output_activity[:, start:end],
-                                                last_sent_iteration=0,
-                                                input_vector=empty_neuron_states.input_vector,
-                                                output_vector=empty_neuron_states.output_vector[start:end],
-                                                values_history=empty_neuron_states.values_history[:, start:end],
-                                                history_index=jnp.array(0, dtype=jnp.int32))
+        svec = empty_neuron_states.sync_rate_vector
+        part_empty_neuron_states = NeuronStates(
+            values=empty_neuron_states.values[start:end],
+            bias=empty_neuron_states.bias[start:end],
+            thresholds=empty_neuron_states.thresholds[start:end],
+            input_residuals=empty_neuron_states.input_residuals,
+            input_order=empty_neuron_states.input_order,
+            input_activity=empty_neuron_states.input_activity,
+            layer_activity=empty_neuron_states.layer_activity[start:end],
+            output_activity=empty_neuron_states.output_activity[:, start:end],
+            last_sent_iteration=empty_neuron_states.last_sent_iteration[start:end],
+            input_vector=empty_neuron_states.input_vector,
+            output_vector=empty_neuron_states.output_vector[start:end],
+            sync_rate_vector=svec[start:end] if svec is not None else None,
+            values_history=empty_neuron_states.values_history[:, start:end],
+            history_index=jnp.array(0, dtype=jnp.int32),
+        )
         # print(f"weights shape: {weights.shape}, resulting size s-e: {start}-{end}")
         try:
             part_weights = weights[:,start:end]
@@ -488,6 +499,9 @@ class MPIProcessDistribution:
         mapping scheme: 6 processes, 3 layers
             0 -> 1 -> 2
             3 -> 4 -> 5
+
+        If the batch size is not perfectly divisible by the number of processes per layer, 
+        the remaining samples are distributed one by one to the first few processes in the layer until all samples are assigned.
         """
         assert self.mpi_size % self.nb_layers == 0, f"Pure data parallelism requires the number of processes ({self.mpi_size}) to be a multiple of the number of layers ({self.nb_layers})"
 
@@ -502,7 +516,7 @@ class MPIProcessDistribution:
             self.layer_assignments[i] = (layer_idx, 
                                          (batch_part_start, batch_part_end), 
                                          (0, self.layer_sizes[layer_idx]-1))
-            if layer_idx == self.nb_layers - 1:
+            if layer_idx == self.nb_layers - 1: # Set up the batch partitions for the next network
                 batch_part_start = batch_part_end+1
                 batch_part_end = batch_part_start + batch_part_size -1
                 if batch_remain != 0:
@@ -512,6 +526,46 @@ class MPIProcessDistribution:
             layer_idx = (layer_idx+1)%self.nb_layers
         return self
     
+    def model_split_custom(self, processes_per_layer: tuple[int, ...]):
+        """
+        Model parallelism with a custom number of processes per layer.
+        All processes in the same layer share the same batch partition.
+        Rank layout: layers are assigned in order, e.g. processes_per_layer=(1,2,1) → ranks 0|1,2|3
+
+        Example: processes_per_layer=(1, 2, 1), batch_size=36
+            rank 0 → layer 0, neurons [0:784]
+            rank 1 → layer 1, neurons [0:128]
+            rank 2 → layer 1, neurons [129:256]
+            rank 3 → layer 2, neurons [0:10]
+        """
+        assert len(processes_per_layer) == self.nb_layers, \
+            f"processes_per_layer length ({len(processes_per_layer)}) must match number of layers ({self.nb_layers})"
+        assert sum(processes_per_layer) == self.mpi_size, \
+            f"sum of processes_per_layer ({sum(processes_per_layer)}) must equal total MPI size ({self.mpi_size})"
+        assert all(p >= 1 for p in processes_per_layer), "each layer needs at least 1 process"
+
+        process_rank = 0
+        for layer_idx, nb_processes in enumerate(processes_per_layer):
+            layer_neurons = self.layer_sizes[layer_idx]     
+            layer_part_size = layer_neurons // nb_processes
+            layer_remain = layer_neurons % nb_processes
+
+            model_part_start = 0
+            model_part_end = model_part_start + layer_part_size -1
+            for _ in range(nb_processes):
+                self.layer_assignments[process_rank] =  (layer_idx, 
+                                                        (0, self.batch_size-1), 
+                                                        (model_part_start, model_part_end))
+                model_part_start = model_part_end + 1
+                model_part_end = model_part_start + layer_part_size -1
+                if layer_remain != 0:   # Distribute the remain of the layer's neurons one by one to the first few processes in the layer until all neurons are assigned
+                    model_part_end += 1
+                    layer_remain -= 1
+
+                process_rank += 1
+        print(self.layer_assignments)
+        return self
+
     def model_split_uniform(self):
         """
         Model parallelism: Splits the processes as uniformely as possible by sharing to the deeper layers first 
@@ -527,7 +581,7 @@ class MPIProcessDistribution:
         process_per_layer = self.mpi_size // self.nb_layers
         model_remain = self.mpi_size % self.nb_layers 
         process_distribution = [process_per_layer] * self.nb_layers
-        for i in reversed(range(self.nb_layers-1)):
+        for i in reversed(range(self.nb_layers-1)): # Distributing the additional processes to the deeper layers first (excluding the last layer)
             if model_remain == 0:
                 break
             process_distribution[i] += 1
@@ -536,7 +590,7 @@ class MPIProcessDistribution:
 
         process_rank = 0
         for layer_idx, nb_processes in enumerate(process_distribution):
-            layer_neurons = self.layer_sizes[layer_idx]
+            layer_neurons = self.layer_sizes[layer_idx]     
             layer_part_size = layer_neurons // nb_processes
             layer_remain = layer_neurons % nb_processes
 
@@ -548,7 +602,7 @@ class MPIProcessDistribution:
                                                         (model_part_start, model_part_end))
                 model_part_start = model_part_end+1
                 model_part_end = model_part_start + layer_part_size -1
-                if layer_remain != 0:
+                if layer_remain != 0:   # Distribute the remain of the layer's neurons one by one to the first few processes in the layer until all neurons are assigned
                     model_part_end += 1
                     layer_remain -= 1
 
@@ -562,7 +616,7 @@ class MPIProcessDistribution:
             - Batch partition refers to the splitting of a batch across processes (See data_split_uniform)
             - Model partition refers to the splitting of a layer across processes (See model_split_uniform)
         """
-        # Creating batch and model partitions
+        # Creating batch and model partitions of current rank
         layer_idx, batch_parts, model_parts = self.layer_assignments[rank]
         print(rank, self.layer_assignments)
         batch_part = Partition(start_idx=batch_parts[0],
@@ -583,8 +637,10 @@ class MPIProcessDistribution:
         for r in self.layer_assignments.keys():
             l_idx, b_parts, m_parts = self.layer_assignments[r] # Layer index, batch parts, model parts
             all_leaders[l_idx].append(r)
-
-            if b_parts[0] == batch_part.start_idx and b_parts[1] == batch_part.end_idx: # Check if the rank belongs to the same batch partition
+            
+            # Check if the rank belongs to the same batch partition
+            batch_cond = b_parts[0] == batch_part.start_idx and b_parts[1] == batch_part.end_idx
+            if batch_cond: 
                 if m_parts[0] == 0: # Only consider the first model partition of the layer (leader ranks)
                     b_last_rank = max(b_last_rank, r)   # Last rank of the batch partition where to send the labels
                     b_first_rank = min(b_first_rank, r) # First rank of the batch partition from which we receive the labels
@@ -603,7 +659,8 @@ class MPIProcessDistribution:
                     curr.append(info)
                 elif l_idx == layer_idx+1:  # Next layer model parts where we send the data to
                     next.append(info)
-            if l_idx == layer_idx:
+            # if l_idx == layer_idx:
+            if l_idx == layer_idx and (not batch_cond or r == rank):
                 b_part = Partition(start_idx=b_parts[0],
                                end_idx=b_parts[1],
                                total_size=self.batch_size)
@@ -639,40 +696,24 @@ def forward_send(mpi_config: MPIConfig, data, it=0):
         #              lambda _: None, None)
         send(data, dest=process, tag=0, comm=mpi_config.comm)
 
-@partial(jax.jit, static_argnums=(1, 2))
-def forward_recv(mpi_config: MPIConfig, num_prev, input_shape, finished):
-    # num_prev = mpi_config.nb_previous  
-    data = jnp.zeros((num_prev, input_shape))
-    for i, (process, partition) in enumerate(mpi_config.previous_layer):
-        recv_data = jax.lax.cond(finished[i] <= -1, # If previous layer finished sending don't call receive anymore
-                                 lambda _: jnp.array([-1.0, -1.0]),
-                                 lambda _: recv(jnp.zeros((input_shape)), source=process, tag=0, comm=mpi_config.comm),
-                                 None)
-        # recv_data= recv(jnp.zeros((input_shape)), source=process, tag=0, comm=mpi_config.comm)
-        data = data.at[i].set(recv_data)
-        # jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data[i], data.shape)       
+@partial(jax.jit, static_argnums=(1,))
+def forward_recv(mpi_config: MPIConfig, input_shape):
+    return recv(jnp.zeros((input_shape,)), source=MPI.ANY_SOURCE, tag=0, comm=mpi_config.comm)
 
-    # cond = jnp.logical_and(mpi_config.layer_idx == 2, jnp.any(data!=-10))
-    # jax.lax.cond(cond,
-    #             lambda _: jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data, data.shape),
-    #             lambda _: None, None)
-    # data = jax.lax.fori_loop(0, num_prev, body_fn, data)
-    # cond = jnp.logical_and(True, True)
-    # jax.lax.cond(cond,
-    #                 lambda _: jax.debug.print("rank {} received {} shape {}", mpi_config.rank, data[0], data.shape),
-    #                 lambda _: None, None)
-    return data
-
-@partial(jax.jit, static_argnums=(2))
 def send_labels(mpi_config: MPIConfig, labels, source):
+    # Use mpi4py directly (not mpi4jax) to avoid the per-batch memory leak.
     if mpi_config.rank == source:
-        send(labels, dest=mpi_config.batch_first_and_last_rank[1], tag=10, comm=mpi_config.comm)
+        buf = np.ascontiguousarray(np.asarray(labels, dtype=np.float32))
+        mpi_config.comm.Send(buf, dest=mpi_config.batch_first_and_last_rank[1], tag=10)
 
 def recv_labels(mpi_config: MPIConfig):
-    y = jnp.zeros((mpi_config.batch_part.get_size,))
     if mpi_config.rank == mpi_config.batch_first_and_last_rank[1]:
-        y = recv(y, source=mpi_config.batch_first_and_last_rank[0], tag=10, comm=mpi_config.comm)
-    
+        buf = np.empty((mpi_config.batch_part.get_size,), dtype=np.float32)
+        mpi_config.comm.Recv(buf, source=mpi_config.batch_first_and_last_rank[0], tag=10)
+        y = jnp.asarray(buf)
+    else:
+        y = jnp.zeros((mpi_config.batch_part.get_size,))
+
     y = leader_share_to_whole_layer(mpi_config, y)
     return y
 
@@ -682,15 +723,20 @@ def backward_send(mpi_config: MPIConfig, data):
         # jax.lax.cond(cond,
         #              lambda _: jax.debug.print("rank {} sending {} to rank {}", mpi_config.rank, data.shape, process),
         #              lambda _: None, None)
-        send(data, dest=process, tag=2, comm=mpi_config.comm)
+        # jax.debug.print("rank {} sending start idx{} end idx{} resulting in shape {} to rank {} with total shape {}", mpi_config.rank, partition.start_idx, partition.end_idx, data[:, partition.start_idx:partition.end_idx+1].shape, process, data.shape)
+        data_part = data[:, partition.start_idx:partition.end_idx+1]
+        send(data_part, dest=process, tag=2, comm=mpi_config.comm)
 
 def backward_recv(mpi_config: MPIConfig):
-    data_shape = (mpi_config.batch_part.get_size, mpi_config.model_part.total_size)
+    data_shape = (mpi_config.batch_part.get_size, mpi_config.model_part.get_size)
+    # data_shape = (mpi_config.batch_part.get_size, mpi_config.model_part.total_size)
     data = jnp.zeros(data_shape)
     for process, model_partition in mpi_config.next_layer:
-        # jax.debug.print("rank {} waiting to receive from {}", mpi_config.rank, process)
+        # jax.debug.print("rank {} waiting to receive from {} data of shape {}", mpi_config.rank, process, data_shape)
         data_part = recv(jnp.zeros(data_shape), source=process, tag=2, comm=mpi_config.comm)
         data += data_part
+        # jax.debug.print("rank {} waiting to receive from {} data of shape {}", mpi_config.rank, process, data_part)
+
         # cond = jnp.logical_and(process != -1, jnp.any(data!=-1))
         # jax.lax.cond(cond,
         #              lambda _: jax.debug.print("rank {} received {}", mpi_config.rank, data.shape),
@@ -701,6 +747,12 @@ def backward_recv(mpi_config: MPIConfig):
 def data_split(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...]):
     mpi_process_distribution = MPIProcessDistribution(mpi_size, batch_size, layer_sizes)
     mpi_process_distribution.data_split_uniform()
+    mpi_config = mpi_process_distribution.build(rank, comm)
+    return mpi_config
+
+def model_split_custom(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...], processes_per_layer: tuple[int, ...]):
+    mpi_process_distribution = MPIProcessDistribution(mpi_size, batch_size, layer_sizes)
+    mpi_process_distribution.model_split_custom(processes_per_layer)
     mpi_config = mpi_process_distribution.build(rank, comm)
     return mpi_config
 

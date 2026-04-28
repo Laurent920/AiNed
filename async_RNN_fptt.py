@@ -425,6 +425,127 @@ class FPTTVanillaRNN(nn.Module):
         return logits, [(h_new,)]
 
 
+class FPTTMinimalRNNAED(nn.Module):
+    """
+    MinimalRNN with AED (Async Event-Driven) output, matching async_RNN_fptt_mpi.py.
+
+    Per-timestep equations (event format: neuron_idx, value):
+        z_t = tanh(value * W_phi[neuron_idx] + b_phi)
+        u_t = sigmoid([h_prev, z_t] @ W_gate + b_gate)
+        h_t = u_t * h_prev + (1 - u_t) * z_t
+        o_t = top_k(ReLU(h_t))   ← sparse output like MPI version
+        logits += o_t @ W_out     ← accumulated every timestep
+    """
+
+    def __init__(self, n_input_neurons, hidden_size, n_classes,
+                 sync_rate=1, firing_nb=10000, dropout=0.0, nlayers=1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.sync_rate   = sync_rate
+        self.firing_nb   = firing_nb
+        self.nlayers     = nlayers
+
+        # Layer 0: AED input — embedding lookup by neuron_idx
+        self.W_phi  = nn.Parameter(torch.empty(n_input_neurons, hidden_size))
+        self.b_phi  = nn.Parameter(torch.zeros(hidden_size))
+        self.W_gate = nn.Parameter(torch.empty(hidden_size * 2, hidden_size))
+        self.b_gate = nn.Parameter(torch.zeros(hidden_size))
+
+        # Layers 1..nlayers-1: dense input from previous layer's output
+        self.W_phi_layers  = nn.ModuleList()
+        self.W_gate_layers = nn.ModuleList()
+        for _ in range(1, nlayers):
+            phi_l  = nn.Linear(hidden_size, hidden_size, bias=True)
+            gate_l = nn.Linear(hidden_size * 2, hidden_size, bias=True)
+            nn.init.xavier_uniform_(phi_l.weight)
+            nn.init.xavier_uniform_(gate_l.weight)
+            self.W_phi_layers.append(phi_l)
+            self.W_gate_layers.append(gate_l)
+
+        # Output projection — from last layer only
+        self.W_out = nn.Parameter(torch.empty(hidden_size, n_classes))
+
+        self.drop = nn.Dropout(dropout) if dropout > 0 else None
+
+        nn.init.xavier_uniform_(self.W_phi)
+        nn.init.xavier_uniform_(self.W_gate)
+        nn.init.xavier_uniform_(self.W_out)
+
+    def init_hidden(self, batch_size):
+        device = self.W_phi.device
+        return [(torch.zeros(batch_size, self.hidden_size, device=device),)
+                for _ in range(self.nlayers)]
+
+    def forward_chunk(self, x_chunk, hidden, t_offset, return_sparsity=False):
+        """
+        Args:
+            x_chunk: (B, chunk_len, 2) — event format (neuron_idx, value)
+            hidden:  [(h,), ...]  — one tuple per layer
+            t_offset: int — global timestep offset (for sync_rate)
+            return_sparsity: if True, also return avg non-zero activations per timestep
+        Returns:
+            logits: (B, n_classes) — accumulated over chunk from last layer
+            hidden: updated [(h,), ...]
+            avg_act: (only if return_sparsity=True) avg non-zero activations per timestep
+        """
+        B, chunk_len, _ = x_chunk.shape
+        C = self.W_out.shape[1]
+        device = self.W_phi.device
+
+        hs = [hidden[l][0] for l in range(self.nlayers)]   # list of (B, H)
+        logits = torch.zeros(B, C, device=device)
+        total_active = 0.0
+        n_firing_steps = 0
+
+        for local_t in range(chunk_len):
+            t = t_offset + local_t
+            neuron_idx = x_chunk[:, local_t, 0].long()   # (B,)
+            value      = x_chunk[:, local_t, 1]           # (B,)
+
+            # Mask padding events (neuron_idx < 0)
+            valid    = (neuron_idx >= 0).float().unsqueeze(1)  # (B, 1)
+            safe_idx = neuron_idx.clamp(min=0)
+
+            # --- Layer 0: AED embedding input ---
+            phi       = self.W_phi[safe_idx]                      # (B, H)
+            phi_input = value.unsqueeze(1) * phi + self.b_phi.unsqueeze(0)
+            phi_input = phi_input * valid
+            z_t       = torch.tanh(phi_input)                    # (B, H)
+
+            cat_hz = torch.cat([hs[0], z_t], dim=1)              # (B, 2H)
+            u_t    = torch.sigmoid(cat_hz @ self.W_gate + self.b_gate.unsqueeze(0))
+            h_new  = u_t * hs[0] + (1.0 - u_t) * z_t
+            hs[0]  = torch.where(valid.bool(), h_new, hs[0])
+
+            sync_fire = 1.0 if ((t + 1) % self.sync_rate == 0) else 0.0
+            o_t = torch.relu(hs[0]) * sync_fire
+            o_t = keep_top_k_batch_torch(o_t, self.firing_nb)
+
+            # --- Layers 1..nlayers-1: dense input from previous layer ---
+            for l in range(1, self.nlayers):
+                inp = o_t
+                if self.drop is not None:
+                    inp = self.drop(inp)
+                z_t_l  = torch.tanh(self.W_phi_layers[l - 1](inp))
+                cat_l  = torch.cat([hs[l], z_t_l], dim=1)
+                u_t_l  = torch.sigmoid(self.W_gate_layers[l - 1](cat_l))
+                hs[l]  = u_t_l * hs[l] + (1.0 - u_t_l) * z_t_l
+                o_t    = torch.relu(hs[l]) * sync_fire
+                o_t    = keep_top_k_batch_torch(o_t, self.firing_nb)
+
+            # accumulate logits from last layer only
+            logits = logits + o_t @ self.W_out
+
+            if return_sparsity and sync_fire > 0:
+                total_active += (o_t != 0).float().sum(dim=1).mean().item()
+                n_firing_steps += 1
+
+        if return_sparsity:
+            avg_act = total_active / max(n_firing_steps, 1)
+            return logits, [(h,) for h in hs], avg_act
+        return logits, [(h,) for h in hs]
+
+
 class MinimalRNNCell(nn.Module):
     """
     MinimalRNN cell (Chen, 2017 — "MinimalRNN: Toward More Interpretable
@@ -1454,6 +1575,72 @@ def _parse_hidden_sizes(hidden_size_arg):
     return [int(x.strip()) for x in str(hidden_size_arg).split(',') if x.strip()]
 
 
+def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_classes, epoch, clip=1.0):
+    """
+    Standard BPTT training for FPTTMinimalRNNAED.
+
+    Processes the full sequence in a single forward pass — no chunking, no oracle
+    loss, no epoch reset. Loss is standard cross-entropy on logits accumulated over
+    all timesteps (logits += o_t @ W_out). Backpropagates through the entire sequence.
+    """
+    model.train()
+    device = next(model.parameters()).device
+    n = x_train.shape[0]
+    rng = np.random.default_rng(epoch)
+    perm = rng.permutation(n)
+    total_loss = 0.0
+    n_batches = 0
+
+    for s in range(0, n, batch_size):
+        idx = perm[s : s + batch_size]
+        xb = torch.tensor(x_train[idx], dtype=torch.float32, device=device)
+        yb = torch.tensor(y_train[idx], dtype=torch.long, device=device)
+        B  = yb.shape[0]
+
+        hidden = model.init_hidden(B)
+        optimizer.zero_grad()
+
+        # Full-sequence forward — logits accumulate over all T timesteps
+        logits, _ = model.forward_chunk(xb, hidden, t_offset=0)
+
+        loss = F.cross_entropy(logits, yb)
+        loss.backward()
+
+        if clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+        optimizer.step()
+
+        total_loss += float(loss.item())
+        n_batches  += 1
+
+    return total_loss / max(n_batches, 1)
+
+
+def measure_sparsity(model, x, batch_size=64):
+    """
+    Measure average non-zero activations per firing timestep for FPTTMinimalRNNAED.
+    Returns avg_act (float) — average number of active neurons per timestep per sample,
+    and sparsity (float) — fraction of hidden units active (avg_act / hidden_size).
+    Returns (None, None) for non-AED models.
+    """
+    if not isinstance(model, FPTTMinimalRNNAED):
+        return None, None
+    device = next(model.parameters()).device
+    model.eval()
+    total = 0.0
+    n_batches = 0
+    with torch.no_grad():
+        for s in range(0, x.shape[0], batch_size):
+            xb = torch.tensor(x[s:s + batch_size], dtype=torch.float32, device=device)
+            hidden = model.init_hidden(xb.shape[0])
+            _, _, avg_act = model.forward_chunk(xb, hidden, t_offset=0, return_sparsity=True)
+            total += avg_act
+            n_batches += 1
+    avg = total / max(n_batches, 1)
+    sparsity = avg / model.hidden_size
+    return avg, sparsity
+
+
 def train_fptt(
     x_train, y_train,
     hidden_size,
@@ -1485,8 +1672,10 @@ def train_fptt(
     manual_grad=False,
     accumulate_logits=False,
     avg_logits=False,
+    bptt=False,
     x_val=None, y_val=None,
     x_test=None, y_test=None,
+    save_path="",
 ):
     if train_samples > 0:
         x_train = x_train[:train_samples]
@@ -1495,7 +1684,18 @@ def train_fptt(
     hidden_sizes = _parse_hidden_sizes(hidden_size)
     L = len(hidden_sizes)
 
-    if model_type in ("lstm", "rnn", "minimalrnn"):
+    if model_type == "minimalrnn_aed":
+        H = _parse_hidden_sizes(hidden_size)[0]
+        model = FPTTMinimalRNNAED(
+            n_input_neurons=n_input_neurons,
+            hidden_size=H,
+            n_classes=n_classes,
+            sync_rate=sync_rate,
+            firing_nb=firing_nb,
+            dropout=dropout,
+            nlayers=nlayers,
+        )
+    elif model_type in ("lstm", "rnn", "minimalrnn"):
         H = hidden_sizes[0]
         if len(hidden_sizes) > 1:
             print(f"Warning: {model_type.upper()} uses uniform hidden size. Using {H}. "
@@ -1567,11 +1767,22 @@ def train_fptt(
     )
 
     logs = []
+    best_val_acc = -1.0
     for ep in range(1, epochs + 1):
         t0 = time.time()
-        reset_named_params(named_params)
 
-        if model_type == "rule":
+        if bptt and model_type == "minimalrnn_aed":
+            # Standard BPTT: no epoch reset, no oracle, full sequence in one pass
+            avg_loss = train_one_epoch_bptt(
+                x_train, y_train,
+                model, optimizer,
+                batch_size=batch_size,
+                n_classes=n_classes,
+                epoch=ep,
+                clip=clip,
+            )
+        elif model_type == "rule":
+            reset_named_params(named_params)
             avg_loss = train_one_epoch_manual(
                 x_train, y_train,
                 model, optimizer, named_params,
@@ -1587,6 +1798,7 @@ def train_fptt(
                 avg_logits=avg_logits,
             )
         elif model_type == "minimalrnn" and manual_grad:
+            reset_named_params(named_params)
             avg_loss = train_one_epoch_manual_minimalrnn(
                 x_train, y_train,
                 model, optimizer, named_params,
@@ -1602,7 +1814,8 @@ def train_fptt(
                 avg_logits=avg_logits,
             )
         else:
-            # LSTM/RNN/MinimalRNN(autograd) use autograd training loop
+            # LSTM/RNN/MinimalRNN(autograd)/minimalrnn_aed(FPTT) use autograd training loop
+            reset_named_params(named_params)
             avg_loss = train_one_epoch(
                 x_train, y_train,
                 model, optimizer, named_params,
@@ -1634,6 +1847,12 @@ def train_fptt(
                                 batch_size=batch_size * 4, n_classes=n_classes,
                                 accumulate_logits=accumulate_logits, PARTS=PARTS,
                                 avg_logits=avg_logits)
+        # Measure sparsity for AED models
+        avg_act, sparsity = measure_sparsity(
+            model,
+            x_test[:512] if x_test is not None else (x_val[:512] if x_val is not None else x_train[:512]),
+        )
+
         dt = time.time() - t0
         logs.append((ep, avg_loss, train_acc, val_acc, test_acc, dt))
         parts = [f"epoch={ep}", f"loss={avg_loss:.6f}", f"train_acc={train_acc:.4f}"]
@@ -1641,8 +1860,21 @@ def train_fptt(
             parts.append(f"val_acc={val_acc:.4f}")
         if test_acc is not None:
             parts.append(f"test_acc={test_acc:.4f}")
+        if avg_act is not None:
+            parts.append(f"avg_act={avg_act:.1f}")
+            parts.append(f"sparsity={sparsity:.3f}")
         parts.append(f"time={dt:.1f}s")
         print("  ".join(parts))
+
+        if save_path and val_acc is not None and val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({"epoch": ep, "val_acc": val_acc, "test_acc": test_acc,
+                        "state_dict": model.state_dict()},
+                       f"{save_path}_best.pt")
+
+    if save_path:
+        torch.save({"epoch": epochs, "state_dict": model.state_dict()},
+                   f"{save_path}_final.pt")
 
     return model, logs
 
@@ -1861,8 +2093,8 @@ def main():
     parser.add_argument("--compare-grads",  action="store_true", default=False,
                         help="Run autograd vs manual gradient comparison and exit.")
     parser.add_argument("--model",          type=str,   default="rule",
-                        choices=["rule", "lstm", "rnn", "minimalrnn"],
-                        help="Model type: 'rule' (custom AED RNN), 'lstm' (LSTM), 'rnn' (vanilla Elman), or 'minimalrnn' (Chen 2017).")
+                        choices=["rule", "lstm", "rnn", "minimalrnn", "minimalrnn_aed"],
+                        help="Model type: 'rule' (custom AED RNN), 'lstm' (LSTM), 'rnn' (vanilla Elman), 'minimalrnn' (Chen 2017), or 'minimalrnn_aed' (MinimalRNN with AED event input + ReLU output + logit accumulation, matching async_RNN_fptt_mpi.py).")
     parser.add_argument("--device",         type=str,   default="auto",
                         help="Device: 'cpu', 'cuda', or 'auto' (use cuda if available).")
     parser.add_argument("--nlayers",        type=int,   default=1,
@@ -1875,6 +2107,11 @@ def main():
                         help="Accumulate logits across FPTT chunks instead of resetting each chunk.")
     parser.add_argument("--avg-logits", action="store_true", default=False,
                         help="When accumulating logits, average by chunk count (prevents magnitude growth).")
+    parser.add_argument("--bptt",       action="store_true", default=False,
+                        help="Use standard BPTT instead of FPTT for minimalrnn_aed: full-sequence forward "
+                             "pass, single CE loss, no oracle, no epoch reset.")
+    parser.add_argument("--save-path",  type=str, default="",
+                        help="If set, save best-val and final model weights to <save_path>_best.pt / _final.pt.")
     args = parser.parse_args()
 
     if args.compare_grads:
@@ -1913,7 +2150,7 @@ def main():
         f"  no_reset={args.no_reset}  identity_hh={args.identity_hh}  vanilla={args.vanilla}\n"
         f"  train_samples={args.train_samples}  optim={args.optim}\n"
         f"  nlayers={args.nlayers}  dropout={args.dropout}\n"
-        f"  accumulate_logits={args.accumulate_logits}  avg_logits={args.avg_logits}"
+        f"  accumulate_logits={args.accumulate_logits}  avg_logits={args.avg_logits}  bptt={args.bptt}"
     )
 
     train_fptt(
@@ -1949,6 +2186,8 @@ def main():
         manual_grad=args.manual_grad,
         accumulate_logits=args.accumulate_logits,
         avg_logits=args.avg_logits,
+        bptt=args.bptt,
+        save_path=args.save_path,
     )
 
 

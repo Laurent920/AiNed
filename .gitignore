@@ -9,3 +9,9 @@
 **/cache
 **/big
 **/ncars
+**/results
+**/network_results
+*.sh
+**/tools
+**/.claude
+*.log

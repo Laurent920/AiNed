@@ -1,6 +1,0 @@
-MNIST CSV files already exist
-seed=42 hidden=128 epochs=20 train_batch=120 eval_batch=512 lr=0.0005 sync_rate=1 firing_nb=10000 use_tanh=True train_samples=48004 grad=rtrl device=cuda
-[rtrl] epoch=1/20 loss=0.550620 train_acc=0.8931 test_acc=0.8935 time_s=11096.59
-[rtrl] epoch=2/20 loss=0.295550 train_acc=0.9155 test_acc=0.9121 time_s=11096.18
-[rtrl] epoch=3/20 loss=0.243206 train_acc=0.9262 test_acc=0.9207 time_s=11095.84
-[rtrl] epoch=4/20 loss=0.210211 train_acc=0.9371 test_acc=0.9299 time_s=11095.51

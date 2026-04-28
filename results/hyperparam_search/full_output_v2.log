@@ -1,9 +1,0 @@
-=== Hyperparameter Search Started at Mon Mar 23 08:20:41 PM CET 2026 ===
-Target: R² >= 0.687 | Early stopping patience: 5 epochs
-
-[20:20:41] === ROUND 2: Deeper/wider + restrict + firing_nb ===
-[20:20:41] Starting: r2b_restrict05 (cores=4-6, nprocs=3)
-[20:20:41] Starting: r2a_4layer_128_64 (cores=0-3, nprocs=4)
-[20:20:41] Starting: r2d_h512_wreg (cores=10-12, nprocs=3)
-[20:20:41] Starting: r2c_fire5 (cores=7-9, nprocs=3)
-[04:49:16] EARLY STOP: r2a_4layer_128_64 stagnated at ValR²=-0.0214 for 5 epochs (ep 6). Killing.

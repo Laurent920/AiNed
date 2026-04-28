@@ -34,7 +34,7 @@ from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.primate_reaching_helper import torch_primate_reaching_loader
 
-from other_helpers.helpers import Params, NeuronStates
+from other_helpers.helpers import BaseParams as Params, NeuronStates
 from other_helpers.helpers import store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
@@ -46,7 +46,7 @@ jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_disable_jit", True)
 
 TQDM_DISABLE = False
-STORE_EACH_EPOCH = False
+STORE_EACH_EPOCH = True
 BUFFER_SIZE = 0
 END_SIGNAL = jnp.array([-1.0, -1.0], dtype=jnp.float32)
 
@@ -204,12 +204,13 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
         # EXPLORATION: randomly replace a top-k fired neuron with a non-top-k non-zero neuron
         # Only applies when firing_nb is actually restricting (k < number of non-zero values)
         new_key = key
-        if params.exploration_rate > 0.0:
+        exploration_rate = getattr(params, 'exploration_rate', 0.0)
+        if exploration_rate > 0.0:
             new_key, exploration_key = jax.random.split(key)
 
             num_nonzero = jnp.count_nonzero(pre_topk)
             should_explore = jnp.logical_and(
-                jax.random.uniform(key) < params.exploration_rate,
+                jax.random.uniform(key) < exploration_rate,
                 num_nonzero > k  # Only explore when top-k is actually restricting
             )
             def do_exploration(_):
@@ -567,6 +568,12 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         all_loss = []
         all_history = []
     all_mean_iterations = []
+
+    # Best-checkpoint tracking: save weights/states at the epoch with highest val R²
+    best_val_r2 = -float("inf")
+    best_weights = weights
+    best_neuron_states = empty_neuron_states
+    best_epoch = 0
     
     # Initialize the optimizer
     if rank == 0:
@@ -751,7 +758,15 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         epoch_r2 = bcast(epoch_r2, root=size-1, comm=comm)
         if epoch_r2 >= 0.9999:
             break
-        
+
+        # Save best checkpoint in memory
+        val_r2_scalar = float(bcast(jnp.array(val_r2), root=last_layer * process_per_layer, comm=comm))
+        if val_r2_scalar > best_val_r2:
+            best_val_r2 = val_r2_scalar
+            best_weights = weights
+            best_neuron_states = empty_neuron_states
+            best_epoch = epoch
+
         if STORE_EACH_EPOCH:
             # Gather the weights and iteration values at the last layer
             weights_dict, all_iteration_mean, thresholds_dict = gather_w_it_th(params, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
@@ -800,11 +815,13 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                 else:
                     return val_r2, normalized_it
                 
-    # Inference on the test set
-    test_r2, test_mean, _ = batch_predict(params, key, total_batches, weights, empty_neuron_states, dataset="test", save=False, debug=True)
-    
-    # Gather the weights and iteration values at the last layer
-    weights_dict, all_iteration_mean, thresholds_dict = gather_w_it_th(params, weights, jnp.array(all_mean_iterations), empty_neuron_states.thresholds)
+    # Inference on the test set using best-val-R² checkpoint
+    if rank == last_layer * process_per_layer:
+        print(f"Loading best checkpoint from epoch {best_epoch} (val R²={best_val_r2:.4f})")
+    test_r2, test_mean, _ = batch_predict(params, key, total_batches, best_weights, best_neuron_states, dataset="test", save=False, debug=True)
+
+    # Gather weights/thresholds from best checkpoint for saving
+    weights_dict, all_iteration_mean, thresholds_dict = gather_w_it_th(params, best_weights, jnp.array(all_mean_iterations), best_neuron_states.thresholds)
     
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
@@ -1490,11 +1507,10 @@ def main(
             threshold_lr=config['threshold_lr'],
             sparsity_impact=tuple(config['sparsity_impact']),
             w_reg=config['w_reg'],
-            rerun="",
+            rerun=None,
             top_weights=config['top_weights'],
             history_size=config['history_size'],
             use_bias=config['use_bias'],
-            exploration_rate=config['exploration_rate'],
         )
         if trial is not None:
             params = dataclasses.replace(trial_params, max_nonzero=max_nonzero)
@@ -1594,3 +1610,12 @@ if __name__ == "__main__":
 # JAX_PLATFORMS=cpu mpirun -n 3 ./venv/bin/python async_MLP_neural_decoding.py --config configs/MLP_config.yaml --data_dir . --filename loco_20170210_03.mat
 # JAX_PLATFORMS=cpu mpirun -n 3 ./venv/bin/python async_MLP_neural_decoding.py --config configs/MLP_config.yaml --data_dir . --filename loco_20170215_02.mat
 # JAX_PLATFORMS=cpu mpirun -n 3 ./venv/bin/python async_MLP_neural_decoding.py --config configs/MLP_config.yaml --data_dir . --filename loco_20170301_05.mat
+
+'''
+best_model_indy_20160622_01_42 epoch: 13, r2: 0.6913790048772495, mse:0.018368033692240715
+best_model_indy_20160630_01_42 epoch: 1, r2: 0.4521323765602246, mse:0.03738678991794586
+best_model_indy_20170131_02_42 epoch: 19, r2: 0.5512858129776393, mse:0.032045137137174606
+best_model_loco_20170210_03_42 epoch: 15, r2: 0.5452620629022675, mse:0.0065147303976118565
+best_model_loco_20170215_02_42 epoch: 21, r2: 0.5022942957657881, mse:0.0071355607360601425
+best_model_loco_20170301_05_42 epoch: 13, r2: 0.6246699495836636, mse:0.006136225536465645
+'''
