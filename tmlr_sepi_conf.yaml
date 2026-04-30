@@ -1,0 +1,65 @@
+# mode: inference
+mode: training
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+dataset: mnist
+layer_sizes: [784, 10, 10]
+
+# ============================================================================
+# TRAINING / INFERENCE PARAMETERS
+# ============================================================================
+batch_size: 30
+num_epochs: 3
+learning_rate: 0.0001
+optimizer: adam
+
+load_file: false
+best: false
+rerun: null
+override_params:
+  - batch_size
+  - learning_rate
+  - init_thresholds
+  - shuffle_activations
+  - shuffle_input
+  - threshold_lr
+  - sparsity_impact
+  - w_reg
+  - top_weights
+  - history_size
+
+# ============================================================================
+# NEURON BEHAVIOR
+# ============================================================================
+restrict: [0.0, 0.0, 0.0]
+init_thresholds: 0.05
+shuffle_activations: false
+shuffle_input: false
+firing_nb: 10
+sync_rate: 0
+
+# ============================================================================
+# LEARNING AND REGULARIZATION
+# ============================================================================
+threshold_lr: 0.0
+sparsity_impact: [0.0, 0.0, 0.0]
+w_reg: 0.0
+top_weights: 784
+history_size: 0
+
+# ============================================================================
+# NEW ASYNC-LIF PARAMETERS
+# ============================================================================
+
+forward_group_size: 4
+scheduling_policy: fifo
+stop_condition: on_output
+forward_steps_after_output: 0
+use_top_weight_filter: false
+reset_output_on_spike: false
+# در MLP_config_async_lif_10neurons.yaml
+scheduling_policy: ms          # یا momentum
+momentum_noise_scale: 0.1      # مقدار پیشنهادی مقاله λ_MS
+tau_m: 100.0
