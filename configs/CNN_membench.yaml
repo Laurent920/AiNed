@@ -12,7 +12,7 @@ layer_sizes:
   - [10]
 
 batch_size: 36
-num_epochs: 1
+num_epochs: 3
 learning_rate: 0.0003
 optimizer: adam
 

@@ -35,15 +35,6 @@ def activation_func(thresholds, activations):
     # return jax.nn.relu(activations)
     return jnp.where(activations > thresholds, activations, 0.0)
 
-# @activation_func.defjvp
-# def activation_func_jvp(primals, tangents, k=1.0):
-#     # Surrogate gradient, redefine the function for the backward pass
-#     neuron_states, activations, = primals
-#     neuron_states_dot, activations_dot, = tangents
-#     ans = activation_func(neuron_states, activations)
-#     ans_dot = jnp.where(activations > neuron_states.thresholds, activations, 0.0)
-#     return ans, ans_dot
-
 #region keep_top_k
 @partial(jax.jit, static_argnames=['k', 'apply_abs', 'max_kernel',])
 def keep_top_k(x, k, apply_abs=False, max_kernel=None):
@@ -119,103 +110,24 @@ def output_vector_to_event(key, arr: jnp.ndarray, params, max_len):
 
     return pairs_out
 
-#region NeuronStates
-# @jax.tree_util.register_pytree_node_class
-# class NeuronStates:
-#     def __init__(self, 
-#                  values, 
-#                  bias,
-#                  thresholds, 
-#                  input_residuals, 
-#                  output_residuals,
-#                  input_order, 
-#                  input_activity, 
-#                  layer_activity, 
-#                  output_activity, 
-#                  last_sent_iteration, 
-#                  input_vector, 
-#                  output_vector, 
-#                  sync_rate_vector=None,
-#                  recurrent_weight=None,
-#                  values_history=None,
-#                  history_index=None,
-#                  weights_shape=None, 
-#                  is_conv=False):
-#         '''
-#         Shapes are referenced for a layer with weights of shape: (784, 128)
-
-#         values: jnp.ndarray             # Current state of the neurons in the layer, shape: (layer_sizes[rank],) __ (128,)
-#         thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
-#         input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
-#         output_residuals: jnp.ndarray   # Sum of all output neurons, shape: (layer_sizes[rank],) __ (128,)
-#         input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
-#         input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
-#         layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
-#         output activity                 # For each input neuron stores the hidden neurons that fire, shape: (layer_sizes[rank-1], layer_sizes[rank]) __ (784, 128)  
-        
-#         ____ Convolution fields
-#         weights_shape                   # Shape of the weights
-#         is_conv                         # Is convolution layer               
-#         '''
-#         self.values = values
-#         self.bias = bias
-#         self.thresholds = thresholds
-#         self.input_residuals = input_residuals
-#         self.output_residuals = output_residuals
-#         self.input_order = input_order
-#         self.input_activity = input_activity
-#         self.layer_activity = layer_activity
-#         self.output_activity = output_activity
-#         self.last_sent_iteration = last_sent_iteration
-#         self.input_vector = input_vector
-#         self.output_vector = output_vector
-#         self.sync_rate_vector = sync_rate_vector
-#         self.recurrent_weight = recurrent_weight
-#         self.values_history = values_history
-#         self.history_index = history_index
-#         self.weights_shape = weights_shape
-#         self.is_conv = is_conv
-
-#     # Tell JAX how to flatten this object
-#     def tree_flatten(self):
-#         children = (self.values, self.bias, self.thresholds, self.input_residuals, self.output_residuals,
-#                     self.input_order, self.input_activity, self.layer_activity,
-#                     self.output_activity, self.last_sent_iteration, 
-#                     self.input_vector, self.output_vector, self.sync_rate_vector,
-#                     self.recurrent_weight, self.values_history, self.history_index,
-#                     self.weights_shape, self.is_conv)
-#         aux_data = None  # no extra static data
-#         return children, aux_data
-
-#     @classmethod
-#     def tree_unflatten(cls, aux_data, children):
-#         return cls(*children)
-    
-#     def replace(self, **updates):
-#         """Return a new NeuronStates object with some fields replaced."""
-#         return NeuronStates(
-#             values=updates.get("values", self.values),
-#             bias=updates.get("bias", self.bias),
-#             thresholds=updates.get("thresholds", self.thresholds),
-#             input_residuals=updates.get("input_residuals", self.input_residuals),
-#             output_residuals=updates.get("output_residuals", self.output_residuals),
-#             input_order=updates.get("input_order", self.input_order),
-#             input_activity=updates.get("input_activity", self.input_activity),
-#             layer_activity=updates.get("layer_activity", self.layer_activity),
-#             output_activity=updates.get("output_activity", self.output_activity),
-#             last_sent_iteration=updates.get("last_sent_iteration", self.last_sent_iteration),
-#             input_vector=updates.get("input_vector", self.input_vector),
-#             output_vector=updates.get("output_vector", self.output_vector),
-#             sync_rate_vector=updates.get("sync_rate_vector", self.sync_rate_vector),
-#             recurrent_weight=updates.get("recurrent_weight", self.recurrent_weight),
-#             values_history=updates.get("values_history", self.values_history),
-#             history_index=updates.get("history_index", self.history_index),
-#             weights_shape=updates.get("weights_shape", self.weights_shape),
-#             is_conv=updates.get("is_conv", self.is_conv),
-#         )
-
 @jax.tree_util.register_pytree_node_class
 class NeuronStates:
+    '''
+    Shapes are referenced for a layer with weights of shape: (784, 128)
+
+    values: jnp.ndarray             # Current state of the neurons in the layer, shape: (layer_sizes[rank],) __ (128,)
+    thresholds: jnp.float32         # An array of thresholds, one per neuron, shape: (layer_sizes[rank],) __ (128,)
+    input_residuals: jnp.ndarray    # Sum of all input neurons, shape: (layer_sizes[rank-1],) __ (784,)
+    output_residuals: jnp.ndarray   # Sum of all output neurons, shape: (layer_sizes[rank],) __ (128,)
+    input order                     # Set input neuron to the iteration at which the input is received to record the order of input received, shape: (layer_sizes[rank-1],) __ (784,)
+    input activity                  # Count the number of times an input neuron fired, shape: (layer_sizes[rank-1],) __ (784,)
+    layer activity                  # Count the number of times a neuron activated in this layer, only used for restrict parameter and threshold, shape: (layer_sizes[rank],) __ (128,)
+    output activity                 # For each input neuron stores the hidden neurons that fire, shape: (layer_sizes[rank-1], layer_sizes[rank]) __ (784, 128)  
+    
+    ____ Convolution fields
+    weights_shape                   # Shape of the weights
+    is_conv                         # Is convolution layer               
+    '''
     # Define which fields are always arrays (JAX leaves) vs static scalars
     _ARRAY_FIELDS = frozenset({
         "values", "bias", "thresholds", "input_residuals", "output_residuals",
@@ -310,9 +222,6 @@ class BaseParams:
     top_weights: int             # Top-k weights by absolute value used per neuron (-1 = all)
     history_size: int = 0        # Output states to keep for history plots
     use_bias: bool = False
-    dataset_file: str | None = None
-    collapse_units: bool = True
-    preserve_exact_times: bool = False
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -322,13 +231,24 @@ class Params(BaseParams): #TODO Make params a file-local subclass of BaseParams 
     Legacy all-in-one params class kept for backwards compatibility.
     Prefer defining a file-local subclass of BaseParams instead.
     """
-    use_tanh: bool = False
-    exact_rtrl: bool = False
+    # Neural decoding parameters
+    dataset_file: str | None = None
+    collapse_units: bool = True
+    preserve_exact_times: bool = False
+
+    # Additional inference logic parameters
     exploration_rate: float = 0.0
     trace_event_timing: bool = False
+
+    # CNN parameters
     max_kernel: int | None = None
     flat_layer_sizes: tuple[int, ...] | None = None
+
+    # Recurrent parameters (for RTRL and FPTT)
+    use_tanh: bool = False
+    exact_rtrl: bool = False
     recurrence: tuple[int, ...] | None = None
+
     # FPTT (Forward Propagation Through Time) parameters
     cell_type: str = "aed"
     fptt_parts: int = 1
@@ -379,13 +299,13 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         )
     '''
     layer_idx = mpi_config.layer_idx
-    last_layer = mpi_config.last_layer
+    last_layer = mpi_config.last_layer_idx
 
-    path = os.path.normpath(data_file_path).split(os.sep)
-    assert path[1] == new_params.dataset, f"Rerun can only be used on the same dataset, got {path[1]} and {new_params.dataset}"
-    
     with open(data_file_path, "r") as f:
         stored_data = json.load(f)
+
+    stored_dataset = stored_data.get("dataset", new_params.dataset)
+    assert stored_dataset == new_params.dataset, f"Rerun can only be used on the same dataset, got {stored_dataset} and {new_params.dataset}"
 
     load_file = stored_data["loadfile"]
     layer_sizes = list_to_tuple_deep(stored_data["layer_sizes"])
@@ -949,7 +869,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         
         # Advanced features
         'top_weights': -1,  # Top k weights to use (-1 for all)
-        'history_size': 0,  # Number of output states to keep for plotting
+        'history_size': 0,  # Number of output states to keep for plottingis the l
         'exploration_rate': 0.0,  # Probability of replacing a top-k fired neuron with a random non-top-k non-zero neuron
         'trace_event_timing': False,  # Capture one-batch event timing traces during inference
 

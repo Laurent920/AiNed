@@ -1,11 +1,9 @@
 try:
-    from dataset_helpers.mnist_helper import mnist_loader_manual
-    from dataset_helpers.nmnist_helper import torch_nmnist_loader
     from dataset_helpers.ncars_helper import torch_NCARS_loader
+    from dataset_helpers.cifar10_helper import cifar10_loader_manual
 except ModuleNotFoundError:
-    from mnist_helper import mnist_loader_manual
-    from nmnist_helper import torch_nmnist_loader
     from ncars_helper import torch_NCARS_loader
+    from cifar10_helper import cifar10_loader_manual
 
 import torch
 import torch.nn as nn
@@ -19,12 +17,13 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 20
+epochs = 100
 batch_size = 120
 
 dataset = "mnist"
 # dataset = "nmnist"
-dataset = "ncars"
+# dataset = "ncars"
+# dataset = "cifar10"
 ncars_downsample = False
 
 def get_dataset_config(dataset_name, ncars_downsample=False):
@@ -36,6 +35,8 @@ def get_dataset_config(dataset_name, ncars_downsample=False):
         if ncars_downsample:
             return (2, 60, 50), 2
         return (2, 120, 100), 2
+    if dataset_name == "cifar10":
+        return (3, 32, 32), 10
     raise ValueError(f"Unsupported dataset: {dataset_name}")
 
 
@@ -668,9 +669,269 @@ class VGG8Light(nn.Module):
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
+class ResNet8(nn.Module):
+    """NFNet-style ResNet-8: no BatchNorm, Weight Standardization + residual scaling.
+    Stem + 3 residual blocks (16/32/64) + global avg pool + FC.
+
+    Key techniques:
+    - Weight Standardization: normalize over fan-in dims (C_in, kH, kW) per output filter
+    - Residual scaling (alpha): scale residual branch before addition to preserve variance
+    - ReLU gain (sqrt(2/(1-1/pi)) ~1.7): compensates for variance reduction from ReLU
+    - Careful init: residual branch last conv zeroed so blocks are identity at init
+    """
+    # ReLU output variance = input_variance * (1 - 1/pi) => gain to restore unit variance
+    RELU_GAIN = (2.0 / (1.0 - 1.0 / 3.141592653589793)) ** 0.5
+
+    def __init__(self, num_classes=10, in_channels=1, alpha=0.5):
+        super(ResNet8, self).__init__()
+
+        # Stem
+        self.stem  = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1, bias=True)
+
+        # Block 1: 16->16, identity shortcut
+        self.b1_c1 = nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=True)
+        self.b1_c2 = nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=True)
+
+        # Block 2: 16->32, stride 2, projected shortcut (WS applied)
+        self.b2_c1 = nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1, bias=True)
+        self.b2_c2 = nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=True)
+        self.b2_sc = nn.Conv2d(16, 32, kernel_size=1, stride=2, bias=False)
+
+        # Block 3: 32->64, stride 2, projected shortcut (WS applied)
+        self.b3_c1 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=True)
+        self.b3_c2 = nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=True)
+        self.b3_sc = nn.Conv2d(32, 64, kernel_size=1, stride=2, bias=False)
+
+        self.alpha = alpha
+        self.pool  = nn.AdaptiveAvgPool2d((1, 1))
+        self.out   = nn.Linear(64, num_classes, bias=True)
+
+        self.activation_stats = {"input": [], "stem": [], "block1": [], "block2": [], "block3": [], "out": []}
+
+        self._initialize_weights()
+
+    def _ws(self, conv, x, stride=1, padding=1):
+        """Weight Standardization: normalize each output filter over its fan-in dims (C_in, kH, kW)."""
+        w = conv.weight  # shape: (C_out, C_in, kH, kW)
+        w = w - w.mean(dim=(1, 2, 3), keepdim=True)
+        w = w / (w.std(dim=(1, 2, 3), keepdim=True, correction=0) + 1e-5)
+        return F.conv2d(x, w, conv.bias, stride=stride, padding=padding)
+
+    def _ws_1x1(self, conv, x, stride=1):
+        """WS for 1x1 shortcut convs: normalize over C_in only."""
+        w = conv.weight  # shape: (C_out, C_in, 1, 1)
+        w = w - w.mean(dim=1, keepdim=True)
+        w = w / (w.std(dim=1, keepdim=True, correction=0) + 1e-5)
+        return F.conv2d(x, w, None, stride=stride, padding=0)
+
+    def _relu(self, x):
+        """Scaled ReLU: restores unit variance after ReLU kills ~half the signal."""
+        return F.relu(x) * self.RELU_GAIN
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        x = self._relu(self._ws(self.stem, x))
+        self._record_activation("stem", x)
+
+        # Block 1 (identity shortcut)
+        r = x
+        x = self._relu(self._ws(self.b1_c1, x))
+        x = self._ws(self.b1_c2, x)
+        x = self._relu(self.alpha * x + r)
+        self._record_activation("block1", x)
+
+        # Block 2 (projected shortcut, WS on 1x1)
+        r = self._ws_1x1(self.b2_sc, x, stride=2)
+        x = self._relu(self._ws(self.b2_c1, x, stride=2))
+        x = self._ws(self.b2_c2, x)
+        x = self._relu(self.alpha * x + r)
+        self._record_activation("block2", x)
+
+        # Block 3 (projected shortcut, WS on 1x1)
+        r = self._ws_1x1(self.b3_sc, x, stride=2)
+        x = self._relu(self._ws(self.b3_c1, x, stride=2))
+        x = self._ws(self.b3_c2, x)
+        x = self._relu(self.alpha * x + r)
+        self._record_activation("block3", x)
+
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+        # Zero-init last conv of each residual branch so blocks start as identity
+        nn.init.zeros_(self.b1_c2.weight)
+        nn.init.zeros_(self.b2_c2.weight)
+        nn.init.zeros_(self.b3_c2.weight)
+
+
+class ResNetBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResNetBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return F.relu(out + self.shortcut(x))
+
+
+class ResNet20(nn.Module):
+    """ResNet-20 for CIFAR-10 (He et al. 2016): 3 stages × 3 blocks, 16/32/64 channels.
+    ~270k parameters. Reaches ~91-92% on CIFAR-10."""
+    def __init__(self, num_classes=10, in_channels=3):
+        super(ResNet20, self).__init__()
+
+        self.stem = nn.Conv2d(in_channels, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn_stem = nn.BatchNorm2d(16)
+
+        self.stage1 = nn.Sequential(ResNetBlock(16, 16), ResNetBlock(16, 16), ResNetBlock(16, 16))
+        self.stage2 = nn.Sequential(ResNetBlock(16, 32, stride=2), ResNetBlock(32, 32), ResNetBlock(32, 32))
+        self.stage3 = nn.Sequential(ResNetBlock(32, 64, stride=2), ResNetBlock(64, 64), ResNetBlock(64, 64))
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.out = nn.Linear(64, num_classes, bias=False)
+
+        self.activation_stats = {"input": [], "stem": [], "stage1": [], "stage2": [], "stage3": [], "out": []}
+
+        self._initialize_weights()
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        x = F.relu(self.bn_stem(self.stem(x)))
+        self._record_activation("stem", x)
+
+        x = self.stage1(x)
+        self._record_activation("stage1", x)
+
+        x = self.stage2(x)
+        self._record_activation("stage2", x)
+
+        x = self.stage3(x)
+        self._record_activation("stage3", x)
+
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+
+        x = self.out(x)
+        self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+
+class VGG8Cifar(nn.Module):
+    """VGG8 for CIFAR-10 (32x32x3). Two poolings: 32->16->8, FC input = 8*8*128."""
+    def __init__(self, num_classes=10, in_channels=3):
+        super(VGG8Cifar, self).__init__()
+
+        self.conv1_1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False)
+        # self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.pool1   = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.pool2   = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        self.conv3_1 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        self.pool3   = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv3_2 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
+
+
+        self.fc1 = nn.Linear(4 * 4 * 256, 1024, bias=False)
+        self.out = nn.Linear(1024, num_classes, bias=False)
+
+        self.activation_stats = {
+            **{
+                name: [] for name, module in self.named_children()
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+            },
+            "input": []
+        }
+
+        self._initialize_weights()
+
+    def forward(self, x):
+        self._record_activation("input", x)
+
+        x = F.relu(self.conv1_1(x)); self._record_activation("conv1_1", x)
+        # x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
+        x = self.pool1(x);           self._record_activation("pool1", x)
+
+        x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
+        # x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        x = self.pool2(x);           self._record_activation("pool2", x)
+
+        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        x = self.pool3(x);           self._record_activation("pool3", x)
+        x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
+        x = F.relu(self.conv3_3(x)); self._record_activation("conv3_3", x)
+
+
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x)); self._record_activation("fc1", x)
+        x = self.out(x);         self._record_activation("out", x)
+        return x
+
+    def _record_activation(self, layer_name, x):
+        nonzero = (x != 0).sum().item() / x.size(0)
+        self.activation_stats[layer_name].append(nonzero)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+
 # ==========================================================
-# region TRAINING AND EVALUATION 
+# region TRAINING AND EVALUATION
 # ==========================================================
+def prepare_inputs(inputs, device):
+    t = torch.as_tensor(inputs, dtype=torch.float32)
+    if dataset == "cifar10":
+        # flat HWC layout (N, H*W*C) -> (N, C, H, W)
+        C, H, W = input_shape
+        t = t.view(-1, H, W, C).permute(0, 3, 1, 2).contiguous()
+    else:
+        t = t.view(-1, *input_shape)
+    return t.to(device)
+
+
 def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
     if dataset == "mnist":
         # Choose one:
@@ -679,7 +940,8 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
 
         # model = VGG16(num_classes=10, in_channels=1).to(device)
         # model = VGG8(num_classes=10, in_channels=1).to(device)
-        model = VGG8Light(num_classes=10, in_channels=1).to(device)
+        # model = VGG8Light(num_classes=10, in_channels=1).to(device)
+        model = ResNet8(num_classes=10, in_channels=1).to(device)
     elif dataset == "nmnist":
         # Choose one:
         # model = NmnistCNN().to(device)
@@ -689,6 +951,11 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
     elif dataset == "ncars":
         # model = AdaptiveEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
         model = SmallEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
+    elif dataset == "cifar10":
+        # model = VGG8Cifar(num_classes=10, in_channels=3).to(device)
+        model = ResNet8(num_classes=10, in_channels=3).to(device)
+        # model = ResNet20(num_classes=10, in_channels=3).to(device)
+        lr = 0.001
     else:
         print("Wrong dataset")
         return
@@ -706,7 +973,7 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         running_loss, correct, total = 0, 0, 0
 
         for batch_idx, (inputs, targets) in enumerate(tqdm(iter(train_loader))):
-            inputs = torch.as_tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
+            inputs = prepare_inputs(inputs, device)
             targets = torch.as_tensor(targets, dtype=torch.long).to(device)
 
             # UNCOMMENT to check if the two dataloader implementation are equal
@@ -855,7 +1122,7 @@ def evaluate(model, loader, total_batches, device):
     correct, total = 0, 0
     with torch.no_grad():
         for inputs, targets in iter(loader):
-            inputs = torch.as_tensor(inputs, dtype=torch.float32).view(-1, *input_shape).to(device)
+            inputs = prepare_inputs(inputs, device)
             targets = torch.as_tensor(targets, dtype=torch.long).to(device)
             outputs = model(inputs)
             _, predicted = outputs.max(1)
@@ -936,14 +1203,28 @@ def get_weights_for_rank(filename, rank):
 # ==========================================================
 if __name__ == "__main__":
     if dataset == "mnist":
+        try:
+            from dataset_helpers.mnist_helper import mnist_loader_manual
+        except ModuleNotFoundError:
+            from mnist_helper import mnist_loader_manual
         (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = mnist_loader_manual(batch_size, preprocess=False)
     elif dataset == "nmnist":
+        try:
+            from dataset_helpers.nmnist_helper import torch_nmnist_loader
+        except ModuleNotFoundError:
+            from nmnist_helper import torch_nmnist_loader
         (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = torch_nmnist_loader(batch_size, binned=True, aggregate_time=True)
     elif dataset == "ncars":
         (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = torch_NCARS_loader(
             batch_size=batch_size,
             downsample=ncars_downsample,
             full_matrix=True,
+        )
+    elif dataset == "cifar10":
+        (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = cifar10_loader_manual(
+            batch_size=batch_size,
+            shuffle=True,
+            preprocess=False,
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")

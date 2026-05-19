@@ -461,6 +461,7 @@ def load_primate_reaching_data(
     val_len = math.floor((sub_length - train_len) / 2)
 
     ind_train, ind_val, ind_test = [], [], []
+    seg_train, seg_val, seg_test = [], [], []  # per-segment index lists
 
     for split_no in range(split_num):
         for i in range(sub_length):
@@ -470,13 +471,17 @@ def load_primate_reaching_data(
 
             seg_start = time_segments[seg_idx, 0]
             seg_end = time_segments[seg_idx, 1]
+            seg_indices = list(np.arange(seg_start, seg_end, stride_steps))
 
             if i < train_len:
-                ind_train += list(np.arange(seg_start, seg_end, stride_steps))
+                ind_train += seg_indices
+                seg_train.append(seg_indices)
             elif train_len <= i < train_len + val_len:
-                ind_val += list(np.arange(seg_start, seg_end, stride_steps))
+                ind_val += seg_indices
+                seg_val.append(seg_indices)
             else:
-                ind_test += list(np.arange(seg_start, seg_end, stride_steps))
+                ind_test += seg_indices
+                seg_test.append(seg_indices)
 
     dataset.close()
 
@@ -502,6 +507,9 @@ def load_primate_reaching_data(
         "ind_train": ind_train,
         "ind_val": ind_val,
         "ind_test": ind_test,
+        "seg_train": seg_train,
+        "seg_val": seg_val,
+        "seg_test": seg_test,
         "ratio": ratio,
         "input_feature_size": input_size,
         "sample_times": t,
@@ -750,6 +758,123 @@ def torch_primate_reaching_loader(
     total_test_batches = len(testloader)
 
     return (trainloader, total_train_batches), (valloader, total_val_batches), (testloader, total_test_batches), max_nonzero
+
+
+def torch_primate_reaching_stateful_loader(
+    data_dir: str = "",
+    filename: str = "indy_20160622_01.mat",
+    bin_width: float = 0.004,
+    stride: float = 0.004,
+    train_ratio: float = 0.5,
+    split_num: int = 1,
+    download: bool = True,
+    collapse_units: bool = True,
+    preserve_exact_times: bool = False,
+    max_nonzero: Optional[int] = None,
+):
+    """
+    Stateful loader for primate reaching: returns trials as ordered sequences of
+    single-bin samples. Each element of a split is a list of (events, label) pairs
+    representing one trial in time order.
+
+    Returns:
+        train_trials, val_trials, test_trials: list of trials, each trial is a list
+            of (events_array, label_array) where events_array has shape (max_nonzero, 2)
+            and label_array has shape (2,).
+        max_nonzero: max events per single bin across all splits.
+    """
+    if data_dir:
+        base_dir = os.path.join(data_dir, "data", "primate_reaching")
+    else:
+        base_dir = os.path.join(".", "data", "primate_reaching")
+    os.makedirs(base_dir, exist_ok=True)
+
+    data = load_primate_reaching_data(
+        data_dir=base_dir,
+        filename=filename,
+        bin_width=bin_width,
+        stride=stride,
+        train_ratio=train_ratio,
+        split_num=split_num,
+        download=download,
+        collapse_units=collapse_units,
+        preserve_exact_times=preserve_exact_times,
+    )
+
+    ratio = data["ratio"]
+    sample_times = data["sample_times"]
+
+    # Build single-bin datasets (window=1) for each split.
+    def _make_split_dataset(indices):
+        if preserve_exact_times:
+            return PrimateReachingExactEventsDataset(
+                data["event_times"], data["event_features"], data["labels"],
+                sample_times, indices, window=1, ratio=ratio, label_mode="last",
+            )
+        else:
+            return PrimateReachingDataset(
+                data["samples"], data["labels"], indices,
+                window=1, ratio=ratio, label_mode="last",
+            )
+
+    train_ds = _make_split_dataset(data["ind_train"])
+    val_ds   = _make_split_dataset(data["ind_val"])
+    test_ds  = _make_split_dataset(data["ind_test"])
+
+    # Compute max_nonzero across all splits if not provided.
+    if max_nonzero is None:
+        all_indices = np.asarray(
+            data["ind_train"] + data["ind_val"] + data["ind_test"], dtype=np.int64
+        )
+        if preserve_exact_times:
+            max_nonzero = _compute_exact_max_nonzero(
+                data["event_times"], sample_times, all_indices, 1, ratio,
+            )
+        else:
+            max_nonzero = _compute_binned_max_nonzero(
+                data["samples"], all_indices, 1, ratio,
+            )
+        max_nonzero = max(max_nonzero, 1)
+
+    def _build_trials_from_segments(seg_index_lists):
+        """Build trials from pre-grouped segment index lists.
+        Each segment is one trial; returns list of trials, each a list of (events, label)."""
+        # Build a flat dataset and a flat->segment position mapping
+        flat_indices = [idx for seg in seg_index_lists for idx in seg]
+        if preserve_exact_times:
+            flat_ds = PrimateReachingExactEventsDataset(
+                data["event_times"], data["event_features"], data["labels"],
+                sample_times, flat_indices, window=1, ratio=ratio, label_mode="last",
+            )
+        else:
+            flat_ds = PrimateReachingDataset(
+                data["samples"], data["labels"], flat_indices,
+                window=1, ratio=ratio, label_mode="last",
+            )
+
+        trials = []
+        pos = 0
+        for seg in seg_index_lists:
+            trial = []
+            for _ in seg:
+                x, y = flat_ds[pos]
+                if not preserve_exact_times:
+                    x = _window_to_events(x)
+                num_events = len(x)
+                padded = np.full((max_nonzero, 2), -2, dtype=np.float32)
+                if num_events > 0:
+                    use = min(num_events, max_nonzero)
+                    padded[:use] = x[:use]
+                trial.append((padded, np.asarray(y, dtype=np.float32)))
+                pos += 1
+            trials.append(trial)
+        return trials
+
+    train_trials = _build_trials_from_segments(data["seg_train"])
+    val_trials   = _build_trials_from_segments(data["seg_val"])
+    test_trials  = _build_trials_from_segments(data["seg_test"])
+
+    return train_trials, val_trials, test_trials, max_nonzero
 
 
 if __name__ == "__main__":

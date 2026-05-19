@@ -8,7 +8,6 @@ os.environ.pop("JAX_TRACEBACK_FILTERING", None)
 import jax
 import jax.numpy as jnp
 from jax import jit
-from jax.experimental import io_callback
 from functools import partial
 import optax
 
@@ -40,8 +39,8 @@ from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
-from other_helpers.backpropagation import MLP_back_prop, RNN_back_prop
-from other_helpers.loss_functions import loss_bpp, loss_func
+from forward_backward_pass.backpropagation import MLP_back_prop, RNN_back_prop
+from forward_backward_pass.loss_functions import loss_bpp, loss_func
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 
 jax.config.update("jax_debug_nans", True)
@@ -66,6 +65,23 @@ mpi_config = None
 training_generator = None
 validation_generator = None
 test_generator = None
+
+# region PARAMS DEFINITIONS
+@dataclasses.dataclass(frozen=True)
+class MLPParams(Params):
+    """Classification MLP parameters (MNIST, CIFAR10, DVS, etc.)"""
+    exploration_rate: float = 0.0
+    trace_event_timing: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class NeuralDecodingParams(Params):
+    """Regression neural decoding parameters (primate reaching, neural_decoding)"""
+    dataset_file: str | None = None
+    collapse_units: bool = True
+    preserve_exact_times: bool = False
+
+# endregion
 
 # region INFERENCE
 @partial(jax.jit, static_argnames=['params', 'grad'])
@@ -1059,7 +1075,8 @@ def compute_runtime_plot(all_runtimes, all_activations):
 #     return epoch_accuracy, mean, end_time - start_time
             
 # region Inference
-def batch_predict(params: Params, key, total_batches, weights, empty_neuron_states: NeuronStates, dataset:str="train", save=True, debug=True, readInputJson=False):    
+#TODO: training and inference functions are very similar, we could merge them and avoid code duplication
+def batch_predict(params: Params, key, total_batches, weights, empty_neuron_states: NeuronStates, dataset:str="train", save=True, debug=True, readInputJson=False):
     '''
     This function implements the forward pass of the neural network
 
@@ -1104,7 +1121,6 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
     else:
         print("INVALID DATASET")
         return
-
     if total_batches == 0:
         return -0.01, -1.0, -1.0 # arbitrary code for empty dataset
     
@@ -1348,7 +1364,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
         thresholds = jnp.full(layer_sizes[layer_idx], init_thresholds)
 
-        params = Params(
+        params = MLPParams(
             dataset=dataset,
             random_seed=random_seed,
             layer_sizes=layer_sizes, 

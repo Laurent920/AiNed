@@ -20,8 +20,6 @@ USE_CPU_ONLY = True
 flags = os.environ.get("XLA_FLAGS", "")
 if USE_CPU_ONLY:
     flags += " --xla_force_host_platform_device_count=8"
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["XLA_FLAGS"] = flags
 
 from jax.tree_util import tree_map

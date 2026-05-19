@@ -7,9 +7,9 @@ import torch
 import torch.nn as nn
 
 from dataset_helpers.mnist_helper import mnist_loader_manual
-from other_helpers.backpropagation import RNN_back_prop
+from forward_backward_pass.backpropagation import RNN_back_prop
 from other_helpers.helpers import NeuronStates, Params, load_config_with_defaults
-from other_helpers.loss_functions import loss_bpp, loss_func
+from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
 
 def random_layer_params(m, n, key, scale=1e-2):

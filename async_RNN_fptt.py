@@ -76,6 +76,50 @@ from dataset_helpers.mnist_helper import mnist_loader_manual  # noqa: E402
 #region Data helpers
 # ---------------------------------------------------------------------------
 
+def load_neural_decoding_arrays(batch_size: int, data_dir: str,
+                                filename: str = "indy_20160622_01.mat",
+                                window: int = 50, train_ratio: float = 0.5,
+                                collapse_units: bool = True,
+                                preserve_exact_times: bool = False):
+    """
+    Load primate-reaching neural-decoding data and return numpy arrays in the
+    same (x, y) shape convention as the other loaders. Regression task: y is
+    continuous 2-D velocity, NOT class labels.
+
+    Returns x_train, y_train, x_val, y_val, x_test, y_test, n_input_neurons
+    where:
+        x shape: (N, max_events, 2)  — padded event format (idx, value); idx=-2 is padding
+        y shape: (N, 2)              — float32 (vx, vy)
+        n_input_neurons: 96 by default (collapse_units=True)
+    """
+    from dataset_helpers.primate_reaching_helper import torch_primate_reaching_loader
+
+    (trainloader, _), (valloader, _), (testloader, _), _ = torch_primate_reaching_loader(
+        batch_size=batch_size, shuffle=False, data_dir=data_dir,
+        filename=filename, window=window, train_ratio=train_ratio,
+        collapse_units=collapse_units, preserve_exact_times=preserve_exact_times,
+        truncate=True,
+    )
+
+    def _collect(loader):
+        all_x, all_y = [], []
+        for batch in loader:
+            data, labels = batch
+            all_x.append(np.asarray(data, dtype=np.float32))
+            all_y.append(np.asarray(labels, dtype=np.float32))
+        return np.concatenate(all_x, axis=0), np.concatenate(all_y, axis=0)
+
+    x_train, y_train = _collect(trainloader)
+    x_val,   y_val   = _collect(valloader)
+    x_test,  y_test  = _collect(testloader)
+
+    # n_input_neurons: derive from the max idx seen (collapse_units=True → 96 for indy*).
+    n_input_neurons = int(max(x_train[..., 0].max(),
+                              x_val[..., 0].max(),
+                              x_test[..., 0].max()) + 1)
+    return x_train, y_train, x_val, y_val, x_test, y_test, n_input_neurons
+
+
 def load_shd_arrays(batch_size: int, data_dir: str):
     """
     Load SHD dataset and convert to numpy arrays in event format (neuron_idx, value).
@@ -427,23 +471,38 @@ class FPTTVanillaRNN(nn.Module):
 
 class FPTTMinimalRNNAED(nn.Module):
     """
-    MinimalRNN with AED (Async Event-Driven) output, matching async_RNN_fptt_mpi.py.
+    MinimalRNN with AED (Async Event-Driven) inter-layer semantics, matching the
+    reference implementation in async_RNN.py.
 
-    Per-timestep equations (event format: neuron_idx, value):
+    Layer 0 (first hidden) — sparse-embedding input from raw events:
         z_t = tanh(value * W_phi[neuron_idx] + b_phi)
         u_t = sigmoid([h_prev, z_t] @ W_gate + b_gate)
         h_t = u_t * h_prev + (1 - u_t) * z_t
-        o_t = top_k(ReLU(h_t))   ← sparse output like MPI version
-        logits += o_t @ W_out     ← accumulated every timestep
+        o_t = top_k(ReLU(h_t))
+
+    Layers 1..nlayers-1 — per-event integration from previous layer's events:
+        For each non-zero event (idx_e, val_e) emitted by layer l-1 at this timestep:
+            z   = tanh(val_e * W_phi_l[:, idx_e] + b_phi_l)
+            u   = sigmoid([h_l, z] @ W_gate_l + b_gate_l)
+            h_l = u * h_l + (1 - u) * z       # advances once PER event
+            o_l = top_k(ReLU(h_l))            # fired into the next layer
+
+    Output: logits += sum_k o_last^k @ W_out per timestep, equivalent to one logit
+    add per event from the last hidden layer.
     """
 
     def __init__(self, n_input_neurons, hidden_size, n_classes,
-                 sync_rate=1, firing_nb=10000, dropout=0.0, nlayers=1):
+                 sync_rate=1, firing_nb=10000, dropout=0.0, nlayers=1,
+                 dense_output_firing=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.sync_rate   = sync_rate
         self.firing_nb   = firing_nb
         self.nlayers     = nlayers
+        # If True, the LAST hidden layer's full dense ReLU(h) is fed to W_out
+        # at every step (no top-k cap on the output projection). The per-event
+        # top-k firing BETWEEN hidden layers is unaffected.
+        self.dense_output_firing = dense_output_firing
 
         # Layer 0: AED input — embedding lookup by neuron_idx
         self.W_phi  = nn.Parameter(torch.empty(n_input_neurons, hidden_size))
@@ -469,76 +528,186 @@ class FPTTMinimalRNNAED(nn.Module):
 
         nn.init.xavier_uniform_(self.W_phi)
         nn.init.xavier_uniform_(self.W_gate)
-        nn.init.xavier_uniform_(self.W_out)
+        # logits are divided by n_real_events before the loss (see forward_chunk),
+        # so the effective fan-in per step is hidden_size — xavier with fan_in=hidden_size.
+        nn.init.normal_(self.W_out, mean=0.0, std=1.0 / hidden_size ** 0.5)
 
     def init_hidden(self, batch_size):
         device = self.W_phi.device
         return [(torch.zeros(batch_size, self.hidden_size, device=device),)
                 for _ in range(self.nlayers)]
 
-    def forward_chunk(self, x_chunk, hidden, t_offset, return_sparsity=False):
+    def _event_step(self, l, idx, val, h_prev, valid_mask):
+        """One MinimalRNN gate update at hidden layer l (l >= 1) for a single
+        sparse event (idx, val). Used for inter-layer per-event integration:
+        layer l's hidden state advances ONCE per incoming event from layer l-1.
+
+        Args:
+            l: layer index in [1, nlayers).
+            idx: (B,) long — index of the firing neuron at layer l-1.
+            val: (B,) float — its value.
+            h_prev: (B, H).
+            valid_mask: (B,) bool — True for real events (val != 0), False for masked slots.
+        Returns:
+            h_new: (B, H) — h_prev where !valid_mask, else updated h.
+        """
+        W_phi_l  = self.W_phi_layers[l - 1]   # nn.Linear(H, H)
+        W_gate_l = self.W_gate_layers[l - 1]  # nn.Linear(2H, H)
+        safe_idx = idx.clamp(min=0)
+        valid_f  = valid_mask.float().unsqueeze(1)
+
+        # Sparse embedding: phi = val * W_phi_l[:, idx] + b_phi_l
+        # nn.Linear stores weight as (out, in); weight.T has rows indexed by `in`.
+        phi = val.unsqueeze(1) * W_phi_l.weight.t()[safe_idx] + W_phi_l.bias.unsqueeze(0)
+        phi = phi * valid_f
+        z   = torch.tanh(phi)
+
+        cat_hz = torch.cat([h_prev, z], dim=1)
+        u      = torch.sigmoid(W_gate_l(cat_hz))
+        h_new  = u * h_prev + (1.0 - u) * z
+        return torch.where(valid_mask.unsqueeze(1), h_new, h_prev)
+
+    def forward_chunk(self, x_chunk, hidden, t_offset, return_sparsity=False,
+                      return_per_step=False):
         """
         Args:
             x_chunk: (B, chunk_len, 2) — event format (neuron_idx, value)
             hidden:  [(h,), ...]  — one tuple per layer
             t_offset: int — global timestep offset (for sync_rate)
+            return_per_step: if True, return (B, chunk_len, C) per-timestep logits
+                             instead of the single (B, C) accumulated logit.
             return_sparsity: if True, also return avg non-zero activations per timestep
         Returns:
-            logits: (B, n_classes) — accumulated over chunk from last layer
+            logits: (B, n_classes) — accumulated from last hidden layer's events
             hidden: updated [(h,), ...]
             avg_act: (only if return_sparsity=True) avg non-zero activations per timestep
+
+        Per-event semantics (matches async_RNN.py): for nlayers >= 2, every event
+        emitted by layer l-1 advances layer l's hidden state once, after which
+        layer l fires its own events that may propagate to layer l+1.
         """
         B, chunk_len, _ = x_chunk.shape
+        H = self.hidden_size
         C = self.W_out.shape[1]
         device = self.W_phi.device
+        K = min(self.firing_nb, H)  # static inner-loop bound
 
         hs = [hidden[l][0] for l in range(self.nlayers)]   # list of (B, H)
         logits = torch.zeros(B, C, device=device)
         total_active = 0.0
         n_firing_steps = 0
+        n_real_events = 0  # count of non-padding input events for output normalisation
+        step_logits = [] if return_per_step else None  # per-timestep logits (B, C)
 
         for local_t in range(chunk_len):
             t = t_offset + local_t
-            neuron_idx = x_chunk[:, local_t, 0].long()   # (B,)
-            value      = x_chunk[:, local_t, 1]           # (B,)
+            neuron_idx = x_chunk[:, local_t, 0].long()
+            value      = x_chunk[:, local_t, 1]
 
-            # Mask padding events (neuron_idx < 0)
-            valid    = (neuron_idx >= 0).float().unsqueeze(1)  # (B, 1)
+            valid    = (neuron_idx >= 0).float().unsqueeze(1)
             safe_idx = neuron_idx.clamp(min=0)
+            n_real_events += (neuron_idx >= 0).float().mean().item()
 
-            # --- Layer 0: AED embedding input ---
-            phi       = self.W_phi[safe_idx]                      # (B, H)
-            phi_input = value.unsqueeze(1) * phi + self.b_phi.unsqueeze(0)
+            # --- Layer 0: AED sparse-embedding input from raw events ---
+            phi_input = value.unsqueeze(1) * self.W_phi[safe_idx] + self.b_phi.unsqueeze(0)
             phi_input = phi_input * valid
-            z_t       = torch.tanh(phi_input)                    # (B, H)
-
-            cat_hz = torch.cat([hs[0], z_t], dim=1)              # (B, 2H)
-            u_t    = torch.sigmoid(cat_hz @ self.W_gate + self.b_gate.unsqueeze(0))
-            h_new  = u_t * hs[0] + (1.0 - u_t) * z_t
-            hs[0]  = torch.where(valid.bool(), h_new, hs[0])
+            z_t       = torch.tanh(phi_input)
+            cat_hz    = torch.cat([hs[0], z_t], dim=1)
+            u_t       = torch.sigmoid(cat_hz @ self.W_gate + self.b_gate.unsqueeze(0))
+            h_new     = u_t * hs[0] + (1.0 - u_t) * z_t
+            hs[0]     = torch.where(valid.bool(), h_new, hs[0])
 
             sync_fire = 1.0 if ((t + 1) % self.sync_rate == 0) else 0.0
-            o_t = torch.relu(hs[0]) * sync_fire
-            o_t = keep_top_k_batch_torch(o_t, self.firing_nb)
 
-            # --- Layers 1..nlayers-1: dense input from previous layer ---
-            for l in range(1, self.nlayers):
-                inp = o_t
-                if self.drop is not None:
-                    inp = self.drop(inp)
-                z_t_l  = torch.tanh(self.W_phi_layers[l - 1](inp))
-                cat_l  = torch.cat([hs[l], z_t_l], dim=1)
-                u_t_l  = torch.sigmoid(self.W_gate_layers[l - 1](cat_l))
-                hs[l]  = u_t_l * hs[l] + (1.0 - u_t_l) * z_t_l
-                o_t    = torch.relu(hs[l]) * sync_fire
-                o_t    = keep_top_k_batch_torch(o_t, self.firing_nb)
+            # 1-layer: original behaviour (mathematically per-event already, since the
+            # output matmul on the dense top-k vector equals Σ_e val_e · W_out[idx_e]).
+            if self.nlayers == 1:
+                o_t = torch.relu(hs[0]) * sync_fire
+                if not self.dense_output_firing:
+                    o_t = keep_top_k_batch_torch(o_t, self.firing_nb)
+                if self.drop is not None and self.training:
+                    o_t = self.drop(o_t)
+                step_out = o_t @ self.W_out  # instantaneous projection from current h
+                logits = logits + step_out
+                if step_logits is not None:
+                    # Per-step: current hidden state projection (not running sum).
+                    # Each step predicts independently from h_t, like the SNN mem_out.
+                    step_logits.append(step_out)
+                if return_sparsity and sync_fire > 0:
+                    total_active += (o_t != 0).float().sum(dim=1).mean().item()
+                    n_firing_steps += 1
+                continue
 
-            # accumulate logits from last layer only
-            logits = logits + o_t @ self.W_out
+            # --- Multi-layer per-event cascade (nlayers >= 2) ---
+            o_0 = torch.relu(hs[0]) * sync_fire
+            val_0, idx_0 = torch.topk(o_0, K, dim=1)  # (B, K), sorted desc
+
+            o_last_total = torch.zeros(B, H, device=device)
+
+            for k in range(K):
+                idx_k = idx_0[:, k]
+                val_k = val_0[:, k]
+                valid_k = (val_k != 0)
+                if self.drop is not None and self.training:
+                    val_k = self.drop(val_k)
+                    valid_k = valid_k & (val_k != 0)
+
+                # Layer 1 advances once per layer-0 event
+                hs[1] = self._event_step(1, idx_k, val_k, hs[1], valid_k)
+                o_1 = torch.relu(hs[1]) * sync_fire
+
+                if self.nlayers == 2:
+                    # Layer 1 (last hidden) → output. Either top-k fire (per-event
+                    # protocol) or full dense ReLU(h) (when dense_output_firing=True).
+                    if self.dense_output_firing:
+                        o_last_total = o_last_total + o_1
+                    else:
+                        o_last_total = o_last_total + keep_top_k_batch_torch(o_1, self.firing_nb)
+                    continue
+
+                # nlayers >= 3: layer 1 fires events that drive layer 2 per-event
+                val_1, idx_1 = torch.topk(o_1, K, dim=1)
+                for kk in range(K):
+                    idx_kk = idx_1[:, kk]
+                    val_kk = val_1[:, kk]
+                    valid_kk = (val_kk != 0)
+                    if self.drop is not None and self.training:
+                        val_kk = self.drop(val_kk)
+                        valid_kk = valid_kk & (val_kk != 0)
+
+                    hs[2] = self._event_step(2, idx_kk, val_kk, hs[2], valid_kk)
+                    o_2 = torch.relu(hs[2]) * sync_fire
+                    # Layer 2 (last hidden) → output: dense or top-k per the flag.
+                    if self.dense_output_firing:
+                        o_last_total = o_last_total + o_2
+                    else:
+                        o_last_total = o_last_total + keep_top_k_batch_torch(o_2, self.firing_nb)
+
+            # Output layer accumulates logits per event from last hidden layer.
+            # Σ_e val_e · W_out[idx_e] equals (Σ_k o_last^k) @ W_out, so one matmul
+            # at end-of-timestep is exact, not an approximation.
+            step_out = o_last_total @ self.W_out
+            logits = logits + step_out
+            if step_logits is not None:
+                step_logits.append(step_out)
 
             if return_sparsity and sync_fire > 0:
-                total_active += (o_t != 0).float().sum(dim=1).mean().item()
+                total_active += (o_last_total != 0).float().sum(dim=1).mean().item()
                 n_firing_steps += 1
+
+        # Normalise by number of real (non-padding) events so W_out scale is
+        # independent of sequence length and firing density across sessions.
+        norm = max(n_real_events, 1.0)
+        logits = logits / norm
+
+        if return_per_step:
+            # (B, T, C) — instantaneous h_t @ W_out at each event step.
+            # Not normalised by n_real_events (each step is independent, not a running sum).
+            per_step = torch.stack(step_logits, dim=1)
+            if return_sparsity:
+                avg_act = total_active / max(n_firing_steps, 1)
+                return per_step, [(h,) for h in hs], avg_act
+            return per_step, [(h,) for h in hs]
 
         if return_sparsity:
             avg_act = total_active / max(n_firing_steps, 1)
@@ -1527,9 +1696,15 @@ def train_one_epoch(
     return total_loss / max(total_batches, 1)
 
 
-def evaluate(x, y, model, batch_size, n_classes, accumulate_logits=False, PARTS=1, avg_logits=False):
-    """Full-sequence accuracy evaluation (no weight updates).
+def evaluate(x, y, model, batch_size, n_classes, accumulate_logits=False, PARTS=1,
+             avg_logits=False, task="classification", stateful=False, per_step_last=False):
+    """Full-sequence evaluation (no weight updates).
     x: (N, T, 2) — preprocessed event format.
+    task='classification': returns accuracy.
+    task='regression': returns R² averaged across output dims (matches r2_from_sums).
+    stateful=True: process samples sequentially (batch=1), carry hidden state from
+        one window to the next so the RNN sees long-range temporal context. Useful
+        for neural decoding where consecutive samples are consecutive time bins.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -1538,27 +1713,71 @@ def evaluate(x, y, model, batch_size, n_classes, accumulate_logits=False, PARTS=
     _PARTS = PARTS if PARTS * step >= T else PARTS + 1
     all_preds = []
     with torch.no_grad():
-        for s in range(0, x.shape[0], batch_size):
-            xb = torch.tensor(x[s : s + batch_size], dtype=torch.float32, device=device)
-            B  = xb.shape[0]
+        if stateful:
+            # Batched-streams stateful eval: split x (in time order) into B parallel
+            # streams, each of which carries its own hidden state forward sample-by-
+            # sample. ~B× faster than batch=1 sequential, with B cold-starts instead
+            # of 1 (negligible if chunk_size ≫ "warm-up time").
+            N = x.shape[0]
+            B = max(1, batch_size)
+            chunk_size = N // B
+            usable = B * chunk_size
+            # x_streams: (B, chunk_size, T, 2) — stream i = x[i*chunk_size : (i+1)*chunk_size]
+            x_streams = x[:usable].reshape(B, chunk_size, *x.shape[1:])
             hidden = model.init_hidden(B)
-            if accumulate_logits and _PARTS > 1:
-                C = model.fc.weight.shape[0] if hasattr(model, 'fc') else model.w_out.data.shape[1]
-                cum_logits = torch.zeros(B, C, device=device)
-                for p in range(_PARTS):
-                    start = p * step
-                    end = min(start + step, T)
-                    if start >= T:
-                        break
-                    x_chunk = xb[:, start:end, :]
-                    h_detached = [tuple(t.detach() for t in tup) for tup in hidden]
-                    chunk_logits, hidden = model.forward_chunk(x_chunk, h_detached, t_offset=start)
-                    cum_logits = cum_logits + chunk_logits
-                all_preds.append(cum_logits.argmax(dim=1).cpu().numpy())
-            else:
+            all_chunk_preds = []
+            for k in range(chunk_size):
+                xb = torch.tensor(x_streams[:, k], dtype=torch.float32, device=device)
+                logits, hidden = model.forward_chunk(xb, hidden, t_offset=0)
+                hidden = [tuple(h.detach() for h in tup) for tup in hidden]
+                all_chunk_preds.append(logits.cpu().numpy() if task == "regression"
+                                       else logits.argmax(dim=1).cpu().numpy())
+            # Stack to (chunk_size, B, ...) then transpose to (B, chunk_size, ...)
+            stacked = np.stack(all_chunk_preds, axis=0).swapaxes(0, 1)
+            # Flatten to (usable, ...) — preserves original time order
+            all_preds.append(stacked.reshape(usable, *stacked.shape[2:]))
+            # If there's a leftover tail, do it stateless (rare; only the last <B samples).
+            if usable < N:
+                tail = x[usable:]
+                hidden = model.init_hidden(tail.shape[0])
+                xb = torch.tensor(tail, dtype=torch.float32, device=device)
                 logits, _ = model.forward_chunk(xb, hidden, t_offset=0)
-                all_preds.append(logits.argmax(dim=1).cpu().numpy())
+                all_preds.append(logits.cpu().numpy() if task == "regression"
+                                 else logits.argmax(dim=1).cpu().numpy())
+        else:
+            for s in range(0, x.shape[0], batch_size):
+                xb = torch.tensor(x[s : s + batch_size], dtype=torch.float32, device=device)
+                B  = xb.shape[0]
+                hidden = model.init_hidden(B)
+                if accumulate_logits and _PARTS > 1:
+                    C = model.fc.weight.shape[0] if hasattr(model, 'fc') else model.w_out.data.shape[1]
+                    cum_logits = torch.zeros(B, C, device=device)
+                    for p in range(_PARTS):
+                        start = p * step
+                        end = min(start + step, T)
+                        if start >= T:
+                            break
+                        x_chunk = xb[:, start:end, :]
+                        h_detached = [tuple(t.detach() for t in tup) for tup in hidden]
+                        chunk_logits, hidden = model.forward_chunk(x_chunk, h_detached, t_offset=start)
+                        cum_logits = cum_logits + chunk_logits
+                    logits = cum_logits
+                elif per_step_last:
+                    per_step, _ = model.forward_chunk(xb, hidden, t_offset=0,
+                                                      return_per_step=True)
+                    logits = per_step[:, -1, :]
+                else:
+                    logits, _ = model.forward_chunk(xb, hidden, t_offset=0)
+                all_preds.append(logits.cpu().numpy() if task == "regression"
+                                 else logits.argmax(dim=1).cpu().numpy())
     preds = np.concatenate(all_preds)
+    if task == "regression":
+        # R² averaged across output dimensions, matching r2_from_sums semantics.
+        y2 = y if y.ndim == 2 else y[:, None]
+        ss_res = np.sum((y2 - preds) ** 2, axis=0)
+        ss_tot = np.sum((y2 - y2.mean(axis=0, keepdims=True)) ** 2, axis=0)
+        r2_per_dim = np.where(ss_tot > 0, 1.0 - ss_res / ss_tot, 0.0)
+        return float(r2_per_dim.mean())
     return float(np.mean(preds == y))
 
 
@@ -1575,13 +1794,16 @@ def _parse_hidden_sizes(hidden_size_arg):
     return [int(x.strip()) for x in str(hidden_size_arg).split(',') if x.strip()]
 
 
-def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_classes, epoch, clip=1.0):
+def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_classes, epoch,
+                          clip=1.0, task="classification", temporal_loss=False):
     """
     Standard BPTT training for FPTTMinimalRNNAED.
 
-    Processes the full sequence in a single forward pass — no chunking, no oracle
-    loss, no epoch reset. Loss is standard cross-entropy on logits accumulated over
-    all timesteps (logits += o_t @ W_out). Backpropagates through the entire sequence.
+    When temporal_loss=True (regression only): uses temporally weighted MSE over
+    all window timesteps (weights linearly from 0→1), matching SNN training.
+    Otherwise uses plain MSE on the final accumulated logit.
+
+    Returns (avg_loss, train_acc).
     """
     model.train()
     device = next(model.parameters()).device
@@ -1589,21 +1811,40 @@ def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_class
     rng = np.random.default_rng(epoch)
     perm = rng.permutation(n)
     total_loss = 0.0
-    n_batches = 0
+    n_batches  = 0
+
+    all_preds   = []
+    all_targets = []
+
+    use_per_step = (task == "regression" and temporal_loss)
+    label_dtype = torch.float32 if task == "regression" else torch.long
 
     for s in range(0, n, batch_size):
         idx = perm[s : s + batch_size]
         xb = torch.tensor(x_train[idx], dtype=torch.float32, device=device)
-        yb = torch.tensor(y_train[idx], dtype=torch.long, device=device)
+        yb = torch.tensor(y_train[idx], dtype=label_dtype, device=device)
         B  = yb.shape[0]
 
         hidden = model.init_hidden(B)
         optimizer.zero_grad()
 
-        # Full-sequence forward — logits accumulate over all T timesteps
-        logits, _ = model.forward_chunk(xb, hidden, t_offset=0)
+        if use_per_step:
+            # per_step: (B, T, C); yb: (B, C) → expand to (B, T, C) for windowed loss
+            per_step, _ = model.forward_chunk(xb, hidden, t_offset=0, return_per_step=True)
+            T = per_step.shape[1]
+            weights = torch.linspace(0, 1, steps=T, device=device)  # (T,)
+            yb_exp = yb.unsqueeze(1).expand_as(per_step)             # (B, T, C)
+            sq_err = (per_step - yb_exp) ** 2                        # (B, T, C)
+            loss = (sq_err * weights.view(1, T, 1)).mean()
+            # Use last-step prediction for train_acc tracking
+            logits = per_step[:, -1, :]
+        else:
+            logits, _ = model.forward_chunk(xb, hidden, t_offset=0)
+            if task == "regression":
+                loss = F.mse_loss(logits, yb)
+            else:
+                loss = F.cross_entropy(logits, yb)
 
-        loss = F.cross_entropy(logits, yb)
         loss.backward()
 
         if clip > 0:
@@ -1612,8 +1853,21 @@ def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_class
 
         total_loss += float(loss.item())
         n_batches  += 1
+        all_preds.append(logits.detach().cpu().numpy())
+        all_targets.append(yb.detach().cpu().numpy())
 
-    return total_loss / max(n_batches, 1)
+    avg_loss = total_loss / max(n_batches, 1)
+
+    preds   = np.concatenate(all_preds,   axis=0)
+    targets = np.concatenate(all_targets, axis=0)
+    if task == "regression":
+        ss_res = np.sum((targets - preds) ** 2, axis=0)
+        ss_tot = np.sum((targets - targets.mean(axis=0, keepdims=True)) ** 2, axis=0)
+        train_acc = float(np.where(ss_tot > 0, 1.0 - ss_res / ss_tot, 0.0).mean())
+    else:
+        train_acc = float((preds.argmax(axis=1) == targets).mean())
+
+    return avg_loss, train_acc
 
 
 def measure_sparsity(model, x, batch_size=64):
@@ -1676,10 +1930,23 @@ def train_fptt(
     x_val=None, y_val=None,
     x_test=None, y_test=None,
     save_path="",
+    task="classification",
+    dense_output_firing=False,
+    stateful_eval=False,
+    temporal_loss=False,
+    weight_decay=0.0,
+    load_checkpoint=None,
+    eval_only=False,
 ):
     if train_samples > 0:
-        x_train = x_train[:train_samples]
-        y_train = y_train[:train_samples]
+        # Subsample uniformly at random rather than taking the first N. Time-series
+        # datasets (e.g., neural decoding) have ordered targets — the first N rows
+        # of the train split can be a near-constant slice (y_std ≪ y_std_global),
+        # which collapses the model to predicting that slice's mean.
+        rng_sub = np.random.default_rng(seed)
+        idx = rng_sub.choice(x_train.shape[0], train_samples, replace=False)
+        x_train = x_train[idx]
+        y_train = y_train[idx]
 
     hidden_sizes = _parse_hidden_sizes(hidden_size)
     L = len(hidden_sizes)
@@ -1694,6 +1961,7 @@ def train_fptt(
             firing_nb=firing_nb,
             dropout=dropout,
             nlayers=nlayers,
+            dense_output_firing=dense_output_firing,
         )
     elif model_type in ("lstm", "rnn", "minimalrnn"):
         H = hidden_sizes[0]
@@ -1755,10 +2023,36 @@ def train_fptt(
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {model_type}  params={n_params:,}  device={device}")
 
+    if load_checkpoint:
+        ckpt = torch.load(load_checkpoint, map_location=device)
+        model.load_state_dict(ckpt["state_dict"])
+        print(f"Loaded checkpoint: {load_checkpoint}  (saved ep={ckpt.get('epoch','?')}  val={ckpt.get('val_acc','?')})")
+
+    if eval_only:
+        model.eval()
+        val_acc = evaluate(x_val, y_val, model, batch_size=batch_size * 4, n_classes=n_classes,
+                           accumulate_logits=accumulate_logits, PARTS=PARTS, avg_logits=avg_logits,
+                           task=task, stateful=stateful_eval, per_step_last=temporal_loss) if x_val is not None else None
+        test_acc = evaluate(x_test, y_test, model, batch_size=batch_size * 4, n_classes=n_classes,
+                            accumulate_logits=accumulate_logits, PARTS=PARTS, avg_logits=avg_logits,
+                            task=task, stateful=stateful_eval, per_step_last=temporal_loss) if x_test is not None else None
+        avg_act, sparsity = measure_sparsity(model, x_test[:512] if x_test is not None else x_val[:512])
+        parts = ["eval_only=True"]
+        if val_acc is not None:
+            parts.append(f"val_acc={val_acc:.4f}")
+        if test_acc is not None:
+            parts.append(f"test_acc={test_acc:.4f}")
+        if avg_act is not None:
+            parts.append(f"avg_act={avg_act:.1f}  sparsity={sparsity:.3f}")
+        print("  ".join(parts))
+        return model, []
+
     if optim_name.lower() == "sgd":
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
+                                    weight_decay=weight_decay)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
+                                      weight_decay=weight_decay)
 
     named_params = get_stats_named_params(model)
 
@@ -1767,19 +2061,22 @@ def train_fptt(
     )
 
     logs = []
-    best_val_acc = -1.0
+    best_val_acc = float("-inf")  # ensures the first epoch always sets a baseline
     for ep in range(1, epochs + 1):
         t0 = time.time()
 
         if bptt and model_type == "minimalrnn_aed":
-            # Standard BPTT: no epoch reset, no oracle, full sequence in one pass
-            avg_loss = train_one_epoch_bptt(
+            # Standard BPTT: no epoch reset, no oracle, full sequence in one pass.
+            # train_acc comes from the training forward passes — no extra eval needed.
+            avg_loss, train_acc = train_one_epoch_bptt(
                 x_train, y_train,
                 model, optimizer,
                 batch_size=batch_size,
                 n_classes=n_classes,
                 epoch=ep,
                 clip=clip,
+                task=task,
+                temporal_loss=temporal_loss,
             )
         elif model_type == "rule":
             reset_named_params(named_params)
@@ -1831,22 +2128,28 @@ def train_fptt(
                 avg_logits=avg_logits,
             )
 
-        train_acc = evaluate(x_train[:1000], y_train[:1000], model,
-                             batch_size=batch_size * 4, n_classes=n_classes,
-                             accumulate_logits=accumulate_logits, PARTS=PARTS,
-                             avg_logits=avg_logits)
+        if not (bptt and model_type == "minimalrnn_aed"):
+            # For non-BPTT paths train_acc isn't returned by the training loop,
+            # so compute it here on the full training set.
+            train_acc = evaluate(x_train, y_train, model,
+                                 batch_size=batch_size * 4, n_classes=n_classes,
+                                 accumulate_logits=accumulate_logits, PARTS=PARTS,
+                                 avg_logits=avg_logits, task=task, stateful=stateful_eval,
+                                 per_step_last=temporal_loss)
         val_acc = None
         if x_val is not None:
             val_acc = evaluate(x_val, y_val, model,
                                batch_size=batch_size * 4, n_classes=n_classes,
                                accumulate_logits=accumulate_logits, PARTS=PARTS,
-                               avg_logits=avg_logits)
+                               avg_logits=avg_logits, task=task, stateful=stateful_eval,
+                               per_step_last=temporal_loss)
         test_acc = None
         if x_test is not None:
             test_acc = evaluate(x_test, y_test, model,
                                 batch_size=batch_size * 4, n_classes=n_classes,
                                 accumulate_logits=accumulate_logits, PARTS=PARTS,
-                                avg_logits=avg_logits)
+                                avg_logits=avg_logits, task=task, stateful=stateful_eval,
+                                per_step_last=temporal_loss)
         # Measure sparsity for AED models
         avg_act, sparsity = measure_sparsity(
             model,
@@ -2081,13 +2384,26 @@ def main():
                         help="Initialize recurrent weight matrices to identity.")
     parser.add_argument("--vanilla",       action="store_true", default=False,
                         help="Use vanilla RNN: h_t = tanh(W_ih x_t + W_hh h_{t-1} + b). No relu, no sync, no topk.")
-    parser.add_argument("--train-samples",  type=int,   default=3000,
+    parser.add_argument("--train-samples",  type=int,   default=0,
                         help="Number of training samples; 0 = full dataset.")
     parser.add_argument("--optim",          type=str,   default="adam",
                         choices=["adam", "sgd"])
     parser.add_argument("--dataset",        type=str,   default="mnist",
-                        choices=["mnist", "smnist", "shd"],
-                        help="Dataset: 'mnist', 'smnist', or 'shd' (Spiking Heidelberg Digits, 20 classes).")
+                        choices=["mnist", "smnist", "shd", "neural_decoding"],
+                        help="Dataset: 'mnist', 'smnist', 'shd' (Spiking Heidelberg Digits, 20 classes), "
+                             "or 'neural_decoding' (primate reaching, regression onto 2-D velocity).")
+    parser.add_argument("--filename",       type=str, default="indy_20160622_01.mat",
+                        help="Primate-reaching session filename (only for --dataset neural_decoding).")
+    parser.add_argument("--window",         type=int, default=50,
+                        help="Window length in timesteps for neural decoding.")
+    parser.add_argument("--collapse-units", action="store_true", default=False,
+                        help="Collapse spike unit slots per channel (neural decoding).")
+    parser.add_argument("--preserve-exact-times", action="store_true", default=False,
+                        help="Use raw (timestamp, channel) events instead of binned counts.")
+    parser.add_argument("--val-samples",  type=int, default=0,
+                        help="Cap val set to first N samples (0 = all). Used for eval speed.")
+    parser.add_argument("--test-samples", type=int, default=0,
+                        help="Cap test set to first N samples (0 = all). Used for eval speed.")
     parser.add_argument("--smoke-test",     action="store_true", default=False,
                         help="Run the built-in smoke test and exit.")
     parser.add_argument("--compare-grads",  action="store_true", default=False,
@@ -2112,6 +2428,21 @@ def main():
                              "pass, single CE loss, no oracle, no epoch reset.")
     parser.add_argument("--save-path",  type=str, default="",
                         help="If set, save best-val and final model weights to <save_path>_best.pt / _final.pt.")
+    parser.add_argument("--dense-output-firing", action="store_true", default=False,
+                        help="Send the FULL dense ReLU(h_last) into the logit projection at every step "
+                             "instead of top-k firing. Per-event semantics BETWEEN hidden layers is unaffected.")
+    parser.add_argument("--stateful-eval", action="store_true", default=False,
+                        help="Eval with batch=1 and hidden state carried over between consecutive samples "
+                             "(useful for time-series like neural decoding so the RNN sees long-range context).")
+    parser.add_argument("--temporal-loss", action="store_true", default=False,
+                        help="Use temporally weighted MSE over all window steps (weight linearly 0→1), "
+                             "matching SNN training. Regression only.")
+    parser.add_argument("--weight-decay",  type=float, default=0.0,
+                        help="Weight decay (L2 regularisation) for Adam/SGD optimizer.")
+    parser.add_argument("--load-checkpoint", type=str, default=None,
+                        help="Path to a .pt checkpoint to load before training/eval.")
+    parser.add_argument("--eval-only", action="store_true", default=False,
+                        help="Skip training; just evaluate the loaded checkpoint on val+test.")
     args = parser.parse_args()
 
     if args.compare_grads:
@@ -2132,11 +2463,28 @@ def main():
             args.batch_size, args.data_dir
         )
         n_classes = 20
+        task = "classification"
+    elif args.dataset == "neural_decoding":
+        x_train, y_train, x_val, y_val, x_test, y_test, n_input_neurons = load_neural_decoding_arrays(
+            args.batch_size, args.data_dir, filename=args.filename, window=args.window,
+            collapse_units=args.collapse_units,
+            preserve_exact_times=args.preserve_exact_times,
+        )
+        n_classes = y_train.shape[1]  # regression output dim, typically 2
+        task = "regression"
+        # Cap val/test for eval speed under per-event semantics. R² is stable on
+        # ~2000 samples; full set inflates per-epoch eval cost without changing
+        # the metric meaningfully.
+        if args.val_samples > 0:
+            x_val, y_val = x_val[:args.val_samples], y_val[:args.val_samples]
+        if args.test_samples > 0:
+            x_test, y_test = x_test[:args.test_samples], y_test[:args.test_samples]
     else:
         x_train, y_train, x_val, y_val, x_test, y_test, n_input_neurons = load_mnist_arrays(
             args.batch_size, args.data_dir, dataset=args.dataset
         )
         n_classes = 10
+        task = "classification"
 
     hidden_sizes = _parse_hidden_sizes(args.hidden_size)
 
@@ -2188,6 +2536,13 @@ def main():
         avg_logits=args.avg_logits,
         bptt=args.bptt,
         save_path=args.save_path,
+        task=task,
+        dense_output_firing=args.dense_output_firing,
+        stateful_eval=args.stateful_eval,
+        temporal_loss=args.temporal_loss,
+        weight_decay=args.weight_decay,
+        load_checkpoint=args.load_checkpoint,
+        eval_only=args.eval_only,
     )
 
 
