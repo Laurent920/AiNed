@@ -42,7 +42,7 @@ from other_helpers.helpers import update_history, process_history, load_config_w
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
-from other_helpers.general_MPI_helper import CNN_data_split, CNN_model_split_custom
+from other_helpers.general_MPI_helper import CNN_data_split, CNN_model_split_custom, ResNet_data_split, ResNet_model_split_custom
 from other_helpers.event_pooling import pool_output_size
 from forward_backward_pass.inference import predict, layer_computation as fc_layer_computation, conv_layer_computation
 
@@ -67,7 +67,6 @@ mpi_config = None           # MPIConfig class for mpi helpers functions
 training_generator = None
 validation_generator = None
 test_generator = None
-max_test_batches = 0  # 0 = no limit
 
 #region ConvNeuronStates
 @jax.tree_util.register_pytree_node_class
@@ -479,11 +478,25 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     # jax.debug.print("Rank {} finished forward pass in conv_predict_bwd with {} it", mpi_config.rank, iterations)
     # w_sum = l2_weight_regularization(mpi_config, weights)
 
-    # Receive the gradients from the later layers.
-    # With model parallelism, there may be multiple next-layer ranks each owning a different
-    # output region of this layer. Sum all their contributions to get the full gradient.
     out_layer_shape = params.flat_layer_sizes[layer_idx]
     next_grad_1 = jnp.zeros((batch_part_size,) + out_layer_shape)
+
+    # Receive residual-path gradients FIRST: the upstream layer (e.g. layer 3) sends the
+    # residual backward grad before the normal backward grad, so we must recv in the same
+    # order to avoid an MPI ordering deadlock.
+    for _dst_rank, _src_part, _dst_part in mpi_config.res_connect_next:
+        from other_helpers.general_MPI_helper import CNN_layer_Partition
+        if isinstance(_src_part, CNN_layer_Partition):
+            c_s, c_e = _src_part.c_start_idx, _src_part.c_end_idx + 1
+            x_s, x_e = _src_part.x_start_idx, _src_part.x_end_idx + 1
+            y_s, y_e = _src_part.y_start_idx, _src_part.y_end_idx + 1
+            slice_shape = (batch_part_size, c_e - c_s, x_e - x_s, y_e - y_s)
+            partial = recv(jnp.zeros(slice_shape), source=_dst_rank, tag=2, comm=comm)
+            next_grad_1 = next_grad_1.at[:, c_s:c_e, x_s:x_e, y_s:y_e].add(partial)
+        else:
+            next_grad_1 = next_grad_1 + recv(jnp.zeros((batch_part_size,) + out_layer_shape), source=_dst_rank, tag=2, comm=comm)
+
+    # Receive normal backward gradients from next-layer ranks after residuals.
     for _next_rank, _ in mpi_config.next_layer:
         next_grad_1 = next_grad_1 + recv(jnp.zeros((batch_part_size,) + out_layer_shape), source=_next_rank, tag=2, comm=comm)
 
@@ -558,13 +571,7 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
         return grad # (5, 3, 3, 3)
 
     input_residuals = all_neuron_states.input_residuals # Shape: (B, 3, 28, 28)
-    weight_grad = jax.vmap(grad_w)(input_residuals, next_grad) # Shape: (B, 5, 3, 3, 3) #TODO Use batches in convolution directly instead of vmap?
-
-    # Sum over the batch (keepdims for the size-1 batch axis) so combine_batch_avg's
-    # mean is a no-op — matching MLP_back_prop's FC convention. Previously conv grads
-    # were meaned over the batch while FC grads were summed, making conv grads
-    # batch_size x smaller than FC grads (a conv/FC learning-rate imbalance).
-    weight_grad = jnp.sum(weight_grad, axis=0, keepdims=True) # Shape: (1, 5, 3, 3, 3)
+    weight_grad = jax.vmap(grad_w)(input_residuals, next_grad) # Shape: (5, 3, 3, 3) #TODO Use batches in convolution directly instead of vmap?
 
     # weight_grad = weight_grad * weight_res
     weight_grad += 2 * params.w_reg * weights
@@ -600,6 +607,20 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     th_grad = -jnp.mean(next_grad * layer_activity, axis=0)
     thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
     th_grad = th_grad * thresholds * (thresholds - 1)
+
+    # Residual backward: send ∂L/∂(values_pre_act) (== activity_mask * next_grad, available
+    # as `next_grad` after line 568) to every src layer that sent us a residual.
+    # Shape matches src.flat_layer_sizes (= conv_layer_sizes[dst]) per the build-time validator.
+    for _src_rank, _src_part, _dst_part in mpi_config.res_connect_prev:
+        from other_helpers.general_MPI_helper import CNN_layer_Partition
+        if isinstance(_src_part, CNN_layer_Partition):
+            c_s, c_e = _src_part.c_start_idx, _src_part.c_end_idx + 1
+            x_s, x_e = _src_part.x_start_idx, _src_part.x_end_idx + 1
+            y_s, y_e = _src_part.y_start_idx, _src_part.y_end_idx + 1
+            grad_slice = next_grad[:, c_s:c_e, x_s:x_e, y_s:y_e]
+        else:
+            grad_slice = next_grad
+        send(grad_slice, dest=_src_rank, tag=2, comm=comm)
 
     if layer_idx > 1:
         # Compute gradient w.r.t. previous layer's activations and send to all previous-layer ranks.
@@ -963,7 +984,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         empty_neuron_states.thresholds,
         all_loss,
         opti,
-        "CNN",
+        "CNN/ResNet",
         all_history,
         total_batches[0],
         extra_fields=extra_fields,
@@ -1162,8 +1183,6 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
                 batch_iterator = iter(validation_generator)
     elif dataset == "test":
         total_batches = total_batches[2]
-        if max_test_batches > 0:
-            total_batches = min(total_batches, max_test_batches)
         if layer_idx == 0:
             batch_iterator = None
             if rank == 0:
@@ -1309,13 +1328,13 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             empty_neuron_states.thresholds,
             [],
             None,
-            "CNN",
+            "CNN/ResNet",
             all_history,
             total_batches,
         )
     return epoch_accuracy, mean, end_time - start_time
 
-def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, split_dims=None):
+def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, split_dims=None, residual_connections=()):
     '''
     Define for each MPI rank:
     - layer_idx:            Which layer it belongs to
@@ -1325,9 +1344,10 @@ def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, split_dims=
 
     processes_per_layer: if provided, use CNN model parallelism split on spatial/channel dims.
                          Must be a tuple of ints (one per layer) summing to size.
-                         If None, use data parallelism (CNN_data_split).
+                         If None, use data parallelism (ResNet_data_split).
     split_dims: tuple of strings (one per layer) e.g. ('x', 'cx', 'y', None, None, None).
-                Passed through to CNN_model_split_custom. None defaults to 'x'-only split.
+                Passed through to ResNet_model_split_custom. None defaults to 'x'-only split.
+    residual_connections: tuple of (src_layer_idx, dst_layer_idx) pairs for skip connections.
     '''
     global layer_idx
     global last_layer_idx
@@ -1336,9 +1356,9 @@ def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, split_dims=
     global processes_per_layer_global
 
     if processes_per_layer is not None:
-        mpi_config = CNN_model_split_custom(rank, comm, size, batch_size, layer_sizes, processes_per_layer, split_dims)
+        mpi_config = ResNet_model_split_custom(rank, comm, size, batch_size, layer_sizes, processes_per_layer, split_dims, residual_connections)
     else:
-        mpi_config = CNN_data_split(rank, comm, size, batch_size, layer_sizes)
+        mpi_config = ResNet_data_split(rank, comm, size, batch_size, layer_sizes, residual_connections)
 
     layer_idx = mpi_config.layer_idx
     last_layer_idx = mpi_config.last_layer_idx
@@ -1397,7 +1417,9 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     if split_dims is not None:
         split_dims = tuple(split_dims)
 
-    get_layer_idx(batch_size, layer_sizes, processes_per_layer, split_dims)
+    residual_connections = tuple(config['residual_connections'])
+
+    get_layer_idx(batch_size, layer_sizes, processes_per_layer, split_dims, residual_connections)
     
     if batch_size % mpi_config.get_process_per_batch != 0:
         print(f"Error: one batch ({batch_size}) must be divisible by the number of processes per layer ({mpi_config.get_process_per_batch})")
@@ -1496,6 +1518,19 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes)
         network = dataclasses.replace(network, params=params)
 
+        # Validate residual connections
+        if rank == 0:
+            for src, dst in residual_connections:
+                if src == 0:
+                    raise ValueError("Residual source cannot be the input layer (0)")
+                if len(params.layer_sizes[dst]) == 1:
+                    raise ValueError(f"Residual dst {dst} is FC; only conv dst supported")
+                if tuple(network.flat_layer_sizes[src]) != tuple(network.conv_layer_sizes[dst]):
+                    raise ValueError(
+                        f"Residual {src}->{dst} shape mismatch: "
+                        f"flat[{src}]={network.flat_layer_sizes[src]} vs conv[{dst}]={network.conv_layer_sizes[dst]}"
+                    )
+
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
             print(params)
@@ -1515,7 +1550,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             # To run the full training pipeline
             result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam",
                                extra_fields={"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
-                                             "split_dims": list(split_dims) if split_dims else None})
+                                             "split_dims": list(split_dims) if split_dims else None,
+                                             "residual_connections": [list(rc) for rc in residual_connections]})
         else:
             print(f"Unknown mode in config file, choose either 'training' or 'inference', got {mode}")
             sys.exit(1)
@@ -1532,8 +1568,6 @@ if __name__ == "__main__":
                        help='Directory for storing and reading the datasets (default: current directory/data/)')
     parser.add_argument('--debug-level', type=int, default=0,
                        help='Debug level for bug tests in inference.py (0=off, 1=BT1, 2=BT2, 3=BT3)')
-    parser.add_argument('--max-test-batches', type=int, default=0,
-                       help='Cap number of test batches (0 = no limit, for quick BT runs)')
     args, unknown = parser.parse_known_args()
     
     random_seed = args.seed
@@ -1541,7 +1575,6 @@ if __name__ == "__main__":
 
     import forward_backward_pass.inference as _inf_mod
     _inf_mod._DEBUG_LEVEL = args.debug_level
-    max_test_batches = args.max_test_batches
 
     # Initialize MPI
     comm = MPI.COMM_WORLD

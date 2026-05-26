@@ -222,6 +222,9 @@ class BaseParams:
     top_weights: int             # Top-k weights by absolute value used per neuron (-1 = all)
     history_size: int = 0        # Output states to keep for history plots
     use_bias: bool = False
+    dataset_file: str | None = None
+    collapse_units: bool = True
+    preserve_exact_times: bool = False
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -231,11 +234,6 @@ class Params(BaseParams): #TODO Make params a file-local subclass of BaseParams 
     Legacy all-in-one params class kept for backwards compatibility.
     Prefer defining a file-local subclass of BaseParams instead.
     """
-    # Neural decoding parameters
-    dataset_file: str | None = None
-    collapse_units: bool = True
-    preserve_exact_times: bool = False
-
     # Additional inference logic parameters
     exploration_rate: float = 0.0
     trace_event_timing: bool = False
@@ -872,6 +870,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'history_size': 0,  # Number of output states to keep for plottingis the l
         'exploration_rate': 0.0,  # Probability of replacing a top-k fired neuron with a random non-top-k non-zero neuron
         'trace_event_timing': False,  # Capture one-batch event timing traces during inference
+        'residual_connections': (),  # Residual skip connections: [(src_layer_idx, dst_layer_idx), ...]
 
         # FPTT parameters
         'cell_type': 'aed',         # "aed" or "minimalrnn"

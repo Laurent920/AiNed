@@ -1,5 +1,6 @@
 import os
 os.environ["JAX_PLATFORMS"] = "cpu"
+import torch
 
 from mpi4py import MPI
 # os.environ["JAX_TRACEBACK_FILTERING"] = "on"
@@ -350,131 +351,85 @@ def layer_computation(params, key, neuron_idx, layer_input, weights, neuron_stat
     return jax.lax.cond(rank == 1, first_hidden, other_hidden, (activations))
 
 #region Forward Pass
-@partial(jax.jit, static_argnames=['params', 'grad',])
+@partial(jax.jit, static_argnames=['params', 'grad'])
 def predict(params, key, weights, empty_neuron_states, batch_data: jnp.ndarray, grad=False):
     '''
     MLP inference, each layer sends each event separately in the format: (index, value)
     -1 means end of data from previous layer
-    -2 means placeholder data in the input layer 
+    -2 means placeholder data in the input layer
     '''
-    @jit
-    def input_layer(args):
-        neuron_states, x = args # x is shape (input_layer_size,)
+    def input_layer(x):
         x_p = jnp.array(x)
 
-        # 2 Ways to compute and send the inputs (depending on the dataset one or the other is more efficient) 
-        # TODO: Determine when one is better than the other
-        # @jit
-        # def send_input(i, carry):
-        #     timestep = carry
-        #     data = x_p[i]
-        #     @jit
-        #     def send_data(t):
-        #         # combined = jnp.stack([data[3], data[0], data[1], 1.0]) # Sending format (c, x, y, v)
-        #         combined = data
-
-        #         # jax.debug.print("rank {} sending data {}", rank, combined)
-        #         send(combined, dest=rank+processes_per_layer_global, tag=0, comm=comm)
-        #         return t+1
-            
-        #     timestep = jax.lax.cond(
-        #         jnp.any(data != -2),
-        #         send_data,
-        #         lambda _: timestep,
-        #         operand=timestep
-        #     )
-        #     return timestep
-
-        # # Initial carry: (timestep=0)
-        # iteration = jax.lax.fori_loop(0, x_p.shape[0], send_input, (0))
-        #________________________________________________________________________________
         if params.shuffle_input:
             perm = jax.random.permutation(key, x_p.shape[0])
             x_p = x_p[perm]
-            
+
         def send_input(i, carry):
-            count = carry
-            data = x_p[i]
-            send(data, dest=rank+processes_per_layer_global, tag=0, comm=comm)
-            # jax.debug.print("rank {} sending data {}", rank, data)
+            mpi_config.forward_send(x_p[i])
             return i
 
-        def first_not_minus2(row):
-            return (row != -2)
-        mask = jax.vmap(first_not_minus2)(x_p)
-        loop_iterations = (jnp.count_nonzero(mask)/2).astype(int)
+        mask = (x_p != -2)
+        loop_iterations = (jnp.count_nonzero(mask) / 2).astype(int)
+        iteration = jax.lax.fori_loop(0, loop_iterations, send_input, 0)
 
-        iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
+        mpi_config.forward_send(END_SIGNAL)
+        return iteration, jnp.zeros((BUFFER_SIZE, 2))
 
-        # Send end signal
-        send(END_SIGNAL, dest=rank+processes_per_layer_global, tag=0, comm=comm)
+    def other_layers(neuron_states):
+        def cond(state):
+            _, _, finished, _, _ = state
+            return finished < mpi_config.nb_previous
 
-        return jnp.zeros(()), neuron_states, iteration, jnp.zeros((BUFFER_SIZE, 2))
-    
-    @jit
-    def other_layers(args):
-        neuron_states, _ = args
-        def cond(state): # end of input has been reached -> break the while loop
-            _, _, neuron_idx, _, _= state            
-            return neuron_idx != -1
-        @jit
         def forward_pass(state):
-            layer_input, neuron_states, neuron_idx, iteration, buffer = state
-            @jit
-            def hidden_layers(args): # Send activation to the next layers
-                loop_iterations, activated_output = args
-                @jit
-                def send_activation(i, _):
-                    out_val = activated_output[i]
-                    send(out_val, dest=rank+processes_per_layer_global, tag=0, comm=comm)
+            layer_input, neuron_states, finished, iteration, buffer = state
+
+            def send_activations(loop_iterations, activated_output):
+                def send_one(i, _):
+                    mpi_config.forward_send(activated_output[i])
                     return None
-                jax.lax.fori_loop(0, loop_iterations, send_activation, None)
-                
-                return None
-            
-            # Receive neuron values from previous layers and compute the activations
-            (neuron_idx, layer_input) = recv(jnp.zeros((2,)), source=rank-processes_per_layer_global, tag=0, comm=comm)
-            loop_iterations, activated_output, new_neuron_states= layer_computation(params, key, neuron_idx.astype(int), layer_input, weights, neuron_states, iteration, grad)
-            
-            # buffer = jax.lax.cond(
-            #     iteration < BUFFER_SIZE,
-            #     lambda: buffer.at[iteration].set(jnp.array([(neuron_idx, layer_input)]).flatten()),
-            #     lambda: buffer,  # don't update if already have 100
-            # )
-            neuron_states = new_neuron_states
-            
-            jax.lax.cond(layer_idx == last_layer, lambda _: None, hidden_layers, (loop_iterations, activated_output)) # Don't send if we reach the last layer
-            return layer_input, neuron_states, neuron_idx, iteration+1, buffer
-        
-        neuron_idx = 0
+                jax.lax.fori_loop(0, loop_iterations, send_one, None)
+
+            received = mpi_config.forward_recv(2)
+            neuron_idx, layer_input = received[0], received[1]
+            neuron_idx = neuron_idx.astype(jnp.int32)
+
+            neg_idx = neuron_idx == -1
+            finished = jax.lax.cond(neg_idx, lambda _: finished + 1, lambda _: finished, operand=None)
+            iteration = jax.lax.cond(neg_idx, lambda _: iteration, lambda _: iteration + 1, operand=None)
+
+            loop_iterations, activated_output, new_neuron_states = layer_computation(
+                params, key, neuron_idx, layer_input, weights, neuron_states, iteration, grad)
+
+            if layer_idx != last_layer:
+                send_activations(loop_iterations, activated_output)
+
+            return layer_input, new_neuron_states, finished, iteration, buffer
+
+        finished = jnp.array(0)
         layer_input = jnp.zeros(())
-        initial_state = (layer_input, neuron_states, neuron_idx, 0, jnp.zeros((BUFFER_SIZE, 2)))
-        
-        # Loop until the rank receives a -1 neuron_idx
-        layer_input, neuron_states, neuron_idx, iteration, buffer = jax.lax.while_loop(cond, forward_pass, initial_state)
+        initial_state = (layer_input, neuron_states, finished, 0, jnp.zeros((BUFFER_SIZE, 2)))
+        layer_input, neuron_states, finished, iteration, buffer = jax.lax.while_loop(cond, forward_pass, initial_state)
 
-        # Send -1 to the next rank when all incoming data has been processed
-        jax.lax.cond(
-            layer_idx != last_layer,
-            lambda _: send(END_SIGNAL, dest=rank + processes_per_layer_global, tag=0, comm=comm),
-            lambda _: [],
-            operand=None
-        )
-        return layer_input, neuron_states, iteration-1, buffer
+        if layer_idx != last_layer:
+            mpi_config.forward_send(END_SIGNAL, iteration)
 
-    # Loop over batches, accumulate output values and return them
+        return layer_input, neuron_states, iteration - mpi_config.nb_previous, buffer
+
     @jit
     def loop_over_batches(_, x):
         neuron_states = empty_neuron_states
-        layer_input, new_neuron_states, iterations, buffer = jax.lax.cond(layer_idx==0, input_layer, other_layers, (neuron_states, x))
-        
+        if layer_idx == 0:
+            iterations, buffer = input_layer(x)
+            new_neuron_states = neuron_states
+        else:
+            _, new_neuron_states, iterations, buffer = other_layers(neuron_states)
+        mpi4jax.barrier(comm=mpi_config.comm)
         return None, (new_neuron_states.values, iterations, new_neuron_states, buffer)
-    
-    _, (all_outputs, all_iterations, all_neuron_states, buffer) = jax.lax.scan(loop_over_batches, None, batch_data)
-    
-    # Synchronize all ranks before starting the backward pass
-    mpi4jax.barrier(comm=comm)
 
+    _, (all_outputs, all_iterations, all_neuron_states, buffer) = jax.lax.scan(loop_over_batches, None, batch_data)
+
+    mpi4jax.barrier(comm=mpi_config.comm)
     return all_outputs, all_iterations, all_neuron_states, buffer
 
 #region Training helpers
@@ -1199,35 +1154,26 @@ def minimalrnn_layer_computation(params, key, neuron_idx, layer_input,
     W_gate = rnn_weights['W_gate']  # (2*H, H)
     b_gate = rnn_weights['b_gate']  # (H,)
     h_prev = neuron_states.h_state  # (H,)
-    th = neuron_states.threshold    # (H,) per-neuron threshold, initialized to 0
     H = h_prev.shape[0]
 
     invalid_idx = neuron_idx < 0
 
-    # Candidate: z_t = tanh(relu(phi_pre))
-    # Use safe indexing: clamp neuron_idx to 0 when invalid (END_SIGNAL) to avoid OOB,
-    # then zero out with jnp.where — no lax.cond needed.
+    # z_t = tanh(value * W_phi[idx] + b_phi), zeroed on END_SIGNAL
     safe_idx = jnp.where(invalid_idx, 0, neuron_idx)
     phi_pre_unclamped = layer_input * W_phi[safe_idx] + b_phi
     phi_pre = jnp.where(invalid_idx, jnp.zeros(H), phi_pre_unclamped)
-    z_t = jnp.tanh(jax.nn.relu(phi_pre))
+    z_t = jnp.tanh(phi_pre)
 
-    # Spike mask and sparse output from previous state
-    s_prev = (h_prev > th).astype(jnp.float32)   # H(h_prev - th), STE in backward
-    y_prev = h_prev * s_prev                       # sparse previous output
+    # Gate: u = sigmoid([h_prev, z_t] @ W_gate + b_gate)  — matches FPTTMinimalRNNAED
+    cat_hz = jnp.concatenate([h_prev, z_t])        # (2*H,)
+    u_t = jax.nn.sigmoid(jnp.dot(cat_hz, W_gate) + b_gate)
 
-    # Gate uses y_prev instead of h_prev
-    cat_yz = jnp.concatenate([y_prev, z_t])        # (2*H,)
-    u_t = jax.nn.sigmoid(jnp.dot(cat_yz, W_gate) + b_gate)
-
-    # State update with threshold subtraction term
-    # Pass-through on END_SIGNAL: h_new = h_prev when invalid
-    h_new_unclamped = u_t * h_prev + (1.0 - u_t) * z_t - s_prev * th
+    # State update, pass-through on END_SIGNAL
+    h_new_unclamped = u_t * h_prev + (1.0 - u_t) * z_t
     h_new = jnp.where(invalid_idx, h_prev, h_new_unclamped)
 
-    # Current spike mask and output
-    s_t = (h_new > th).astype(jnp.float32)        # H(h_t - th)
-    y_t = h_new * s_t                              # sparse output
+    # Output: relu(h_new) — matches FPTTMinimalRNNAED
+    y_t = jax.nn.relu(h_new)
 
     # Apply sync_rate
     sync_fire = (iteration - neuron_states.last_sent_iteration >= neuron_states.sync_rate_vector).astype(jnp.int32)
@@ -1243,8 +1189,6 @@ def minimalrnn_layer_computation(params, key, neuron_idx, layer_input,
 
     # Gradient trace storage — skip END_SIGNAL events (neuron_idx < 0).
     # Use unconditional masked stores (no jax.lax.cond) — avoids branch overhead in while_loop.
-    # At th=0: s_prev = (y_prev > 0), s_t = (h_new > 0) — recomputed in backward, not stored.
-    # Trace buffers: all_z, all_u, all_h_prev (y_prev), all_h_new, all_neuron_idx, all_value (6 total).
     if grad:
         trace_idx = neuron_states.trace_index
         valid_event = ~invalid_idx                   # True for real events, False for END_SIGNAL
@@ -1257,9 +1201,7 @@ def minimalrnn_layer_computation(params, key, neuron_idx, layer_input,
 
         new_all_z          = masked_set(neuron_states.all_z,          z_t)
         new_all_u          = masked_set(neuron_states.all_u,          u_t)
-        new_all_h_prev     = masked_set(neuron_states.all_h_prev,     y_prev)   # stores y_prev (=relu(h_prev) at th=0)
-        # Note: all_s_prev NOT stored — at th=0, s_prev = (y_prev > 0) is recomputed in backward.
-        # Note: all_fired NOT stored — at th=0, s_t = (h_new > 0). Recomputed in backward from u, y_prev, z.
+        new_all_h_prev     = masked_set(neuron_states.all_h_prev,     h_prev)   # stores h_prev
         new_all_neuron_idx = masked_set(neuron_states.all_neuron_idx, jnp.where(valid_event, neuron_idx, neuron_states.all_neuron_idx[trace_idx]))
         new_all_value      = masked_set(neuron_states.all_value,      layer_input)
         # Store h_new directly so backward can reconstruct s_t = (h_new > 0)
@@ -1315,59 +1257,66 @@ def input_layer_one_sample(neuron_states, x, key):
 @partial(jax.jit, static_argnames=['params', 'grad'])
 def hidden_layer_one_sample(params, key, rnn_weights, neuron_states, grad=False):
     """Process one sample's chunk events (hidden layer). JIT-compiled, called in Python loop."""
+    H_size = neuron_states.h_state.shape[0]
 
+    # State: (layer_input, neuron_states, neuron_idx, iteration, relu_sum)
+    # relu_sum is only meaningful for the last hidden layer dense-output branch.
     def cond(state):
-        _, _, neuron_idx, _ = state
+        _, _, neuron_idx, _, _ = state
         return neuron_idx != -1
 
     if layer_idx < last_layer - 1:
-        # Intermediate hidden layer: forward events to next hidden layer
+        # Intermediate hidden layer: forward top-k events to next hidden layer
         def forward_pass(state):
-            layer_input, neuron_states, neuron_idx, iteration = state
+            layer_input, neuron_states, neuron_idx, iteration, relu_sum = state
             (neuron_idx, layer_input) = recv(
                 jnp.zeros((2,)), source=rank - processes_per_layer_global, tag=0, comm=comm)
             loop_iterations, activated_output, new_neuron_states = minimalrnn_layer_computation(
                 params, key, neuron_idx.astype(int), layer_input,
                 rnn_weights, neuron_states, iteration, grad)
-            neuron_states = new_neuron_states
             def send_one(i, _carry):
                 send(activated_output[i], dest=rank + processes_per_layer_global, tag=0, comm=comm)
                 return _carry
             jax.lax.fori_loop(0, loop_iterations, send_one, None)
-            return layer_input, neuron_states, neuron_idx, iteration + 1
+            return layer_input, new_neuron_states, neuron_idx, iteration + 1, relu_sum
 
     elif params.fptt_relu_output:
-        # Last hidden layer, event-based output: send relu events to output layer
+        # Last hidden layer, event-based output: send relu top-k events to output layer
         def forward_pass(state):
-            layer_input, neuron_states, neuron_idx, iteration = state
+            layer_input, neuron_states, neuron_idx, iteration, relu_sum = state
             (neuron_idx, layer_input) = recv(
                 jnp.zeros((2,)), source=rank - processes_per_layer_global, tag=0, comm=comm)
             loop_iterations, activated_output, new_neuron_states = minimalrnn_layer_computation(
                 params, key, neuron_idx.astype(int), layer_input,
                 rnn_weights, neuron_states, iteration, grad)
-            neuron_states = new_neuron_states
             def send_one(i, _carry):
                 send(activated_output[i], dest=rank + processes_per_layer_global, tag=0, comm=comm)
                 return _carry
             jax.lax.fori_loop(0, loop_iterations, send_one, None)
-            return layer_input, neuron_states, neuron_idx, iteration + 1
+            return layer_input, new_neuron_states, neuron_idx, iteration + 1, relu_sum
 
     else:
-        # Last hidden layer, dense output: no forwarding (h_final sent at chunk end)
+        # Last hidden layer, dense output: accumulate keep_top_k(relu(h_t), firing_nb) per
+        # timestep. Matches FPTTMinimalRNNAED.forward_chunk:
+        #   o_last_total += keep_top_k(relu(h_t), firing_nb)  (not the full relu vector).
+        # For dense checkpoints (firing_nb > H) keep_top_k is a no-op.
+        _k_out = params.firing_nb if isinstance(params.firing_nb, int) else params.firing_nb[layer_idx]
         def forward_pass(state):
-            layer_input, neuron_states, neuron_idx, iteration = state
+            layer_input, neuron_states, neuron_idx, iteration, relu_sum = state
             (neuron_idx, layer_input) = recv(
                 jnp.zeros((2,)), source=rank - processes_per_layer_global, tag=0, comm=comm)
             loop_iterations, activated_output, new_neuron_states = minimalrnn_layer_computation(
                 params, key, neuron_idx.astype(int), layer_input,
                 rnn_weights, neuron_states, iteration, grad)
-            neuron_states = new_neuron_states
-            return layer_input, neuron_states, neuron_idx, iteration + 1
+            valid = (neuron_idx >= 0).astype(jnp.float32)
+            relu_sum = relu_sum + keep_top_k(jax.nn.relu(new_neuron_states.h_state), _k_out) * valid
+            return layer_input, new_neuron_states, neuron_idx, iteration + 1, relu_sum
 
     layer_input = jnp.zeros(())
-    initial_state = (layer_input, neuron_states, jnp.array(0.0, dtype=jnp.float32), 0)
+    relu_sum_init = jnp.zeros(H_size)
+    initial_state = (layer_input, neuron_states, jnp.array(0.0, dtype=jnp.float32), 0, relu_sum_init)
 
-    layer_input, neuron_states, neuron_idx, iteration = jax.lax.while_loop(
+    layer_input, neuron_states, neuron_idx, iteration, relu_sum = jax.lax.while_loop(
         cond, forward_pass, initial_state)
 
     # Send chunk-end signal after while_loop
@@ -1376,7 +1325,7 @@ def hidden_layer_one_sample(params, key, rnn_weights, neuron_states, grad=False)
     elif layer_idx < last_layer - 1:
         send(END_SIGNAL, dest=rank + processes_per_layer_global, tag=0, comm=comm)
 
-    return neuron_states, iteration - 1
+    return neuron_states, iteration - 1, relu_sum
 
 
 @partial(jax.jit, static_argnames=['params', 'grad'])
@@ -1400,14 +1349,15 @@ def predict_chunk(params, key, rnn_weights, empty_neuron_states,
         neuron_states = empty_neuron_states.replace(h_state=h_init)
         if layer_idx == 0:
             new_ns, iters = input_layer_one_sample(neuron_states, x_chunk, key)
+            relu_sum = jnp.zeros_like(h_init)
         else:
-            new_ns, iters = hidden_layer_one_sample(params, key, rnn_weights, neuron_states, grad)
-        return None, (new_ns.h_state, iters, new_ns)
+            new_ns, iters, relu_sum = hidden_layer_one_sample(params, key, rnn_weights, neuron_states, grad)
+        return None, (new_ns.h_state, iters, new_ns, relu_sum)
 
-    _, (all_h_finals, all_iterations, all_neuron_states) = jax.lax.scan(
+    _, (all_h_finals, all_iterations, all_neuron_states, all_relu_sums) = jax.lax.scan(
         loop_over_batches, None, (batch_chunk_data, initial_h_states))
 
-    return all_h_finals, all_iterations, all_neuron_states
+    return all_h_finals, all_iterations, all_neuron_states, all_relu_sums
 
 
 # ---------------------------------------------------------------------------
@@ -1723,6 +1673,225 @@ def init_minimalrnn_weights(key, input_dim, hidden_dim):
     }
 
 
+def _validate_checkpoint_shape(sd, layer_sizes, pt_path):
+    """Raise ValueError if the checkpoint architecture doesn't match layer_sizes."""
+    n_hidden_ckpt = 1 + len([k for k in sd if k.startswith('W_phi_layers') and k.endswith('.weight')])
+    n_hidden_cfg  = len(layer_sizes) - 2  # exclude input and output layers
+    if n_hidden_ckpt != n_hidden_cfg:
+        raise ValueError(
+            f"Checkpoint '{pt_path}' has {n_hidden_ckpt} hidden layer(s) "
+            f"but config layer_sizes {list(layer_sizes)} requires {n_hidden_cfg}. "
+            f"Use mpirun -n {n_hidden_ckpt + 2} and matching layer_sizes."
+        )
+    H_ckpt = sd['W_phi'].shape[1]
+    for li in range(1, len(layer_sizes) - 1):
+        H_cfg = layer_sizes[li]
+        if H_cfg != H_ckpt:
+            raise ValueError(
+                f"Checkpoint '{pt_path}' has hidden size H={H_ckpt} "
+                f"but layer_sizes[{li}]={H_cfg}."
+            )
+    n_classes_ckpt = sd['W_out'].shape[1]
+    n_classes_cfg  = layer_sizes[-1]
+    if n_classes_ckpt != n_classes_cfg:
+        raise ValueError(
+            f"Checkpoint '{pt_path}' has {n_classes_ckpt} output classes "
+            f"but layer_sizes[-1]={n_classes_cfg}."
+        )
+
+
+def load_minimalrnn_aed_weights(pt_path, layer_idx, layer_sizes):
+    """
+    Load FPTTMinimalRNNAED weights from a .pt checkpoint into the JAX rnn_weights dict.
+
+    Layer 0 (first hidden, layer_idx=1):
+        W_phi:  state_dict['W_phi']        (n_input, H)
+        b_phi:  state_dict['b_phi']        (H,)
+        W_gate: state_dict['W_gate']       (2H, H)
+        b_gate: state_dict['b_gate']       (H,)
+
+    Layer l (deeper hidden, layer_idx >= 2):
+        W_phi:  state_dict['W_phi_layers.{l-1}.weight'].T   (H_in, H_out) after transpose
+        b_phi:  state_dict['W_phi_layers.{l-1}.bias']       (H,)
+        W_gate: state_dict['W_gate_layers.{l-1}.weight'].T  (2H, H) after transpose
+        b_gate: state_dict['W_gate_layers.{l-1}.bias']      (H,)
+
+    Returns rnn_weights dict, or {} for input/output layers.
+    """
+    last = len(layer_sizes) - 1
+    if layer_idx == 0 or layer_idx == last:
+        return {}
+
+    ckpt = torch.load(pt_path, map_location='cpu', weights_only=False)
+    sd = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+    _validate_checkpoint_shape(sd, layer_sizes, pt_path)
+
+    hidden_layer_idx = layer_idx - 1  # 0-based index into hidden layers
+
+    if hidden_layer_idx == 0:
+        W_phi  = jnp.array(sd['W_phi'].numpy())           # (n_input, H)
+        b_phi  = jnp.array(sd['b_phi'].numpy())           # (H,)
+        W_gate = jnp.array(sd['W_gate'].numpy())          # (2H, H)
+        b_gate = jnp.array(sd['b_gate'].numpy())          # (H,)
+    else:
+        l = hidden_layer_idx - 1  # index into W_phi_layers / W_gate_layers
+        # nn.Linear stores weight as (out, in); we need (in, out) for dot(input, W)
+        W_phi  = jnp.array(sd[f'W_phi_layers.{l}.weight'].numpy().T)   # (H_in, H_out)
+        b_phi  = jnp.array(sd[f'W_phi_layers.{l}.bias'].numpy())       # (H,)
+        W_gate = jnp.array(sd[f'W_gate_layers.{l}.weight'].numpy().T)  # (2H, H)
+        b_gate = jnp.array(sd[f'W_gate_layers.{l}.bias'].numpy())      # (H,)
+
+    return {'W_phi': W_phi, 'b_phi': b_phi, 'W_gate': W_gate, 'b_gate': b_gate}
+
+
+def load_minimalrnn_aed_output_weights(pt_path, layer_sizes):
+    """Load W_out from a .pt checkpoint as a JAX array (H, n_classes)."""
+    ckpt = torch.load(pt_path, map_location='cpu', weights_only=False)
+    sd = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+    _validate_checkpoint_shape(sd, layer_sizes, pt_path)
+    return jnp.array(sd['W_out'].numpy())  # (H, n_classes)
+
+
+# ---------------------------------------------------------------------------
+# MinimalRNN inference (no gradients, no weight updates)
+# ---------------------------------------------------------------------------
+def batch_predict_minimalrnn(params: Params, key, total_batches, rnn_weights, weights, empty_neuron_states, dataset="test", save=True, debug=True):
+    """
+    Inference-only forward pass for MinimalRNN (cell_type='minimalrnn').
+    Mirrors train_fptt's forward pass without gradients or weight updates.
+    Output layer sends a zero gradient backward so hidden layers stay in sync.
+    """
+    global test_generator, validation_generator, training_generator
+
+    mpi4jax.barrier(comm=comm)
+    start_time = time.time()
+
+    n_classes = params.layer_sizes[-1]
+    H_hidden = params.layer_sizes[last_layer - 1]
+    P = params.fptt_parts
+    accumulate_logits = params.fptt_accumulate_logits
+    avg_logits = params.fptt_avg_logits
+
+    H = params.layer_sizes[layer_idx] if (layer_idx > 0 and layer_idx != last_layer) else 0
+
+    if dataset == "test":
+        total_batches_n = total_batches[2]
+        if layer_idx == 0:
+            batch_iterator = iter(test_generator) if rank == 0 else None
+    elif dataset == "val":
+        total_batches_n = total_batches[1]
+        if layer_idx == 0:
+            batch_iterator = iter(validation_generator) if rank == 0 else None
+    else:
+        total_batches_n = total_batches[0]
+        if layer_idx == 0:
+            batch_iterator = iter(training_generator) if rank == 0 else None
+
+    epoch_correct = 0
+    epoch_total = 0
+    all_iteration_mean = []
+
+    for i in tqdm(range(total_batches_n), disable=TQDM_DISABLE):
+        if layer_idx == 0:
+            batch_x, batch_y = mpi_config.split_batch(params, batch_iterator, 2)
+            mpi_config.send_labels(batch_y, mpi_config.batch_first_and_last_rank[0])
+        if layer_idx == last_layer:
+            y = mpi_config.recv_labels()
+
+        if layer_idx > 0 and layer_idx != last_layer:
+            h_states = jnp.zeros((batch_part_size, H))
+        else:
+            h_states = jnp.zeros((batch_part_size, 1))
+
+        T = params.max_nonzero
+        step = T // P
+        _P = P if P * step >= T else P + 1
+
+        if layer_idx == last_layer and accumulate_logits:
+            accumulated_logits = jnp.zeros((batch_part_size, n_classes))
+
+        key, subkey = jax.random.split(key)
+
+        for p in range(_P):
+            start_t = p * step
+            end_t = min(start_t + step, T)
+            if start_t >= T:
+                break
+            chunk_len = end_t - start_t
+
+            if layer_idx == last_layer:
+                if params.fptt_relu_output:
+                    chunk_logits, _, _ = output_layer_recv_events_batch(
+                        weights, batch_part_size, n_classes, H_hidden)
+                else:
+                    relu_sum = recv(jnp.zeros((batch_part_size, H_hidden)),
+                                    source=rank - processes_per_layer_global, tag=3, comm=comm)
+                    chunk_logits = jnp.dot(relu_sum, weights)
+
+                if accumulate_logits:
+                    accumulated_logits = accumulated_logits + chunk_logits
+                    logits = accumulated_logits / (p + 1) if avg_logits else accumulated_logits
+                else:
+                    logits = chunk_logits
+
+                # Send zero gradient backward so hidden layers stay in sync
+                mpi_config.backward_send(jnp.zeros((batch_part_size, H_hidden)))
+
+            elif layer_idx > 0:
+                chunk_data = jnp.zeros((batch_part_size, chunk_len, 2))
+                all_h_finals, _, _, all_relu_sums = predict_chunk(
+                    params, subkey, rnn_weights, empty_neuron_states,
+                    chunk_data, h_states, grad=False)
+
+                if layer_idx == last_layer - 1 and not params.fptt_relu_output:
+                    send(all_relu_sums, dest=rank + processes_per_layer_global, tag=3, comm=comm)
+
+                # Receive (and discard) the zero gradient from next layer
+                mpi_config.backward_recv()
+                if layer_idx > 1:
+                    mpi_config.backward_send(jnp.zeros((batch_part_size, params.layer_sizes[layer_idx - 1])))
+
+                h_states = all_h_finals
+
+            else:
+                chunk_data = jnp.array(batch_x[:, start_t:end_t, :])
+                predict_chunk(params, subkey, rnn_weights, empty_neuron_states,
+                              chunk_data, h_states, grad=False)
+
+            mpi4jax.barrier(comm=comm)
+
+        if layer_idx == last_layer:
+            # Normalise by n_real_events (= max_nonzero for dense sequences like smnist)
+            # matching FPTTMinimalRNNAED.forward_chunk which divides logits by n_real_events
+            norm = float(params.max_nonzero)
+            preds = jnp.argmax(logits / norm, axis=-1)
+            epoch_correct += int(jnp.sum(preds == y.astype(int)))
+            epoch_total += batch_part_size
+
+    end_time = time.time()
+    epoch_accuracy = epoch_correct / epoch_total if epoch_total > 0 else 0.0
+
+    if layer_idx == last_layer and rank == mpi_config.get_last_layer_batch_leader:
+        print(f"[MinimalRNN inference] {dataset} accuracy: {epoch_accuracy:.4f}")
+        if debug:
+            print(f"Execution Time: {end_time - start_time:.2f}s")
+
+    if save and layer_idx == last_layer:
+        weights_dict = {"W_out": np.array(weights).tolist()}
+        store_training_data(
+            params.layer_sizes, params, "inference",
+            [-1], [-1], epoch_accuracy,
+            end_time - start_time, [0], weights_dict, [], {}, "",
+            "RNN",
+            extra_fields={
+                "cell_type": params.cell_type,
+                "fptt_parts": params.fptt_parts,
+                "fptt_relu_output": params.fptt_relu_output,
+            })
+
+    return epoch_accuracy
+
+
 # ---------------------------------------------------------------------------
 # FPTT training loop for MinimalRNN
 # ---------------------------------------------------------------------------
@@ -1868,11 +2037,11 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                             weights, batch_part_size, n_classes, H_hidden)
                         output_iters += int(n_events)
                     else:
-                        # Receive dense h_final vector (tag=3)
-                        h_final = recv(jnp.zeros((batch_part_size, H_hidden)),
-                                       source=rank - processes_per_layer_global, tag=3, comm=comm)
+                        # Receive relu_sum = Σ_t relu(h_t) from last hidden layer (tag=3)
+                        relu_sum = recv(jnp.zeros((batch_part_size, H_hidden)),
+                                        source=rank - processes_per_layer_global, tag=3, comm=comm)
                         output_iters += H_hidden
-                        chunk_logits = jnp.dot(h_final, weights)  # (B, C)
+                        chunk_logits = jnp.dot(relu_sum, weights)  # (B, C)
 
                     if accumulate_logits:
                         accumulated_logits = accumulated_logits + chunk_logits
@@ -1902,8 +2071,8 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                         # sparse_inputs: (B, H_hidden), d_logits: (B, C)
                         weight_grad = jnp.dot(sparse_inputs.T, d_logits)  # (H_hidden, C)
                     else:
-                        # dL/dW = h_final.T @ d_logits
-                        weight_grad = jnp.dot(h_final.T, d_logits)  # (H_hidden, C)
+                        # dL/dW = relu_sum.T @ d_logits
+                        weight_grad = jnp.dot(relu_sum.T, d_logits)  # (H_hidden, C)
 
                     weight_grad = mpi_config.combine_batch_avg(jnp.expand_dims(weight_grad, axis=0))
 
@@ -1936,17 +2105,17 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                     chunk_data = jnp.zeros((batch_part_size, chunk_len, 2))  # dummy
 
                     # Forward pass
-                    all_h_finals, all_iters, all_ns = predict_chunk(
+                    all_h_finals, all_iters, all_ns, all_relu_sums = predict_chunk(
                         params, subkey, rnn_weights, empty_neuron_states,
                         chunk_data, h_states, grad=True)
 
                     batch_iters = batch_iters + all_iters  # accumulate across chunks
 
-                    # Only the last hidden layer sends h_final to the output layer (tag=3),
-                    # but only when NOT using event-based output (fptt_relu_output=False).
+                    # Only the last hidden layer sends relu_sum to the output layer (tag=3).
+                    # relu_sum = Σ_t relu(h_t) over the chunk; output computes relu_sum @ W_out.
                     # When fptt_relu_output=True, events were already sent during forward pass.
                     if layer_idx == last_layer - 1 and not params.fptt_relu_output:
-                        send(all_h_finals, dest=rank + processes_per_layer_global, tag=3, comm=comm)
+                        send(all_relu_sums, dest=rank + processes_per_layer_global, tag=3, comm=comm)
 
                     # Receive gradient from next layer (output layer or next hidden layer).
                     # The next layer sends dL/d(this layer's h_state) with shape (B, H_this).
@@ -2007,7 +2176,7 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                 else:
                     # --- Input layer: run forward pass (sends events to hidden) ---
                     chunk_data = jnp.array(batch_x[:, start_t:end_t, :])
-                    _, all_iters, _ = predict_chunk(
+                    _, all_iters, _, _ = predict_chunk(
                         params, subkey, rnn_weights, empty_neuron_states,
                         chunk_data, h_states, grad=False)
                     batch_iters = batch_iters + all_iters  # accumulate across chunks
@@ -2078,9 +2247,9 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                         chunk_logits, _, _ = output_layer_recv_events_batch(
                             weights, batch_part_size, n_classes, H_hidden)
                     else:
-                        h_final = recv(jnp.zeros((batch_part_size, H_hidden)),
-                                       source=rank - processes_per_layer_global, tag=3, comm=comm)
-                        chunk_logits = jnp.dot(h_final, weights)
+                        relu_sum_val = recv(jnp.zeros((batch_part_size, H_hidden)),
+                                            source=rank - processes_per_layer_global, tag=3, comm=comm)
+                        chunk_logits = jnp.dot(relu_sum_val, weights)
                     if accumulate_logits:
                         val_accum_logits = val_accum_logits + chunk_logits
                         val_logits = val_accum_logits / (vp + 1) if avg_logits else val_accum_logits
@@ -2090,13 +2259,12 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                 elif layer_idx > 0:
                     # Hidden layer forward only (no grad)
                     val_chunk = jnp.zeros((batch_part_size, chunk_len, 2))
-                    all_h_final, all_iters, _ = predict_chunk(
+                    all_h_final, all_iters, _, val_relu_sums = predict_chunk(
                         params, key, rnn_weights, empty_neuron_states,
                         val_chunk, val_h, grad=False)
                     val_h = all_h_final
-                    # Only the last hidden layer sends h_final to the output layer (dense mode)
                     if layer_idx == last_layer - 1 and not params.fptt_relu_output:
-                        send(val_h, dest=rank + processes_per_layer_global, tag=3, comm=comm)
+                        send(val_relu_sums, dest=rank + processes_per_layer_global, tag=3, comm=comm)
 
                 else:
                     # Input layer: send chunk events
@@ -2198,12 +2366,11 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                 if start_t >= T:
                     break
                 chunk_data = jnp.zeros((batch_part_size, end_t - start_t, 2))
-                all_h, _, _ = predict_chunk(params, key, rnn_weights, empty_neuron_states,
-                                            chunk_data, h_states_test, grad=False)
+                all_h, _, _, test_relu_sums = predict_chunk(params, key, rnn_weights, empty_neuron_states,
+                                                            chunk_data, h_states_test, grad=False)
                 h_states_test = all_h
-                # Only the last hidden layer sends h_final to the output layer (dense mode)
                 if layer_idx == last_layer - 1 and not params.fptt_relu_output:
-                    send(all_h, dest=rank + processes_per_layer_global, tag=3, comm=comm)
+                    send(test_relu_sums, dest=rank + processes_per_layer_global, tag=3, comm=comm)
             h_states_test = jnp.zeros((batch_part_size, H))
             mpi4jax.barrier(comm=comm)
 
@@ -2225,9 +2392,9 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
                     chunk_logits, _, _ = output_layer_recv_events_batch(
                         weights, batch_part_size, n_classes, H_hidden)
                 else:
-                    h_final = recv(jnp.zeros((batch_part_size, H_hidden)),
-                                   source=rank - processes_per_layer_global, tag=3, comm=comm)
-                    chunk_logits = jnp.dot(h_final, weights)
+                    relu_sum_test = recv(jnp.zeros((batch_part_size, H_hidden)),
+                                        source=rank - processes_per_layer_global, tag=3, comm=comm)
+                    chunk_logits = jnp.dot(relu_sum_test, weights)
                 if accumulate_logits:
                     test_accum_logits = test_accum_logits + chunk_logits
                     test_logits = test_accum_logits / (p + 1) if avg_logits else test_accum_logits
@@ -2286,6 +2453,15 @@ def train_fptt(params: Params, key, total_batches, rnn_weights, weights, empty_n
 
 
 #endregion
+
+
+def _pad_to_layers(seq, layer_sizes, default):
+    """Extend or truncate seq to len(layer_sizes), filling with default."""
+    n = len(layer_sizes)
+    lst = list(seq) if seq is not None else []
+    if len(lst) < n:
+        lst += [default] * (n - len(lst))
+    return lst[:n]
 
 
 def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, config_path=None, data_dir=""):
@@ -2418,12 +2594,12 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             max_nonzero=max_nonzero,
             shuffle_input=config['shuffle_input'],
             threshold_lr=config['threshold_lr'],
-            sparsity_impact=tuple(config['sparsity_impact']),
+            sparsity_impact=tuple(_pad_to_layers(config['sparsity_impact'], layer_sizes, 0.0)),
             w_reg=config['w_reg'],
             rerun="",
             top_weights=config['top_weights'],
             history_size=config['history_size'],
-            recurrence=config['recurrence'],
+            recurrence=tuple(_pad_to_layers(config['recurrence'], layer_sizes, None)),
             use_bias=config['use_bias'],
             use_tanh=config['use_tanh'],
             exact_rtrl=config.get('exact_rtrl', False),
@@ -2508,12 +2684,23 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             n_classes = layer_sizes[-1]
             max_chunk_len = (params.max_nonzero // max(params.fptt_parts, 1)) + 1
 
-            # Initialize MinimalRNN weights (hidden layers only, not output/input)
+            pt_weights_path = config.get('pt_weights_path', None)
+
+            # Initialize or load MinimalRNN weights (hidden layers only, not output/input)
             key, wkey = jax.random.split(key)
             if layer_idx > 0 and layer_idx != last_layer:
                 H = layer_sizes[layer_idx]
                 input_dim = layer_sizes[layer_idx - 1]
-                rnn_weights = init_minimalrnn_weights(wkey, input_dim, H)
+                if pt_weights_path:
+                    rnn_weights = load_minimalrnn_aed_weights(pt_weights_path, layer_idx, layer_sizes)
+                    print(f"Rank {rank}: loaded MinimalRNN weights from {pt_weights_path} for layer {layer_idx}")
+                else:
+                    rnn_weights = init_minimalrnn_weights(wkey, input_dim, H)
+            elif layer_idx == last_layer and pt_weights_path:
+                rnn_weights = {}
+                H = layer_sizes[layer_idx]
+                weights = load_minimalrnn_aed_output_weights(pt_weights_path, layer_sizes)
+                print(f"Rank {rank}: loaded W_out from {pt_weights_path}")
             else:
                 rnn_weights = {}
                 H = layer_sizes[layer_idx]
@@ -2568,8 +2755,11 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             if mode == 'training':
                 train_fptt(params, key, total_batches, rnn_weights, weights,
                            empty_neuron_states_mr, config['optimizer'], trial)
+            elif mode == 'inference':
+                batch_predict_minimalrnn(params, key, total_batches, rnn_weights, weights,
+                                         empty_neuron_states_mr, dataset="test", save=True, debug=True)
             else:
-                print(f"MinimalRNN currently supports training mode only, got {mode}")
+                print(f"Unknown mode for MinimalRNN, choose 'training' or 'inference', got {mode}")
         else:
             # --- Standard AED path ---
             if mode == 'inference':

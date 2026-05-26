@@ -134,6 +134,7 @@ def cifar10_loader_manual(batch_size,
                           shuffle=False,
                           preprocess=True,
                           CNN_preprocess=False,
+                          normalize=True,
                           data_dir="",
                           cache_dir='./cache/cifar10',
                           **_ignored):
@@ -158,7 +159,8 @@ def cifar10_loader_manual(batch_size,
     download_cifar10(dataset_folder)
 
     if preprocess:
-        cache_dir += "/async_CNN" if CNN_preprocess else "/async_MLP_sequential"
+        suffix = "/async_CNN" if CNN_preprocess else "/async_MLP_sequential"
+        cache_dir += suffix if normalize else suffix + "_no_norm"
 
     os.makedirs(cache_dir, exist_ok=True)
     train_cache_path = os.path.join(cache_dir, 'train.npz')
@@ -179,8 +181,9 @@ def cifar10_loader_manual(batch_size,
         cifar_x_test = flatten_row_major(test_raw['x'])
         cifar_y_test = test_raw['y']
 
-        cifar_x = normalize_per_channel(cifar_x)
-        cifar_x_test = normalize_per_channel(cifar_x_test)
+        if normalize:
+            cifar_x = normalize_per_channel(cifar_x)
+            cifar_x_test = normalize_per_channel(cifar_x_test)
 
         if preprocess:
             if CNN_preprocess:

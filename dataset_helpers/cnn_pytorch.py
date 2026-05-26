@@ -17,13 +17,13 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 100
-batch_size = 120
+epochs = 20
+batch_size = 64
 
 dataset = "mnist"
 # dataset = "nmnist"
 # dataset = "ncars"
-# dataset = "cifar10"
+dataset = "cifar10"
 ncars_downsample = False
 
 def get_dataset_config(dataset_name, ncars_downsample=False):
@@ -50,15 +50,21 @@ class SimpleCNN(nn.Module):
 
         # Define your layers
         self.conv1 = nn.Conv2d(1, 3, kernel_size=3, stride=1, padding=1, bias=False)
-        # self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0, ceil_mode=True)
 
         self.conv2 = nn.Conv2d(3, 5, kernel_size=3, stride=1, padding=1, bias=False)
-        # self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0, ceil_mode=True)
         # self.pool2 = nn.AvgPool2d(kernel_size=(2, 2), stride=(2,2), padding=0)
 
+        self.conv3 = nn.Conv2d(5, 5, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool3 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0, ceil_mode=True)
+        
+        self.conv4 = nn.Conv2d(5, 5, kernel_size=3, stride=1, padding=1, bias=False)
+        self.pool4 = nn.MaxPool2d(kernel_size=(2, 2), stride=(2,2), padding=0, ceil_mode=True)
         # self.out = nn.Linear(28*28*3, 10, bias=False)
 
-        self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
+        # self.fc1 = nn.Linear(28 * 28 * 5, 128, bias=False)
+        self.fc1 = nn.Linear(2 * 2 * 5, 128, bias=False)
         # self.fc1 = nn.Linear((14 * 14 * 5), 128, bias=False)
         # self.fc1 = nn.Linear(28 * 28 * 64, 32, bias=False)
         # self.out = nn.Linear(14 * 14 * 5, 10, bias=False)
@@ -78,18 +84,32 @@ class SimpleCNN(nn.Module):
 
         x = F.relu(self.conv1(x))
         self._record_activation("conv1", x)
-        # print(x.shape)
-
-        # x = self.pool1(x)
-        # self._record_activation("pool1", x)
+        
+        x = self.pool1(x)
+        self._record_activation("pool1", x)
         # print(x.shape)
 
         x = F.relu(self.conv2(x))
         self._record_activation("conv2", x)
  
-        # x = self.pool2(x)
-        # self._record_activation("pool2", x)
-        
+        x = self.pool2(x)
+        self._record_activation("pool2", x)
+        # print(x.shape)
+
+        x = F.relu(self.conv3(x))
+        self._record_activation("conv3", x)
+ 
+        x = self.pool3(x)
+        self._record_activation("pool3", x)
+        # print(x.shape)
+
+        x = F.relu(self.conv4(x))
+        self._record_activation("conv4", x)
+ 
+        x = self.pool4(x)
+        self._record_activation("pool4", x)
+        # print(x.shape)
+
         # print(x.shape)
         x = x.view(x.size(0), -1)
         # print(x.shape)
@@ -861,25 +881,33 @@ class VGG8Cifar(nn.Module):
         super(VGG8Cifar, self).__init__()
 
         self.conv1_1 = nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False)
-        # self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False)
         self.pool1   = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.pool1   = nn.AvgPool2d(kernel_size=2, stride=2)
 
         self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        self.conv2_2 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
         self.pool2   = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.conv3_1 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
-        self.pool3   = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.pool2   = nn.AvgPool2d(kernel_size=2, stride=2)
+
+        # self.conv3_1 = nn.Conv2d(128, 128, kernel_size=3, padding=1, bias=False)
+        # self.pool3   = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.pool3   = nn.AvgPool2d(kernel_size=2, stride=2)
         self.conv3_2 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
         self.conv3_3 = nn.Conv2d(256, 256, kernel_size=3, padding=1, bias=False)
-
+        self.pool3   = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # self.pool4   = nn.AvgPool2d(kernel_size=2, stride=2)
 
         self.fc1 = nn.Linear(4 * 4 * 256, 1024, bias=False)
-        self.out = nn.Linear(1024, num_classes, bias=False)
+        # self.fc1 = nn.Linear(2 * 2 * 256, 1024, bias=False)
+        self.fc2 = nn.Linear(1024, 512, bias=False)
+        self.out = nn.Linear(512, num_classes, bias=False)
 
         self.activation_stats = {
             **{
                 name: [] for name, module in self.named_children()
-                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d))
+                if isinstance(module, (nn.Conv2d, nn.Linear, nn.MaxPool2d, nn.AdaptiveAvgPool2d, nn.AvgPool2d))
             },
             "input": []
         }
@@ -890,21 +918,23 @@ class VGG8Cifar(nn.Module):
         self._record_activation("input", x)
 
         x = F.relu(self.conv1_1(x)); self._record_activation("conv1_1", x)
-        # x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
+        x = F.relu(self.conv1_2(x)); self._record_activation("conv1_2", x)
         x = self.pool1(x);           self._record_activation("pool1", x)
 
         x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
-        # x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
         x = self.pool2(x);           self._record_activation("pool2", x)
 
-        x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
-        x = self.pool3(x);           self._record_activation("pool3", x)
+        # x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
+        # x = self.pool3(x);           self._record_activation("pool3", x)
         x = F.relu(self.conv3_2(x)); self._record_activation("conv3_2", x)
         x = F.relu(self.conv3_3(x)); self._record_activation("conv3_3", x)
+        x = F.relu(self.pool3(x)); self._record_activation("pool3", x)
 
 
         x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x)); self._record_activation("fc1", x)
+        x = F.relu(self.fc2(x)); self._record_activation("fc2", x)
         x = self.out(x);         self._record_activation("out", x)
         return x
 
@@ -932,16 +962,16 @@ def prepare_inputs(inputs, device):
     return t.to(device)
 
 
-def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0001):
+def train_model(train_loader, val_loader, test_loader, total_train_batches, total_val_batches, total_test_batches, device, epochs=10, lr=0.0005):
     if dataset == "mnist":
         # Choose one:
-        # model = SimpleCNN().to(device)
+        model = SimpleCNN().to(device)
         # model = LeNet5().to(device)
 
         # model = VGG16(num_classes=10, in_channels=1).to(device)
         # model = VGG8(num_classes=10, in_channels=1).to(device)
         # model = VGG8Light(num_classes=10, in_channels=1).to(device)
-        model = ResNet8(num_classes=10, in_channels=1).to(device)
+        # model = ResNet8(num_classes=10, in_channels=1).to(device)
     elif dataset == "nmnist":
         # Choose one:
         # model = NmnistCNN().to(device)
@@ -952,10 +982,10 @@ def train_model(train_loader, val_loader, test_loader, total_train_batches, tota
         # model = AdaptiveEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
         model = SmallEventCNN(num_classes=num_classes, in_channels=input_shape[0]).to(device)
     elif dataset == "cifar10":
-        # model = VGG8Cifar(num_classes=10, in_channels=3).to(device)
-        model = ResNet8(num_classes=10, in_channels=3).to(device)
+        model = VGG8Cifar(num_classes=10, in_channels=3).to(device)
+        # model = ResNet8(num_classes=10, in_channels=3).to(device)
         # model = ResNet20(num_classes=10, in_channels=3).to(device)
-        lr = 0.001
+        lr = 0.0002
     else:
         print("Wrong dataset")
         return
@@ -1133,6 +1163,272 @@ def evaluate(model, loader, total_batches, device):
 
 
 # ==========================================================
+# region CIFAR-10 CONFIG SEARCH (no BN, target >= 80%)
+# ==========================================================
+
+def _collect_loader(loader):
+    """Drain a custom DataLoader into (x, y) numpy arrays."""
+    xs, ys = [], []
+    for x, y in loader:
+        xs.append(np.array(x, dtype=np.float32))
+        ys.append(np.array(y, dtype=np.int64))
+    return np.concatenate(xs, 0), np.concatenate(ys, 0)
+
+
+def load_cifar10_nchw():
+    """Return (tr_x, tr_y, val_x, val_y, te_x, te_y) as (N,C,H,W) float32 numpy arrays."""
+    (tr, _), (val, _), (te, _), _ = cifar10_loader_manual(
+        batch_size=5000, shuffle=False, preprocess=False, normalize=True
+    )
+    def to_nchw(x):  # flat (N, H*W*C) HWC -> (N, C, H, W)
+        return x.reshape(-1, 32, 32, 3).transpose(0, 3, 1, 2)
+
+    tr_x, tr_y   = _collect_loader(tr)
+    val_x, val_y = _collect_loader(val)
+    te_x, te_y   = _collect_loader(te)
+    return to_nchw(tr_x), tr_y, to_nchw(val_x), val_y, to_nchw(te_x), te_y
+
+
+def augment_train_batch(x):
+    """x: (N, C, H, W) torch tensor. Returns random-cropped + h-flipped tensor."""
+    N, C, H, W = x.shape
+    device = x.device
+    x = x.clone()
+    # Random horizontal flip
+    flip = torch.rand(N, device=device) > 0.5
+    x[flip] = x[flip].flip(dims=[-1])
+    # Pad 4px each side, then random 32x32 crop (8 possible offsets)
+    padded = F.pad(x, [4, 4, 4, 4], mode='reflect')
+    crops = torch.empty_like(x)
+    for i in range(N):
+        t = torch.randint(0, 9, ()).item()
+        l = torch.randint(0, 9, ()).item()
+        crops[i] = padded[i, :, t:t+H, l:l+W]
+    return crops
+
+
+class VGG8CifarSearch(nn.Module):
+    """Configurable VGG8-style for CIFAR-10. No BN. 3 conv blocks + optional dropout/GAP."""
+
+    def __init__(self, num_classes=10, in_channels=3,
+                 channels=(64, 128, 256), pool_type='max',
+                 global_pool=False, dropout=0.3):
+        super().__init__()
+        c1, c2, c3 = channels
+
+        def pool():
+            return nn.AvgPool2d(2, 2) if pool_type == 'avg' else nn.MaxPool2d(2, 2)
+
+        self.conv1_1 = nn.Conv2d(in_channels, c1, 3, padding=1, bias=True)
+        self.conv1_2 = nn.Conv2d(c1, c1, 3, padding=1, bias=True)
+        self.pool1   = pool()
+
+        self.conv2_1 = nn.Conv2d(c1, c2, 3, padding=1, bias=True)
+        self.conv2_2 = nn.Conv2d(c2, c2, 3, padding=1, bias=True)
+        self.pool2   = pool()
+
+        self.conv3_1 = nn.Conv2d(c2, c3, 3, padding=1, bias=True)
+        self.conv3_2 = nn.Conv2d(c3, c3, 3, padding=1, bias=True)
+        self.pool3   = pool()   # 32 -> 16 -> 8 -> 4
+
+        self.drop = nn.Dropout(dropout)
+        self._global_pool = global_pool
+
+        if global_pool:
+            self.gap = nn.AdaptiveAvgPool2d(1)
+            self.out = nn.Linear(c3, num_classes, bias=True)
+        else:
+            self.fc1 = nn.Linear(4 * 4 * c3, 512, bias=True)
+            self.out = nn.Linear(512, num_classes, bias=True)
+
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        x = F.relu(self.conv1_1(x))
+        x = F.relu(self.conv1_2(x))
+        x = self.pool1(x)
+
+        x = F.relu(self.conv2_1(x))
+        x = F.relu(self.conv2_2(x))
+        x = self.pool2(x)
+
+        x = F.relu(self.conv3_1(x))
+        x = F.relu(self.conv3_2(x))
+        x = self.pool3(x)
+
+        if self._global_pool:
+            return self.out(self.gap(x).flatten(1))
+        return self.out(self.drop(F.relu(self.fc1(x.flatten(1)))))
+
+
+# Literature-guided configs for CIFAR-10 without BatchNorm.
+# Augmentation (crop + flip) is applied to every config — it is non-negotiable for 80%.
+# SGD + OneCycleLR outperforms Adam at 100 epochs (Fastai / "Bag of Tricks" findings).
+# weight_decay=5e-4 is the VGG canonical value; dropout compensates for no BN.
+CIFAR_SEARCH_CONFIGS = [
+    # --- Best known no-BN recipe: SGD + OneCycleLR ---
+    dict(name="sgd_onecycle_std",
+         channels=(64, 128, 256), pool_type='max', global_pool=False, dropout=0.3,
+         optimizer='sgd', lr=0.1, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=100, scheduler='onecycle'),
+
+    # --- Classic VGG recipe: SGD + cosine ---
+    dict(name="sgd_cosine_std",
+         channels=(64, 128, 256), pool_type='max', global_pool=False, dropout=0.3,
+         optimizer='sgd', lr=0.05, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=100, scheduler='cosine'),
+
+    # --- Adam + cosine (faster warmup, plateau-avoidance) ---
+    dict(name="adam_cosine_std",
+         channels=(64, 128, 256), pool_type='max', global_pool=False, dropout=0.3,
+         optimizer='adam', lr=0.001, weight_decay=1e-4,
+         batch_size=128, epochs=100, scheduler='cosine'),
+
+    # --- 2x wider channels: more feature capacity ---
+    dict(name="sgd_onecycle_wide",
+         channels=(128, 256, 512), pool_type='max', global_pool=False, dropout=0.4,
+         optimizer='sgd', lr=0.1, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=100, scheduler='onecycle'),
+
+    # --- GlobalAvgPool: removes large FC, limits overfitting ---
+    dict(name="sgd_onecycle_gap",
+         channels=(64, 128, 256), pool_type='max', global_pool=True, dropout=0.0,
+         optimizer='sgd', lr=0.1, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=100, scheduler='onecycle'),
+
+    # --- AvgPool throughout: smoother gradients vs MaxPool ---
+    dict(name="sgd_cosine_avgpool",
+         channels=(64, 128, 256), pool_type='avg', global_pool=False, dropout=0.3,
+         optimizer='sgd', lr=0.05, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=100, scheduler='cosine'),
+
+    # --- Larger batch (256) with linearly-scaled lr ---
+    dict(name="sgd_onecycle_bs256",
+         channels=(64, 128, 256), pool_type='max', global_pool=False, dropout=0.3,
+         optimizer='sgd', lr=0.2, momentum=0.9, weight_decay=5e-4,
+         batch_size=256, epochs=100, scheduler='onecycle'),
+
+    # --- Wide + AvgPool + longer run ---
+    dict(name="sgd_cosine_wide_avgpool",
+         channels=(128, 256, 512), pool_type='avg', global_pool=False, dropout=0.4,
+         optimizer='sgd', lr=0.05, momentum=0.9, weight_decay=5e-4,
+         batch_size=128, epochs=120, scheduler='cosine'),
+]
+
+
+def train_one_cifar_config(cfg, tr_x, tr_y, val_x, val_y, te_x, te_y, device):
+    from torch.utils.data import TensorDataset, DataLoader as TDL
+
+    bs = cfg['batch_size']
+    tr_ds  = TDL(TensorDataset(torch.from_numpy(tr_x),  torch.from_numpy(tr_y)),
+                 batch_size=bs, shuffle=True,  num_workers=0, pin_memory=(device.type == 'cuda'))
+    val_ds = TDL(TensorDataset(torch.from_numpy(val_x), torch.from_numpy(val_y)),
+                 batch_size=bs, shuffle=False, num_workers=0, pin_memory=(device.type == 'cuda'))
+    te_ds  = TDL(TensorDataset(torch.from_numpy(te_x),  torch.from_numpy(te_y)),
+                 batch_size=bs, shuffle=False, num_workers=0, pin_memory=(device.type == 'cuda'))
+
+    model = VGG8CifarSearch(
+        channels=cfg['channels'], pool_type=cfg['pool_type'],
+        global_pool=cfg['global_pool'], dropout=cfg['dropout'],
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\n[{cfg['name']}]  params={n_params/1e6:.2f}M  bs={bs}  epochs={cfg['epochs']}")
+
+    criterion = nn.CrossEntropyLoss()
+    epochs    = cfg['epochs']
+
+    if cfg['optimizer'] == 'sgd':
+        opt = optim.SGD(model.parameters(), lr=cfg['lr'],
+                        momentum=cfg.get('momentum', 0.9),
+                        weight_decay=cfg.get('weight_decay', 5e-4),
+                        nesterov=True)
+    else:
+        opt = optim.Adam(model.parameters(), lr=cfg['lr'],
+                         weight_decay=cfg.get('weight_decay', 1e-4))
+
+    if cfg['scheduler'] == 'onecycle':
+        sched = optim.lr_scheduler.OneCycleLR(
+            opt, max_lr=cfg['lr'], steps_per_epoch=len(tr_ds),
+            epochs=epochs, pct_start=0.3, anneal_strategy='cos', div_factor=25.0)
+        step_per_batch = True
+    elif cfg['scheduler'] == 'cosine':
+        sched = optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+        step_per_batch = False
+    else:
+        sched, step_per_batch = None, False
+
+    best_val, best_test = 0.0, 0.0
+
+    def eval_acc(loader):
+        model.eval()
+        c, t = 0, 0
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                c += model(xb).argmax(1).eq(yb).sum().item()
+                t += yb.size(0)
+        return 100. * c / t
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        correct, total = 0, 0
+        for xb, yb in tr_ds:
+            xb, yb = xb.to(device), yb.to(device)
+            xb = augment_train_batch(xb)
+            opt.zero_grad()
+            out  = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            opt.step()
+            if step_per_batch and sched is not None:
+                sched.step()
+            correct += out.detach().argmax(1).eq(yb).sum().item()
+            total   += yb.size(0)
+
+        if not step_per_batch and sched is not None:
+            sched.step()
+
+        val_acc = eval_acc(val_ds)
+        if val_acc > best_val:
+            best_val  = val_acc
+            best_test = eval_acc(te_ds)
+
+        if epoch % 20 == 0 or epoch == epochs:
+            train_acc = 100. * correct / total
+            print(f"  ep {epoch:3d}/{epochs}  train={train_acc:.1f}%  "
+                  f"val={val_acc:.1f}%  best_val={best_val:.1f}%  best_test={best_test:.1f}%")
+
+    return best_val, best_test
+
+
+def run_cifar_search(device):
+    print("Loading CIFAR-10 arrays...")
+    tr_x, tr_y, val_x, val_y, te_x, te_y = load_cifar10_nchw()
+    print(f"  train={len(tr_x)}  val={len(val_x)}  test={len(te_x)}")
+
+    results = []
+    for cfg in CIFAR_SEARCH_CONFIGS:
+        t0 = time.time()
+        best_val, best_test = train_one_cifar_config(
+            cfg, tr_x, tr_y, val_x, val_y, te_x, te_y, device)
+        elapsed = time.time() - t0
+        results.append((cfg['name'], best_val, best_test, elapsed))
+        marker = " *** TARGET ***" if best_test >= 80.0 else ""
+        print(f"  >> {cfg['name']:30s}  val={best_val:.2f}%  test={best_test:.2f}%"
+              f"  ({elapsed/60:.1f}min){marker}")
+
+    print("\n===== SEARCH RESULTS (sorted by test acc) =====")
+    for name, val, test, t in sorted(results, key=lambda r: r[2], reverse=True):
+        print(f"  {name:30s}  val={val:.2f}%  test={test:.2f}%  ({t/60:.1f}min)")
+
+# endregion
+
+# ==========================================================
 # LOAD AND PARSE PRETRAINED FILES
 # ==========================================================
 def parse_cnn_filename(filename):
@@ -1221,11 +1517,10 @@ if __name__ == "__main__":
             full_matrix=True,
         )
     elif dataset == "cifar10":
-        (train_loader, total_train_batches), (val_loader, total_val_batches), (test_loader, total_test_batches), max_nonzero = cifar10_loader_manual(
-            batch_size=batch_size,
-            shuffle=True,
-            preprocess=False,
-        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Using device:", device)
+        run_cifar_search(device)
+        raise SystemExit(0)
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
 

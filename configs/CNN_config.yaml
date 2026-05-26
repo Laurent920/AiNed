@@ -36,8 +36,10 @@ mode: training
 dataset: mnist
 layer_sizes:
   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
-  - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
-  - [5, [3, 3], [1, 1], [1, 1], ""]   # Conv: 5 filters, 3x3 kernel, max pool
+  - [3, [3, 3], [1, 1], [1, 1], "max"]    # Conv: 3 filters, 3x3 kernel, max pool
+  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
+  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
+  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
   - [128]                                  # FC: 120 units
   - [10]                                   # Output: 10 classes
   
@@ -120,7 +122,7 @@ layer_sizes:
 #   - [10]                                   # Output: 10 classes
 
 # ---------- CIFAR-10 (32x32) need to set the sync rate to 32*3 to simulate the row by row processing ----------
-# dataset: cifar10
+dataset: cifar10
 # layer_sizes:
 #   - [3, 32, 32]                           # Input: 2 polarities, 34x34
 #   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
@@ -128,15 +130,16 @@ layer_sizes:
 #   - [128]                                  # FC: 128 units
 #   - [10]                                   # Output: 10 classes
 
-# layer_sizes:
-#   - [3, 32, 32]                           # Input
-#   - [32, [3, 3], [1, 1], [1, 1], "max"]      # Conv block 1: 64 filters
-#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
-#   - [128, [3, 3], [1, 1], [1, 1], "max"]     # Conv block 2: 128 filters
-#   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
-#   - [256]                                  # FC layer
-#   - [128]                                  # FC layer
-#   - [10]   
+layer_sizes:
+  - [3, 32, 32]                           # Input
+  - [128, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
+  - [128, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+  - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
+  - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
+  - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
+  - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
+  - [512]                                  # FC layer
+  - [10]   
 
 # ---------- DVS Gesture (64x64 downsampled) ----------
 # dataset: dvs
@@ -183,10 +186,12 @@ layer_sizes:
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
-batch_size: 120              # Number of samples per batch
-num_epochs: 2              # Number of training epochs
-learning_rate: 0.0005       # Learning rate for optimizer
-optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
+batch_size: 12              # Number of samples per batch
+num_epochs: 10              # Number of training epochs
+# learning_rate: 0.0005       # Learning rate for optimizer
+learning_rate: 0.1       # Learning rate for optimizer
+# optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
+optimizer: sgd_onecycle             # Choice of optimizer (adam, sgd, adamw, rmsprop)
 
 # ============================================================================
 # MODEL LOADING/SAVING
@@ -230,7 +235,7 @@ shuffle_input: false
 firing_nb: 1
 # firing_nb: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
 sync_rate: [96, 96, 1, 1, 1, 1, 1, 1, 1, 1]
-sync_rate: 96
+sync_rate: 1
 
 # ============================================================================
 # LEARNING AND REGULARIZATION

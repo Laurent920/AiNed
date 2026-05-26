@@ -2,7 +2,18 @@ import jax
 import jax.numpy as jnp
 from functools import partial
 
-# region Sparse pooling 
+
+def pool_output_size(in_size, pool, stride):
+    """Ceil-mode pooled output size: ceil((in_size - pool) / stride) + 1.
+
+    Keeps a partial last window for odd dimensions instead of dropping the
+    trailing row/column (floor mode). Equals the floor formula when the
+    dimension is evenly covered. All static ints.
+    """
+    return -(-(in_size - pool) // stride) + 1
+
+
+# region Sparse pooling
 @partial(jax.jit, static_argnames=['pad_len',])
 def compact_nonzero_and_pad(events, pad_len=0):
     """
@@ -83,9 +94,9 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
     ph, pw = map(int, pool_size)
     sh, sw = map(int, stride)
     
-    # Pooling layer size (assumes H and W are divisible by stride if not we just ignore one row/column)
-    Hp = H // sh
-    Wp = W // sw
+    # Ceil-mode pooling size: keep a partial last window for odd dims.
+    Hp = pool_output_size(H, ph, sh)
+    Wp = pool_output_size(W, pw, sw)
     # jax.debug.print("Pool output sizes: {} {} {} {} {}", Hp, Wp, C, H, W)
 
     coords = events[:, :3].astype(jnp.int32)   # (N,3) integers
@@ -102,8 +113,8 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
     valid = (
         (coords[:, 0] >= 0) &                       # valid channel
         (coords[:, 1] >= 0) & (coords[:, 2] >= 0) & # valid spatial coords
-        (coords[:, 1] < Hp * sh) &                  # ignore last H row
-        (coords[:, 2] < Wp * sw)                    # ignore last W column
+        (coords[:, 1] < H) &                        # ceil-mode: keep edge (partial window)
+        (coords[:, 2] < W)
     )
     safe_pooled_idx = jnp.where(valid, pooled_idx, 0) # Replace invalid indices with a safe dummy (0)
 
@@ -265,28 +276,26 @@ def unpool(input_matrix, pooled, shape, pool_size=(2, 2), pool_stride=(2, 2)):
     sh, sw = pool_stride
     kh, kw = pool_size
 
-    # Create upsampled version
-    x_up_h = jnp.repeat(pooled, sh, axis=1)
-    matrix_upsampled = jnp.repeat(x_up_h, sw, axis=2)
-    
-    # Pad if necessary to match original dimensions
-    pad_h = H - matrix_upsampled.shape[1]
-    pad_w = W - matrix_upsampled.shape[2]
-    if pad_h > 0 or pad_w > 0:
-        matrix_upsampled = jnp.pad(matrix_upsampled, 
-                                ((0, 0), (0, pad_h), (0, pad_w)), 
-                                constant_values=0)
-    
-    # Create mask for matching values
-    mask = (input_matrix == matrix_upsampled)
-    
+    # Pad the original map to the ceil-mode grid so windows align with `pooled`.
+    out_h, out_w = pooled.shape[1], pooled.shape[2]
+    pad_h = (out_h - 1) * sh + kh - H
+    pad_w = (out_w - 1) * sw + kw - W
+    inp = jnp.pad(input_matrix, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=-jnp.inf)
+    Hp, Wp = inp.shape[1], inp.shape[2]
+
+    # Create upsampled version on the padded grid
+    matrix_upsampled = jnp.repeat(jnp.repeat(pooled, sh, axis=1), sw, axis=2)[:, :Hp, :Wp]
+
+    # Create mask for matching values (padded cells are -inf, never match)
+    mask = (inp == matrix_upsampled)
+
     # Create priority matrix: prefer top-left positions
-    priority_base = jnp.arange(H * W, dtype=jnp.float32).reshape(H, W)
-    priority = jnp.broadcast_to(priority_base[None, :, :], (C, H, W))
-    
+    priority_base = jnp.arange(Hp * Wp, dtype=jnp.float32).reshape(Hp, Wp)
+    priority = jnp.broadcast_to(priority_base[None, :, :], (C, Hp, Wp))
+
     # Apply mask: set non-matching positions to -inf (not 0!)
     priority = jnp.where(mask, priority, -jnp.inf)
-    
+
     # For each pooling window, keep only the position with highest priority
     max_priorities = jax.lax.reduce_window(
         priority,
@@ -296,17 +305,15 @@ def unpool(input_matrix, pooled, shape, pool_size=(2, 2), pool_stride=(2, 2)):
         window_strides=(1, sh, sw),
         padding="VALID",
     )
-    
-    max_priorities_upsampled = jnp.repeat(jnp.repeat(max_priorities, sh, axis=1), sw, axis=2)
-    
-    if pad_h > 0 or pad_w > 0:
-        max_priorities_upsampled = jnp.pad(max_priorities_upsampled, 
-                                            ((0, 0), (0, pad_h), (0, pad_w)), 
-                                            constant_values=-jnp.inf)
-    
+
+    max_priorities_upsampled = jnp.repeat(jnp.repeat(max_priorities, sh, axis=1), sw, axis=2)[:, :Hp, :Wp]
+
     # Keep only positions that have the maximum priority in their window
     unique_mask = (priority == max_priorities_upsampled) & mask
-    unpooled = matrix_upsampled * unique_mask
+    unpooled = jnp.where(unique_mask, matrix_upsampled, 0.0)
+
+    # Crop padding back to the original resolution
+    unpooled = unpooled[:, :H, :W]
 
     # jax.debug.print("rank {}, input {}, pooled {}, unpooled {}", rank, jnp.count_nonzero(input_matrix), jnp.count_nonzero(pooled), jnp.count_nonzero(unpooled))
     return unpooled
@@ -335,11 +342,16 @@ def full_matrix_to_event_array_with_pooling(matrix, shape, pooling="", pool_size
         sh, sw = pool_stride
 
         input_matrix = matrix
-        # Compute output dimensions
-        out_h = (H - kh) // sh + 1
-        out_w = (W - kw) // sw + 1
+        # Ceil-mode output dimensions (keep a partial last window for odd dims)
+        out_h = pool_output_size(H, kh, sh)
+        out_w = pool_output_size(W, kw, sw)
+        # Pad so VALID windows realize the ceil-mode output without dropping the edge.
+        pad_h = (out_h - 1) * sh + kh - H
+        pad_w = (out_w - 1) * sw + kw - W
+        pad_val = -jnp.inf if pooling == "max" else 0.0
+        padded_input = jnp.pad(input_matrix, ((0, 0), (0, pad_h), (0, pad_w)), constant_values=pad_val)
         # io_callback(lambda arr, name: save_to_file(arr, name), None, input_matrix, 0)
-        
+
         @jax.jit
         def pool_fn(x):
             # Extract all pooling windows efficiently
@@ -356,7 +368,7 @@ def full_matrix_to_event_array_with_pooling(matrix, shape, pooling="", pool_size
             return windows
 
         # Apply pooling channel-wise
-        matrix = pool_fn(input_matrix)
+        matrix = pool_fn(padded_input)
         # io_callback(lambda arr, name: save_to_file(arr, name), None, matrix, 1)
 
         if pooling == "max":

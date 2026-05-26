@@ -33,7 +33,7 @@ from dataset_helpers.nmnist_helper import torch_nmnist_loader
 from dataset_helpers.shd_helper import torch_SHD_loader
 from dataset_helpers.dvs_helper import torch_DVSGesture_loader
 from dataset_helpers.ncars_helper import torch_NCARS_loader
-from dataset_helpers.cnn_mnist import get_weights_for_rank
+from dataset_helpers.cnn_pytorch import get_weights_for_rank
 
 from other_helpers.helpers import Params, NeuronStates
 from other_helpers.helpers import accuracy, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
@@ -41,7 +41,7 @@ from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
-from other_helpers.event_pooling import output_to_event_array_with_pooling, full_matrix_to_event_array_with_pooling
+from other_helpers.event_pooling import output_to_event_array_with_pooling, full_matrix_to_event_array_with_pooling, pool_output_size
 
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
 from other_helpers.general_MPI_helper import data_split, model_split_custom, model_split
@@ -271,9 +271,9 @@ class Network:
                     filename += f"_C{out_chan}x{in_chan}x{kernel[0]}x{kernel[1]}"
 
                 h_out_pool, w_out_pool = h_out, w_out
-                if pooling != "": # Compute the shape after pooling if needed
-                    h_out_pool = (h_out - pool_size[0]) // pool_stride[0] + 1
-                    w_out_pool = (w_out - pool_size[1]) // pool_stride[1] + 1
+                if pooling != "": # Compute the shape after pooling if needed (ceil mode)
+                    h_out_pool = pool_output_size(h_out, pool_size[0], pool_stride[0])
+                    w_out_pool = pool_output_size(w_out, pool_size[1], pool_stride[1])
                     if pooling == "max":
                         filename += f"_P{pool_size[0]}x{pool_size[1]}"
                     elif pooling == "avg":
@@ -794,6 +794,16 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
         # This avoids broadcasting the same pooled gradient to every element in the window.
         pre_pool_proxy = all_neuron_states.layer_activity.astype(next_grad_1.dtype)
 
+        # Ceil-mode: pad the conv map so VALID windows produce the (ceil) pooled
+        # shape that matches next_grad_1; the gradient is cropped back afterwards.
+        Hc, Wc = pre_pool_proxy.shape[-2], pre_pool_proxy.shape[-1]
+        Hp = pool_output_size(Hc, ph, sh)
+        Wp = pool_output_size(Wc, pw, sw)
+        pad_h = (Hp - 1) * sh + ph - Hc
+        pad_w = (Wp - 1) * sw + pw - Wc
+        pad_val = -jnp.inf if empty_neuron_states.pooling == "max" else 0.0
+        pre_pool_proxy = jnp.pad(pre_pool_proxy, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), constant_values=pad_val)
+
         @jit
         def pool_only(x):
             if empty_neuron_states.pooling == "max":
@@ -818,7 +828,7 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
             return x
 
         _, pullback = jax.vjp(pool_only, pre_pool_proxy)
-        next_grad = pullback(next_grad_1)[0]
+        next_grad = pullback(next_grad_1)[0][..., :Hc, :Wc]  # crop ceil-mode padding
     else:
         next_grad = next_grad_1
     
@@ -1025,17 +1035,34 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         print(f"{opti} optimizer selected")
     if opti == "adam":
         solver = optax.adam(learning_rate=params.learning_rate)
-    elif opti == "adamw":        
+    elif opti == "adamw":
         solver = optax.adam(learning_rate=params.learning_rate)
     elif opti == "sgd":
         solver = optax.sgd(learning_rate=params.learning_rate)
+    elif opti == "sgd_onecycle":
+        # Warmup-cosine schedule matching PyTorch OneCycleLR (best config from pytorch search).
+        # learning_rate is the peak LR; starts at lr/25, decays to ~0 after warmup.
+        # Use w_reg: 0.0 in config to avoid double-counting with add_decayed_weights.
+        total_steps = params.num_epochs * total_batches[0]
+        warmup_steps = int(0.3 * total_steps)
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=params.learning_rate / 25,
+            peak_value=params.learning_rate,
+            warmup_steps=warmup_steps,
+            decay_steps=total_steps,
+            end_value=1e-5,
+        )
+        solver = optax.chain(
+            optax.add_decayed_weights(5e-4),
+            optax.sgd(learning_rate=schedule, momentum=0.9, nesterov=True),
+        )
     elif opti == "rmsprop":
         solver = optax.rmsprop(learning_rate=params.learning_rate, decay=0.9, eps=1e-8)
         print("amsgrad optimizer selected")
         solver = optax.amsgrad(learning_rate=params.learning_rate)
     elif opti == "lion":
         solver = optax.lion(learning_rate=params.learning_rate)
-    else: 
+    else:
         solver = None
     if solver is not None:
         opt_state = solver.init(weights)
@@ -1695,7 +1722,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
         elif mode == 'training':
             # To run the full training pipeline
-            result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam")
+            result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, config.get('optimizer', 'adam'))
         else:
             print(f"Unknown mode in config file, choose either 'training' or 'inference', got {mode}")
             sys.exit(1)

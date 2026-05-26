@@ -12,6 +12,7 @@ from dataset_helpers.mnist_helper import mnist_loader_manual
 from forward_backward_pass.backpropagation import MLP_back_prop
 from other_helpers.helpers import NeuronStates, Params, load_config_with_defaults
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
+from other_helpers.event_pooling import pool_output_size
 
 
 def one_hot(y, num_classes):
@@ -98,8 +99,8 @@ def init_weights_from_async_cnn(layer_sizes, seed):
             if layer_def["pooling"] != "":
                 pkh, pkw = layer_def["pool_size"]
                 psh, psw = layer_def["pool_stride"]
-                h_out = (h_out - pkh) // psh + 1
-                w_out = (w_out - pkw) // psw + 1
+                h_out = pool_output_size(h_out, pkh, psh)
+                w_out = pool_output_size(w_out, pkw, psw)
             cur_shape = (out_ch, h_out, w_out)
         else:
             in_dim = int(np.prod(cur_shape)) if len(cur_shape) == 3 else int(cur_shape[0])
@@ -113,25 +114,38 @@ def init_weights_from_async_cnn(layer_sizes, seed):
 
 
 def apply_pool_jax(x, pooling, pool_size, pool_stride):
+    if pooling == "":
+        return x
+    ph, pw = pool_size
+    sh, sw = pool_stride
+    H, W = x.shape[2], x.shape[3]
+    # Ceil-mode: pad internally so VALID windows keep the partial edge window.
+    # Padding inside keeps the vjp w.r.t. the (unpadded) pre-pool tensor correct.
+    out_h = pool_output_size(H, ph, sh)
+    out_w = pool_output_size(W, pw, sw)
+    pad_h = (out_h - 1) * sh + ph - H
+    pad_w = (out_w - 1) * sw + pw - W
+    pad_val = -jnp.inf if pooling == "max" else 0.0
+    xp = jnp.pad(x, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), constant_values=pad_val)
     if pooling == "max":
         return jax.lax.reduce_window(
-            x,
+            xp,
             init_value=-jnp.inf,
             computation=jax.lax.max,
-            window_dimensions=(1, 1, pool_size[0], pool_size[1]),
-            window_strides=(1, 1, pool_stride[0], pool_stride[1]),
+            window_dimensions=(1, 1, ph, pw),
+            window_strides=(1, 1, sh, sw),
             padding="VALID",
         )
     if pooling == "avg":
         out = jax.lax.reduce_window(
-            x,
+            xp,
             init_value=0.0,
             computation=jax.lax.add,
-            window_dimensions=(1, 1, pool_size[0], pool_size[1]),
-            window_strides=(1, 1, pool_stride[0], pool_stride[1]),
+            window_dimensions=(1, 1, ph, pw),
+            window_strides=(1, 1, sh, sw),
             padding="VALID",
         )
-        return out / float(pool_size[0] * pool_size[1])
+        return out / float(ph * pw)
     return x
 
 
@@ -246,6 +260,7 @@ def forward_with_states(x, weights, biases, layer_defs, sync_rate, fc_mask_value
             input_vector=jnp.broadcast_to(jnp.arange(1, in_dim + 1), (bsz, in_dim)),
             output_vector=jnp.where(a > 0, output_value, 0),
             layer_activity=(a > 0).astype(jnp.int32),
+            input_activity=jnp.zeros((bsz, in_dim), dtype=jnp.int32),  # only used for bias grad (ignored here)
             thresholds=jnp.zeros_like(a),
         )
         records.append(
@@ -301,7 +316,7 @@ def custom_async_cnn_grads(
         w = weights[wi]
 
         if rec["kind"] == "fc":
-            weight_grad, _th_grad, weight_res = MLP_back_prop(params, rec["state"], next_grad, rec["cfg_idx"])
+            weight_grad, _th_grad, weight_res, _bias_grad = MLP_back_prop(params, rec["state"], next_grad, rec["cfg_idx"])
             w_grads[wi] = weight_grad[0]
             # bias grad: next_grad masked by whether the neuron fired (output_vector > 0), summed over batch
             neuron_fired = (rec["state"].output_vector > 0).astype(next_grad.dtype)  # (B, out_dim)
@@ -392,9 +407,9 @@ class TorchCNN(nn.Module):
                 x = layer(x)
                 x = torch.relu(x)
                 if layer_def["pooling"] == "max":
-                    x = F.max_pool2d(x, kernel_size=layer_def["pool_size"], stride=layer_def["pool_stride"])
+                    x = F.max_pool2d(x, kernel_size=layer_def["pool_size"], stride=layer_def["pool_stride"], ceil_mode=True)
                 elif layer_def["pooling"] == "avg":
-                    x = F.avg_pool2d(x, kernel_size=layer_def["pool_size"], stride=layer_def["pool_stride"])
+                    x = F.avg_pool2d(x, kernel_size=layer_def["pool_size"], stride=layer_def["pool_stride"], ceil_mode=True)
             else:
                 if x.dim() > 2:
                     x = torch.flatten(x, start_dim=1)

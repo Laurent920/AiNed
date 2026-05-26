@@ -72,7 +72,8 @@ def process_activated_output(params, mpi_config, key, arr: jnp.ndarray):
 
 # region layer_computation
 @partial(jax.jit, static_argnames=['params', 'mpi_config', 'grad'])
-def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False, ):
+def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False, is_residual=False):
+    # is_residual accepted for call-site parity with conv_layer_computation; FC layers ignore it.
     layer_idx= mpi_config.layer_idx
     last_layer = mpi_config.last_layer_idx
 
@@ -300,6 +301,8 @@ def predict(params,
 
         # Send end signal to ALL next-layer ranks regardless of selective routing
         mpi_config.forward_send(END_SIGNAL)
+        if len(mpi_config.res_connect_next) > 0:
+            mpi_config.residual_send_end_signal(END_SIGNAL)
 
         return iteration, jnp.zeros((BUFFER_SIZE, message_size))
 
@@ -342,23 +345,53 @@ def predict(params,
                         )
                     else:
                         mpi_config.forward_send(out_val)
+
+                    # Residual: also fan out as residual to any res_connect_next destinations.
+                    if len(mpi_config.res_connect_next) > 0:
+                        mpi_config.residual_send(
+                            out_val,
+                            out_val[0].astype(jnp.int32),
+                            out_val[1].astype(jnp.int32),
+                            out_val[2].astype(jnp.int32),
+                        )
                     return None
                 jax.lax.fori_loop(0, loop_iterations, send_activation, None)
                 return None
             
             received_data = mpi_config.forward_recv(message_size)
-            
+
             # if layer_idx == 4:
             # jax.debug.print("rank {}, received: {}", mpi_config.rank, received_data)
             if message_size == 2:
                 neuron_idx, layer_input = received_data[0], received_data[1]
+                is_residual = jnp.array(False)
             else:
-                neuron_idx = received_data[:3].astype(jnp.int32) # channel, x, y
-                layer_input = received_data[3] # value
-            
+                c_raw = received_data[0].astype(jnp.int32)
+                x_raw = received_data[1].astype(jnp.int32)
+                y_raw = received_data[2].astype(jnp.int32)
+                layer_input = received_data[3]
+
+                is_end = jnp.logical_and(c_raw == -1, x_raw == -1)         # full END_SIGNAL
+                is_residual = jnp.logical_and(c_raw < 0, x_raw >= 0)        # residual marker
+                actual_c = jnp.where(is_residual, -c_raw - 1, c_raw)
+                neuron_idx = jnp.stack([actual_c, x_raw, y_raw])
+
             neuron_idx = jnp.asarray(neuron_idx, dtype=jnp.int32)
 
-            neg_idx = jnp.any(neuron_idx == -1)
+            loop_iterations, activated_output, new_neuron_states = layer_computation(
+                params,
+                mpi_config,
+                key,
+                neuron_idx,
+                layer_input,
+                weights,
+                neuron_states,
+                iteration,
+                grad,
+                is_residual=is_residual,
+            )
+
+            neg_idx = jnp.any(neuron_idx == -1) if message_size == 2 else is_end
             finished = jax.lax.cond(neg_idx, lambda _: finished + 1, lambda _: finished, operand=None)
             iteration = jax.lax.cond(neg_idx, lambda _: iteration, lambda _: iteration + 1, operand=None)
 
@@ -374,15 +407,6 @@ def predict(params,
                     operand=None,
                 )
 
-            loop_iterations, activated_output, new_neuron_states =layer_computation(params, 
-                                                                                    mpi_config, 
-                                                                                    key, 
-                                                                                    neuron_idx, 
-                                                                                    layer_input, 
-                                                                                    weights,
-                                                                                    neuron_states, 
-                                                                                    iteration, 
-                                                                                    grad)
             if layer_idx != last_layer:
                 hidden_layers(loop_iterations, activated_output)
             
@@ -415,6 +439,8 @@ def predict(params,
 
         if layer_idx != last_layer:
             mpi_config.forward_send(END_SIGNAL, iteration)
+            if len(mpi_config.res_connect_next) > 0:
+                mpi_config.residual_send_end_signal(END_SIGNAL)
             # jax.debug.print("rank {} finished forward pass, starting backward pass", mpi_config.rank)
 
         return layer_input, neuron_states, iteration-1, buffer
@@ -444,7 +470,7 @@ def predict(params,
 
 #region Conv computation
 @partial(jax.jit, static_argnames=['params', 'mpi_config', 'grad',])
-def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False):
+def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights, neuron_states, iteration=0, grad=False, is_residual=False):
     '''
     Apply the convolution for an incoming event in the event-driven manner described in "Optimizing event-based neural networks on digital neuromorphic architecture: a comprehensive design space exploration"
     This convolution only supports 'SAME' padding scheme with stride 1
@@ -607,6 +633,14 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
                                                                     unpooled_coords[:, 2]
                                                                 ].add(jnp.where(unpooled_vals != 0, 1, 0))
 
+            # Record the max winning (pooled) value per pre-pool cell. This is the
+            # signal used by the backward pass to route the max-pool gradient to the
+            # true argmax cell, instead of the most-frequent winner (layer_activity).
+            new_output_vector = neuron_states.output_vector.at[ unpooled_coords[:, 0],
+                                                                unpooled_coords[:, 1],
+                                                                unpooled_coords[:, 2]
+                                                            ].max(jnp.where(unpooled_vals != 0, unpooled_vals, 0.0))
+
             input_act = neuron_states.input_activity
             new_input_activity = jax.lax.cond(nb_valid_elements > 0, lambda _: input_act.at[neuron_idx].add(1), lambda _: input_act, None)
             new_input_residuals = neuron_states.input_residuals.at[tuple(neuron_idx)].add(layer_input)
@@ -615,6 +649,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             new_input_activity = neuron_states.input_activity
             new_layer_activity = neuron_states.layer_activity
             new_weight_res = neuron_states.weight_res
+            new_output_vector = neuron_states.output_vector
 
         new_neuron_states = neuron_states.replace(
             values=new_values,
@@ -622,6 +657,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             input_activity=new_input_activity,
             layer_activity=new_layer_activity,
             output_activity=new_output_activity,
+            output_vector=new_output_vector,
             weight_res=new_weight_res,)
 
         return nb_valid_elements, out_events, new_neuron_states
@@ -674,6 +710,25 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
 
         return nb_valid_elements, out_events, new_neuron_states
 
-    nb_valid_elements, out_events, neuron_states = jax.lax.cond(jnp.any(neuron_idx < 0), last_input, regular_input, neuron_states)
+    def residual_input(neuron_states):
+        """Identity skip: add layer_input directly to neuron_states.values[c, x, y].
+        No conv weights, no thresholds, no firing — just accumulation."""
+        c, x, y = neuron_idx
+        new_values = neuron_states.values.at[c, x, y].add(layer_input)
+        if grad:
+            new_layer_activity = neuron_states.layer_activity.at[c, x, y].add(1.0)
+        else:
+            new_layer_activity = neuron_states.layer_activity
+        new_ns = neuron_states.replace(values=new_values, layer_activity=new_layer_activity)
+        # No new fired events — firing happens when a future regular event crosses threshold.
+        C, H, W = params.flat_layer_sizes[mpi_config.layer_idx]
+        return jnp.array(0), jnp.zeros((C*H*W, 4)), new_ns
+
+    nb_valid_elements, out_events, neuron_states = jax.lax.cond(
+        is_residual,
+        residual_input,
+        lambda ns: jax.lax.cond(jnp.any(neuron_idx < 0), last_input, regular_input, ns),
+        neuron_states,
+    )
 
     return nb_valid_elements, out_events, neuron_states

@@ -576,11 +576,12 @@ class FPTTMinimalRNNAED(nn.Module):
             t_offset: int — global timestep offset (for sync_rate)
             return_per_step: if True, return (B, chunk_len, C) per-timestep logits
                              instead of the single (B, C) accumulated logit.
-            return_sparsity: if True, also return avg non-zero activations per timestep
+            return_sparsity: if True, also return per-layer fired-event counts
         Returns:
             logits: (B, n_classes) — accumulated from last hidden layer's events
             hidden: updated [(h,), ...]
-            avg_act: (only if return_sparsity=True) avg non-zero activations per timestep
+            layer_fired: (only if return_sparsity=True) list[float], per hidden layer —
+                total fired events (post top-k) emitted per prediction, batch-averaged
 
         Per-event semantics (matches async_RNN.py): for nlayers >= 2, every event
         emitted by layer l-1 advances layer l's hidden state once, after which
@@ -594,8 +595,9 @@ class FPTTMinimalRNNAED(nn.Module):
 
         hs = [hidden[l][0] for l in range(self.nlayers)]   # list of (B, H)
         logits = torch.zeros(B, C, device=device)
-        total_active = 0.0
-        n_firing_steps = 0
+        # Per-layer count of fired events (post top-k) emitted while processing one
+        # input sequence, batch-averaged → total fired events per prediction per layer.
+        layer_fired = [0.0] * self.nlayers
         n_real_events = 0  # count of non-padding input events for output normalisation
         step_logits = [] if return_per_step else None  # per-timestep logits (B, C)
 
@@ -634,13 +636,15 @@ class FPTTMinimalRNNAED(nn.Module):
                     # Each step predicts independently from h_t, like the SNN mem_out.
                     step_logits.append(step_out)
                 if return_sparsity and sync_fire > 0:
-                    total_active += (o_t != 0).float().sum(dim=1).mean().item()
-                    n_firing_steps += 1
+                    # count only on real input events (skip padding steps)
+                    layer_fired[0] += ((o_t != 0).float().sum(dim=1) * valid.squeeze(1)).mean().item()
                 continue
 
             # --- Multi-layer per-event cascade (nlayers >= 2) ---
             o_0 = torch.relu(hs[0]) * sync_fire
             val_0, idx_0 = torch.topk(o_0, K, dim=1)  # (B, K), sorted desc
+            if return_sparsity and sync_fire > 0:
+                layer_fired[0] += ((val_0 != 0).float().sum(dim=1) * valid.squeeze(1)).mean().item()
 
             o_last_total = torch.zeros(B, H, device=device)
 
@@ -659,14 +663,17 @@ class FPTTMinimalRNNAED(nn.Module):
                 if self.nlayers == 2:
                     # Layer 1 (last hidden) → output. Either top-k fire (per-event
                     # protocol) or full dense ReLU(h) (when dense_output_firing=True).
-                    if self.dense_output_firing:
-                        o_last_total = o_last_total + o_1
-                    else:
-                        o_last_total = o_last_total + keep_top_k_batch_torch(o_1, self.firing_nb)
+                    o_1_fired = o_1 if self.dense_output_firing else keep_top_k_batch_torch(o_1, self.firing_nb)
+                    o_last_total = o_last_total + o_1_fired
+                    if return_sparsity and sync_fire > 0:
+                        # gate by valid_k (real layer-0 event) and valid (real input step)
+                        layer_fired[1] += ((o_1_fired != 0).float().sum(dim=1) * valid_k.float() * valid.squeeze(1)).mean().item()
                     continue
 
                 # nlayers >= 3: layer 1 fires events that drive layer 2 per-event
                 val_1, idx_1 = torch.topk(o_1, K, dim=1)
+                if return_sparsity and sync_fire > 0:
+                    layer_fired[1] += ((val_1 != 0).float().sum(dim=1) * valid_k.float() * valid.squeeze(1)).mean().item()
                 for kk in range(K):
                     idx_kk = idx_1[:, kk]
                     val_kk = val_1[:, kk]
@@ -678,10 +685,10 @@ class FPTTMinimalRNNAED(nn.Module):
                     hs[2] = self._event_step(2, idx_kk, val_kk, hs[2], valid_kk)
                     o_2 = torch.relu(hs[2]) * sync_fire
                     # Layer 2 (last hidden) → output: dense or top-k per the flag.
-                    if self.dense_output_firing:
-                        o_last_total = o_last_total + o_2
-                    else:
-                        o_last_total = o_last_total + keep_top_k_batch_torch(o_2, self.firing_nb)
+                    o_2_fired = o_2 if self.dense_output_firing else keep_top_k_batch_torch(o_2, self.firing_nb)
+                    o_last_total = o_last_total + o_2_fired
+                    if return_sparsity and sync_fire > 0:
+                        layer_fired[2] += ((o_2_fired != 0).float().sum(dim=1) * valid_kk.float() * valid.squeeze(1)).mean().item()
 
             # Output layer accumulates logits per event from last hidden layer.
             # Σ_e val_e · W_out[idx_e] equals (Σ_k o_last^k) @ W_out, so one matmul
@@ -690,10 +697,6 @@ class FPTTMinimalRNNAED(nn.Module):
             logits = logits + step_out
             if step_logits is not None:
                 step_logits.append(step_out)
-
-            if return_sparsity and sync_fire > 0:
-                total_active += (o_last_total != 0).float().sum(dim=1).mean().item()
-                n_firing_steps += 1
 
         # Normalise by number of real (non-padding) events so W_out scale is
         # independent of sequence length and firing density across sessions.
@@ -705,13 +708,11 @@ class FPTTMinimalRNNAED(nn.Module):
             # Not normalised by n_real_events (each step is independent, not a running sum).
             per_step = torch.stack(step_logits, dim=1)
             if return_sparsity:
-                avg_act = total_active / max(n_firing_steps, 1)
-                return per_step, [(h,) for h in hs], avg_act
+                return per_step, [(h,) for h in hs], layer_fired
             return per_step, [(h,) for h in hs]
 
         if return_sparsity:
-            avg_act = total_active / max(n_firing_steps, 1)
-            return logits, [(h,) for h in hs], avg_act
+            return logits, [(h,) for h in hs], layer_fired
         return logits, [(h,) for h in hs]
 
 
@@ -1872,27 +1873,30 @@ def train_one_epoch_bptt(x_train, y_train, model, optimizer, batch_size, n_class
 
 def measure_sparsity(model, x, batch_size=64):
     """
-    Measure average non-zero activations per firing timestep for FPTTMinimalRNNAED.
-    Returns avg_act (float) — average number of active neurons per timestep per sample,
-    and sparsity (float) — fraction of hidden units active (avg_act / hidden_size).
-    Returns (None, None) for non-AED models.
+    Measure per-layer activations for FPTTMinimalRNNAED.
+    Returns avg_act (list[float], one per hidden layer) — average total fired events
+    (post top-k) emitted by each layer while processing one input sequence, i.e. the
+    activation count per layer per prediction, and sparsity (list[float]) — avg_act /
+    hidden_size per layer. Returns (None, None) for non-AED models.
     """
     if not isinstance(model, FPTTMinimalRNNAED):
         return None, None
     device = next(model.parameters()).device
     model.eval()
-    total = 0.0
+    nlayers = model.nlayers
+    totals = [0.0] * nlayers
     n_batches = 0
     with torch.no_grad():
         for s in range(0, x.shape[0], batch_size):
             xb = torch.tensor(x[s:s + batch_size], dtype=torch.float32, device=device)
             hidden = model.init_hidden(xb.shape[0])
-            _, _, avg_act = model.forward_chunk(xb, hidden, t_offset=0, return_sparsity=True)
-            total += avg_act
+            _, _, layer_fired = model.forward_chunk(xb, hidden, t_offset=0, return_sparsity=True)
+            for l in range(nlayers):
+                totals[l] += layer_fired[l]
             n_batches += 1
-    avg = total / max(n_batches, 1)
-    sparsity = avg / model.hidden_size
-    return avg, sparsity
+    avg_act = [t / max(n_batches, 1) for t in totals]
+    sparsity = [a / model.hidden_size for a in avg_act]
+    return avg_act, sparsity
 
 
 def train_fptt(
@@ -2043,7 +2047,8 @@ def train_fptt(
         if test_acc is not None:
             parts.append(f"test_acc={test_acc:.4f}")
         if avg_act is not None:
-            parts.append(f"avg_act={avg_act:.1f}  sparsity={sparsity:.3f}")
+            parts.append("act=[" + ",".join(f"{a:.1f}" for a in avg_act) + "]"
+                         "  sparsity=[" + ",".join(f"{s:.3f}" for s in sparsity) + "]")
         print("  ".join(parts))
         return model, []
 
@@ -2164,8 +2169,8 @@ def train_fptt(
         if test_acc is not None:
             parts.append(f"test_acc={test_acc:.4f}")
         if avg_act is not None:
-            parts.append(f"avg_act={avg_act:.1f}")
-            parts.append(f"sparsity={sparsity:.3f}")
+            parts.append("act=[" + ",".join(f"{a:.1f}" for a in avg_act) + "]")
+            parts.append("sparsity=[" + ",".join(f"{s:.3f}" for s in sparsity) + "]")
         parts.append(f"time={dt:.1f}s")
         print("  ".join(parts))
 

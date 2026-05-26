@@ -9,6 +9,8 @@ from mpi4py import MPI
 from mpi4jax import send, recv
 import mpi4jax
 
+from other_helpers.event_pooling import pool_output_size
+
 try:
     from other_helpers.helpers import NeuronStates, BaseParams
 except ModuleNotFoundError:
@@ -315,6 +317,35 @@ class MPIConfig:
 
             jax.lax.cond(affected, _do_send, lambda _: None, operand=None)
 
+    def residual_send(self, data, event_c, event_x, event_y, it=0):
+        """Send event as a residual (identity skip) to every layer in self.res_connect_next.
+        The channel index is negated to mark the event as residual at the receiver:
+        out[0] = -event_c - 1.   Spatial coords (x, y) and value are unchanged.
+        For identity skip there is no kernel window — overlap test is a single-point check.
+        """
+        neg_c = (-event_c - 1).astype(data.dtype)
+        payload = data.at[0].set(neg_c)
+
+        for process, _src_part, dst_partition in self.res_connect_next:
+            if not isinstance(dst_partition, CNN_layer_Partition):
+                send(payload, dest=process, tag=0, comm=self.comm)
+                continue
+
+            in_c = jnp.logical_and(event_c >= dst_partition.c_start_idx, event_c <= dst_partition.c_end_idx)
+            in_x = jnp.logical_and(event_x >= dst_partition.x_start_idx, event_x <= dst_partition.x_end_idx)
+            in_y = jnp.logical_and(event_y >= dst_partition.y_start_idx, event_y <= dst_partition.y_end_idx)
+            affected = jnp.logical_and(in_c, jnp.logical_and(in_x, in_y))
+
+            def _do_send(_):
+                send(payload, dest=process, tag=0, comm=self.comm)
+                return None
+            jax.lax.cond(affected, _do_send, lambda _: None, operand=None)
+
+    def residual_send_end_signal(self, END_SIGNAL):
+        """Send END_SIGNAL = [-1,-1,-1,-1] on tag=0 to every dst in res_connect_next.
+        Distinguishable from residual events because END has x = -1 while residuals have x >= 0."""
+        for process, _src_part, _dst_part in self.res_connect_next:
+            send(END_SIGNAL, dest=process, tag=0, comm=self.comm)
 
     def forward_recv(self, input_shape):
         src = MPI.ANY_SOURCE
@@ -728,12 +759,13 @@ jax.tree_util.register_pytree_node(
 
 #region MPIProcessDistribution
 class MPIProcessDistribution:
-    """Builder for creating flexible MPI topologies for 
+    """
+    Builder for creating flexible MPI topologies for 
     - Model parallelism (splitting each layer across processes)
     - Data parallelism (splitting batches across processes)
     - ResNet Connections
     """
-    def __init__(self, mpi_size: int, batch_size: int, layer_sizes: tuple[int, ...]):
+    def __init__(self, mpi_size: int, batch_size: int, layer_sizes: tuple[int, ...], residual_connections=()):
             assert mpi_size >= len(layer_sizes), f"The number of processes ({mpi_size}) needs to at least match the number of layers({len(layer_sizes)})"
 
             self.nb_layers = len(layer_sizes)
@@ -741,6 +773,7 @@ class MPIProcessDistribution:
             self.layer_sizes = layer_sizes
             self.batch_size = batch_size
             self.layer_assignments = {}  # rank -> (layer_idx, bach_part, model_part)
+            self.residual_connections = tuple(tuple(p) for p in residual_connections)
 
     def _get_batch_partition_bounds(self, batch_partition_idx: int, total_batch_partitions: int):
         batch_part_size = self.batch_size // total_batch_partitions
@@ -795,8 +828,8 @@ class MPIProcessDistribution:
             cnn_layer_shapes.append(conv_shape)
 
             if pooling != "":
-                h_out = (h_out - pool_size[0]) // pool_stride[0] + 1
-                w_out = (w_out - pool_size[1]) // pool_stride[1] + 1
+                h_out = pool_output_size(h_out, pool_size[0], pool_stride[0])
+                w_out = pool_output_size(w_out, pool_size[1], pool_stride[1])
             previous_layer = (out_chan, h_out, w_out)
 
         self._cnn_layer_shapes = tuple(cnn_layer_shapes)
@@ -1160,6 +1193,36 @@ class MPIProcessDistribution:
 
         all_leaders_rank = tuple([min(layer_ranks) for layer_ranks in all_leaders])
         batch_first_and_last_rank = (b_first_rank, b_last_rank)
+
+        # Populate residual connections
+        res_prev_list = []  # ranks in src layers that point AT this layer (this rank receives from them)
+        res_next_list = []  # ranks in dst layers that this rank's layer points AT (this rank sends to them)
+
+        for src_idx, dst_idx in self.residual_connections:
+            # If this rank is in the destination layer, every rank in the source layer that shares
+            # this batch partition becomes a residual previous-layer entry.
+            if layer_idx == dst_idx:
+                for r_other in self.layer_assignments.keys():
+                    l_other, b_other, m_other = self.layer_assignments[r_other]
+                    if l_other != src_idx:
+                        continue
+                    if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
+                        continue
+                    src_part = self._build_cnn_partition(src_idx, m_other)
+                    dst_part = self._build_cnn_partition(dst_idx, model_parts)
+                    res_prev_list.append((r_other, src_part, dst_part))
+
+            if layer_idx == src_idx:
+                for r_other in self.layer_assignments.keys():
+                    l_other, b_other, m_other = self.layer_assignments[r_other]
+                    if l_other != dst_idx:
+                        continue
+                    if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
+                        continue
+                    src_part = self._build_cnn_partition(src_idx, model_parts)
+                    dst_part = self._build_cnn_partition(dst_idx, m_other)
+                    res_next_list.append((r_other, src_part, dst_part))
+
         return MPIConfig(
             rank=rank,
             size=self.mpi_size,
@@ -1171,12 +1234,12 @@ class MPIProcessDistribution:
             previous_layer=tuple(prev),
             current_layer=tuple(curr),
             next_layer=tuple(next),
-            nb_previous=len(prev),
+            nb_previous=len(prev) + len(res_prev_list),
             all_leader_ranks=all_leaders_rank,
             batch_distribution=tuple(batch_distrib),
             batch_first_and_last_rank=batch_first_and_last_rank,
-            res_connect_next=(),
-            res_connect_prev=()
+            res_connect_next=tuple(res_next_list),
+            res_connect_prev=tuple(res_prev_list)
         )
     
     def CNN_build(self, rank, comm):
@@ -1231,6 +1294,36 @@ class MPIProcessDistribution:
 
         all_leaders_rank = tuple([min(layer_ranks) for layer_ranks in all_leaders])
         batch_first_and_last_rank = (b_first_rank, b_last_rank)
+
+        # Populate residual connections
+        res_prev_list = []  # ranks in src layers that point AT this layer (this rank receives from them)
+        res_next_list = []  # ranks in dst layers that this rank's layer points AT (this rank sends to them)
+
+        for src_idx, dst_idx in self.residual_connections:
+            # If this rank is in the destination layer, every rank in the source layer that shares
+            # this batch partition becomes a residual previous-layer entry.
+            if layer_idx == dst_idx:
+                for r_other in self.layer_assignments.keys():
+                    l_other, b_other, m_other = self.layer_assignments[r_other]
+                    if l_other != src_idx:
+                        continue
+                    if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
+                        continue
+                    src_part = self._build_cnn_partition(src_idx, m_other)
+                    dst_part = self._build_cnn_partition(dst_idx, model_parts)
+                    res_prev_list.append((r_other, src_part, dst_part))
+
+            if layer_idx == src_idx:
+                for r_other in self.layer_assignments.keys():
+                    l_other, b_other, m_other = self.layer_assignments[r_other]
+                    if l_other != dst_idx:
+                        continue
+                    if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
+                        continue
+                    src_part = self._build_cnn_partition(src_idx, model_parts)
+                    dst_part = self._build_cnn_partition(dst_idx, m_other)
+                    res_next_list.append((r_other, src_part, dst_part))
+
         return MPIConfig(
             rank=rank,
             size=self.mpi_size,
@@ -1242,12 +1335,12 @@ class MPIProcessDistribution:
             previous_layer=tuple(prev),
             current_layer=tuple(curr),
             next_layer=tuple(next),
-            nb_previous=len(prev),
+            nb_previous=len(prev) + len(res_prev_list),
             all_leader_ranks=all_leaders_rank,
             batch_distribution=tuple(batch_distrib),
             batch_first_and_last_rank=batch_first_and_last_rank,
-            res_connect_next=(),
-            res_connect_prev=()
+            res_connect_next=tuple(res_next_list),
+            res_connect_prev=tuple(res_prev_list)
         )
 
 #region Splitting func
@@ -1289,6 +1382,17 @@ def model_split(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...]):
     mpi_process_distribution.model_split_uniform()
     mpi_config = mpi_process_distribution.build(rank, comm)
     return mpi_config
+
+def ResNet_data_split(rank, comm, mpi_size, batch_size, layer_sizes, residual_connections=()):
+    d = MPIProcessDistribution(mpi_size, batch_size, layer_sizes, residual_connections)
+    d.CNN_data_split_uniform()
+    return d.CNN_build(rank, comm)
+
+def ResNet_model_split_custom(rank, comm, mpi_size, batch_size, layer_sizes,
+                              processes_per_layer, split_dims=None, residual_connections=()):
+    d = MPIProcessDistribution(mpi_size, batch_size, layer_sizes, residual_connections)
+    d.CNN_model_split_custom(processes_per_layer, split_dims)
+    return d.CNN_build(rank, comm)
 
 #region main
 if __name__ == "__main__":
