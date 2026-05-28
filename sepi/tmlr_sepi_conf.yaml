@@ -1,0 +1,63 @@
+mode: inference
+#mode: training
+
+# ============================================================================
+# NETWORK ARCHITECTURE
+# ============================================================================
+dataset: mnist
+layer_sizes: [784, 128, 10]
+
+# ============================================================================
+# TRAINING / INFERENCE PARAMETERS
+# ============================================================================
+batch_size: 36
+num_epochs: 3
+learning_rate: 5e-4
+optimizer: adam
+
+load_file: false
+best: false
+rerun:
+pretrained_path: "weight/pretrained_mnist_128_10_converted.json"
+
+override_params:
+  - batch_size
+
+# ============================================================================
+# NEURON BEHAVIOR
+# ============================================================================
+restrict: [0.0, 0.0, 0.0]
+init_thresholds: 0.3
+shuffle_activations: false
+shuffle_input: false
+firing_nb: 10
+
+# sync_rate: how many input events each layer waits for before firing.
+# Layer 0 (input rank): sends events, sync_rate[0] unused by hidden_layer_case.
+# Layer 1 (hidden):     784 → waits for ALL pixel events + end signal before
+#                       firing. This matches asynctorch training where the
+#                       full image is processed in one pass. Hidden fires
+#                       ONCE per sample (at the end signal ~valid_event).
+# Layer 2 (output):     1 → accumulates each incoming hidden spike immediately.
+sync_rate: [784, 784, 1] # try with [784,1,1]
+
+# ============================================================================
+# LEARNING AND REGULARIZATION
+# ============================================================================
+threshold_lr: 0.0
+sparsity_impact: [0.0, 0.0, 0.0]
+w_reg: 0.0
+top_weights: 784
+history_size: 0
+
+# ============================================================================
+# ASYNC-LIF / TMLR PARAMETERS
+# ============================================================================
+forward_group_size: 8
+scheduling_policy: ms
+stop_condition: on_output
+forward_steps_after_output: 0
+use_top_weight_filter: false
+reset_output_on_spike: false
+momentum_noise_scale: 1.0e-6
+tau_m: 1000.0  # try with different tau_m values to see how it affects the timing of spikes and learning dynamics
