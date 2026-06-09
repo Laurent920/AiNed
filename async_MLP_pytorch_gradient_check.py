@@ -9,6 +9,7 @@ from dataset_helpers.mnist_helper import mnist_loader_manual
 from forward_backward_pass.backpropagation import MLP_back_prop
 from other_helpers.helpers import Params, NeuronStates, load_config_with_defaults
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
+from other_helpers.init_weights import init_params
 
 
 def random_layer_params(m, n, key, scale=1e-2):

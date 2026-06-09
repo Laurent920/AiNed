@@ -11,6 +11,7 @@
 **/ncars
 **/results
 **/network_results
+**/network_results_surf
 *.sh
 **/tools
 **/.claude

@@ -98,6 +98,32 @@ def _downsample_events_2x(events: np.ndarray) -> np.ndarray:
     return out
 
 
+def _dedup_events(events: np.ndarray) -> np.ndarray:
+    if events.size == 0:
+        return events
+    keys = np.stack([events["x"].astype(np.int32), events["y"].astype(np.int32), events["p"].astype(np.int32)], axis=1)
+    _, first_indices = np.unique(keys, axis=0, return_index=True)
+    return events[np.sort(first_indices)]
+
+
+def _augment_events(events: np.ndarray, x_size: int, y_size: int) -> np.ndarray:
+    """Random horizontal flip + random translation (±4 px), drops out-of-bounds events."""
+    if events.size == 0:
+        return events
+    out = events.copy()
+    if np.random.rand() > 0.5:
+        out["x"] = (x_size - 1 - out["x"].astype(np.int32)).astype(np.int16)
+    dx = np.random.randint(-4, 5)
+    dy = np.random.randint(-4, 5)
+    x = out["x"].astype(np.int32) + dx
+    y = out["y"].astype(np.int32) + dy
+    valid = (x >= 0) & (x < x_size) & (y >= 0) & (y < y_size)
+    out = out[valid]
+    out["x"] = x[valid].astype(np.int16)
+    out["y"] = y[valid].astype(np.int16)
+    return out
+
+
 def _resolve_ncars_root(data_dir: str) -> Path:
     base = Path(data_dir) if data_dir else Path(".")
     target_root = base / "data" / "ncars"
@@ -224,12 +250,13 @@ def _scan_split(split_dir: Path, allow_empty: bool = False):
 
 
 class NCARSPropheseeDataset(Dataset):
-    def __init__(self, root: Path, train: bool = True, downsample: bool = False, allow_empty: bool = False):
+    def __init__(self, root: Path, train: bool = True, downsample: bool = False, dedup: bool = False, allow_empty: bool = False):
         split_name = "train" if train else "test"
         split_dir = _resolve_split_dir(root, split_name)
 
         self.samples = _scan_split(split_dir, allow_empty=allow_empty)
         self.downsample = downsample
+        self.dedup = dedup
 
     def __len__(self):
         return len(self.samples)
@@ -239,6 +266,8 @@ class NCARSPropheseeDataset(Dataset):
         events = _read_prophesee_file(file_path)
         if self.downsample:
             events = _downsample_events_2x(events)
+        if self.dedup:
+            events = _dedup_events(events)
         return events, label
 
 
@@ -347,9 +376,10 @@ def _dummy_preprocess_sample(events: np.ndarray, cnn_preprocess: bool, x_size: i
     return sample
 
 
-def _compute_max_data_length_once(trainset, testset, cache_dir: str, cnn_preprocess: bool, x_size: int, y_size: int) -> int:
+def _compute_max_data_length_once(trainset, testset, cache_dir: str, cnn_preprocess: bool, x_size: int, y_size: int, dedup: bool = False) -> int:
     mode = "cnn" if cnn_preprocess else "mlp"
-    cache_file = Path(cache_dir) / f"max_data_length_{mode}_{x_size}x{y_size}.txt"
+    dedup_suffix = "_dedup" if dedup else ""
+    cache_file = Path(cache_dir) / f"max_data_length_{mode}_{x_size}x{y_size}{dedup_suffix}.txt"
     if cache_file.exists():
         try:
             cached = int(cache_file.read_text().strip())
@@ -389,6 +419,30 @@ def custom_event_pad_collate(batch, max_len):
         num_events = len(d)
         if num_events > max_len:
             raise ValueError(f"NCARS sample length {num_events} exceeds max_len {max_len}")
+
+        d_padded = np.full((max_len, 4), -2, dtype=np.int32)
+        d_padded[:num_events, 0] = d["p"].astype(np.int32)
+        d_padded[:num_events, 1] = d["x"].astype(np.int32)
+        d_padded[:num_events, 2] = d["y"].astype(np.int32)
+        d_padded[:num_events, 3] = 1
+        padded_data.append(d_padded)
+
+    batch_array = jnp.array(padded_data, dtype=jnp.int32)
+    label_array = jnp.array(labels, dtype=jnp.int32)
+    return batch_array, label_array
+
+
+def augmenting_event_pad_collate(batch, max_len, x_size, y_size):
+    """
+    Like custom_event_pad_collate but applies random flip + translation per sample.
+    Only used for the train loader.
+    """
+    data, labels = zip(*batch)
+    padded_data = []
+
+    for d in data:
+        d = _augment_events(d, x_size, y_size)
+        num_events = len(d)
 
         d_padded = np.full((max_len, 4), -2, dtype=np.int32)
         d_padded[:num_events, 0] = d["p"].astype(np.int32)
@@ -474,6 +528,8 @@ def torch_NCARS_loader(
     CNN_preprocess=False,
     shuffle=False,
     downsample=False,
+    dedup=False,
+    augment=False,
     data_dir="",
     full_matrix=False,
 ):
@@ -500,8 +556,8 @@ def torch_NCARS_loader(
         f"test: cars={split_counts['test']['cars']}, background={split_counts['test']['background']}"
     )
 
-    trainset = NCARSPropheseeDataset(root, train=True, downsample=downsample, allow_empty=False)
-    testset = NCARSPropheseeDataset(root, train=False, downsample=downsample, allow_empty=False)
+    trainset = NCARSPropheseeDataset(root, train=True, downsample=downsample, dedup=dedup, allow_empty=False)
+    testset = NCARSPropheseeDataset(root, train=False, downsample=downsample, dedup=dedup, allow_empty=False)
 
     n_train_raw = len(trainset)
     n_test_raw = len(testset)
@@ -524,6 +580,7 @@ def torch_NCARS_loader(
     if full_matrix:
         max_data_length = x_size * y_size * NCARS_SENSOR_SIZE[2]
         collate_fn = lambda batch: dense_matrix_collate(batch, x_size, y_size)
+        train_collate_fn = collate_fn
     else:
         max_data_length = _compute_max_data_length_once(
             trainset,
@@ -532,17 +589,24 @@ def torch_NCARS_loader(
             bool(CNN_preprocess),
             x_size,
             y_size,
+            dedup=dedup,
         )
         if CNN_preprocess:
             collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length)
+            train_collate_fn = (
+                lambda batch: augmenting_event_pad_collate(batch, max_data_length, x_size, y_size)
+                if augment else collate_fn
+            )
         elif CNN_preprocess is None:
             collate_fn = basic_event_collate
+            train_collate_fn = collate_fn
         else:
             collate_fn = lambda batch: custom_preprocess_event_pad_collate(
                 batch, max_data_length, x_size, y_size
             )
+            train_collate_fn = collate_fn
 
-    trainloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=shuffle)
+    trainloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=train_collate_fn, shuffle=shuffle)
     valloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
     testloader = DataLoader(testset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)
 

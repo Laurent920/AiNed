@@ -35,13 +35,14 @@ from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.network_helper import one_hot_encode
 
-from other_helpers.helpers import Params, NeuronStates
+from other_helpers.helpers import BaseParams, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import activation_func, keep_top_k, output_vector_to_event
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop, RNN_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 from other_helpers.MPI_helpers import MPIConfig, combine_batch_avg, gather_batch, split_batch, l2_weight_regularization
+from other_helpers.init_weights import init_params
 
 jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_disable_jit", True)
@@ -68,14 +69,14 @@ test_generator = None
 
 # region PARAMS DEFINITIONS
 @dataclasses.dataclass(frozen=True)
-class MLPParams(Params):
+class MLPParams(BaseParams):
     """Classification MLP parameters (MNIST, CIFAR10, DVS, etc.)"""
     exploration_rate: float = 0.0
     trace_event_timing: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
-class NeuralDecodingParams(Params):
+class NeuralDecodingParams(BaseParams):
     """Regression neural decoding parameters (primate reaching, neural_decoding)"""
     dataset_file: str | None = None
     collapse_units: bool = True

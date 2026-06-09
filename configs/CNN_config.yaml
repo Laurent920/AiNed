@@ -34,15 +34,13 @@ mode: training
 
 # ---------- Small network ----------
 dataset: mnist
-layer_sizes:
-  - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
-  - [3, [3, 3], [1, 1], [1, 1], "max"]    # Conv: 3 filters, 3x3 kernel, max pool
-  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
-  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
-  - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
-  - [128]                                  # FC: 120 units
-  - [10]                                   # Output: 10 classes
-  
+# layer_sizes:
+#   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
+#   - [3, [3, 3], [1, 1], [1, 1], "max"]    # Conv: 3 filters, 3x3 kernel, max pool
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]   # Conv: 5 filters, 3x3 kernel, max pool
+#   - [128]                                  # FC: 120 units
+#   - [10]                                   # Output: 10 classes
+
 # layer_sizes:
 #   - [1, 28, 28]                           # Input: 1 channel, 28x28 MNIST image
 #   # - [3, [3, 3], [1, 1], [1, 1], ""]    # Conv: 3 filters, 3x3 kernel, max pool
@@ -78,30 +76,30 @@ layer_sizes:
 #   - [10]                                   # Output
 
 # ---------- VGG-16 Style (MNIST) ----------
-# layer_sizes:
-#   - [1, 28, 28]                           # Input
-#   # Block 1
-#   - [64, [3, 3], [1, 1], [1, 1], ""]      # Conv
-#   - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + pool
-#   # Block 2
-#   - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [128, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
-#   # Block 3
-#   - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
-#   # Block 4
-#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
-#   # Block 5
-#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
-#   - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
-#   # FC layers
-#   - [4096]                                 # FC
-#   - [4096]                                 # FC
-#   - [10]                                   # Output
+layer_sizes:
+  - [1, 28, 28]                           # Input
+  # Block 1
+  - [32, [3, 3], [1, 1], [1, 1], ""]      # Conv
+  - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + pool
+  # Block 2
+  - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+  # Block 3
+  # - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+  # # Block 4
+  # - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+  # # Block 5
+  # - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv
+  # - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + pool
+  # FC layers
+  - [256]                                 # FC
+  - [128]                                 # FC
+  - [10]                                   # Output
 
 # ---------- Simple CNN (Downsampled 14x14 MNIST) ----------
 # layer_sizes:
@@ -124,20 +122,29 @@ layer_sizes:
 # ---------- CIFAR-10 (32x32) need to set the sync rate to 32*3 to simulate the row by row processing ----------
 dataset: cifar10
 # layer_sizes:
-#   - [3, 32, 32]                           # Input: 2 polarities, 34x34
+#   - [3, 32, 32]                           # Input: 3 channels, 32x32
+#   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
+#   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
+#   - [128]                                  # FC: 128 units
+#   - [10]                                   # Output: 10 classes
+
+# ---------- CIFAR-10 downsampled (16x16) — 4x fewer events, sync_rate = 16*3 ----------
+# dataset: cifar10
+# layer_sizes:
+#   - [3, 16, 16]                           # Input: 3 channels, 16x16 (2x2 avg-pooled)
 #   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
 #   - [5, [3, 3], [1, 1], [1, 1], "max"]    # Conv + pool: 5 filters
 #   - [128]                                  # FC: 128 units
 #   - [10]                                   # Output: 10 classes
 
 layer_sizes:
-  - [3, 32, 32]                           # Input
-  - [128, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
-  - [128, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+  - [3, 16, 16]                           # Input
+  - [64, [3, 3], [1, 1], [1, 1], ""]      # Conv block 1: 64 filters
+  - [64, [3, 3], [1, 1], [1, 1], "max"]   # Conv + max pool
+  - [128, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
+  - [128, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
   - [256, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
   - [256, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
-  - [512, [3, 3], [1, 1], [1, 1], ""]     # Conv block 2: 128 filters
-  - [512, [3, 3], [1, 1], [1, 1], "max"]  # Conv + max pool
   - [512]                                  # FC layer
   - [10]   
 
@@ -186,12 +193,16 @@ layer_sizes:
 # ============================================================================
 # TRAINING PARAMETERS
 # ============================================================================
-batch_size: 12              # Number of samples per batch
-num_epochs: 10              # Number of training epochs
+batch_size: 64              # Number of samples per batch
+num_epochs: 5              # Number of training epochs
+train_subset_batches: 40   # Limit training to N batches per epoch for quick debugging (null = use all)
+augment: true        # CIFAR-10 only: random flip + pad-4/crop augmentation per batch
+
 # learning_rate: 0.0005       # Learning rate for optimizer
-learning_rate: 0.1       # Learning rate for optimizer
-# optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
-optimizer: sgd_onecycle             # Choice of optimizer (adam, sgd, adamw, rmsprop)
+learning_rate: 0.001       # Learning rate for optimizer
+optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
+# optimizer: adagrad
+
 
 # ============================================================================
 # MODEL LOADING/SAVING
@@ -206,7 +217,8 @@ best: false                 # Legacy parameter, keep as false
 # rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_L15_L10_acc0.939_adam_.json"
 # rerun = "network_results/mnist/training/CNN/downsampled/42_ep20_b36_C1x14x14_C3x1x3x3_C5x3x3x3_P2x2_L15_L10_acc0.912_adam_.json"
 
-rerun : network_results/mnist/training/CNN/sync/load_false/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json
+rerun : network_results_surf/mnist/training/CNN/42_ep5_b120_C1x28x28_C32x1x3x3_C64x32x3x3_P2x2_C128x64x3x3_C256x128x3x3_P2x2_L256_L128_L10_acc0.975_adam_.json
+# rerun : network_results/mnist/training/CNN/sync/load_false/42_ep20_b36_C1x28x28_C3x1x3x3_C5x3x3x3_L128_L10_acc0.981_adam_.json
 rerun: null
 
 # List of parameters to override from the loaded model
@@ -234,7 +246,7 @@ shuffle_input: false
 
 firing_nb: 1
 # firing_nb: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-sync_rate: [96, 96, 1, 1, 1, 1, 1, 1, 1, 1]
+# sync_rate: [96, 96, 1, 1, 1, 1, 1, 1, 1, 1]
 sync_rate: 1
 
 # ============================================================================
@@ -245,3 +257,4 @@ sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 w_reg: 0.0
 top_weights: -1
 history_size: 0
+output_decay: 1.0               # Per-event weight decay at output layer (1.0 = uniform, <1 = earlier events dominate)

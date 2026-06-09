@@ -132,18 +132,24 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
 
     def last_layer_case(): # No need for additional computation at the output layer
         new_values_history, new_history_index = neuron_states.values_history, neuron_states.history_index
+
+        # Apply per-event weight decay: contribution at event t is scaled by output_decay^t.
+        # (activations - neuron_states.values) isolates the new dot-product contribution;
+        # for END_SIGNAL (invalid_idx) this term is zero, so no special casing needed.
+        decayed_activations = neuron_states.values + (activations - neuron_states.values) * (params.output_decay ** iteration)
+
         if params.history_size > 0:
-            new_values_history, new_history_index = update_history(new_values_history, new_history_index, activations)
+            new_values_history, new_history_index = update_history(new_values_history, new_history_index, decayed_activations)
 
         shape = 2
         if not is_MLP:
             shape = 4 # CNN network output format: (c, x, y, v)
 
         dummy_activations = jnp.zeros((activations.shape[0], shape))
-        
+
         # if layer_idx == 2:
         #     jax.debug.print("rank {}, is_MLP: {}, H {}, W {}, neuron idx: {}, dummy_activations {}", mpi_config.rank, is_MLP, H, W, neuron_idx, dummy_activations)
-        return jnp.array(0), dummy_activations, neuron_states.replace(  values=activations,
+        return jnp.array(0), dummy_activations, neuron_states.replace(  values=decayed_activations,
                                                                         input_residuals=new_input_residuals,
                                                                         input_activity=new_input_activity,
                                                                         values_history=new_values_history,
@@ -491,9 +497,12 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
       - Any combination of the above.
     '''
     out_ch, in_ch, k_h, k_w = weights.shape
-    H, W = neuron_states.values.shape[1], neuron_states.values.shape[2] # c, h, w
     c, x, y = neuron_idx
     pad_value = jnp.asarray(-10000.0, dtype=neuron_states.values.dtype)
+    pad_h, pad_w = neuron_states.padding
+    event_pad_h, event_pad_w = k_h - 1 - pad_h, k_w - 1 - pad_w
+    H = neuron_states.values.shape[1] - 2 * event_pad_h
+    W = neuron_states.values.shape[2] - 2 * event_pad_w
 
     # Determine owned region from model partition (static at trace time)
     model_part = mpi_config.model_part
@@ -510,6 +519,16 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         x_start, x_end = 0, H - 1
         y_start, y_end = 0, W - 1
 
+    sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[mpi_config.layer_idx]
+    if sr == 10000:
+        if neuron_states.pooling != "":
+            C_f, H_f, W_f = params.flat_layer_sizes[mpi_config.layer_idx]
+            event_array_size = C_f * H_f * W_f
+        else:
+            event_array_size = out_ch * H * W
+    else:
+        event_array_size = out_ch * k_h * k_w
+
     @jit
     def regular_input(neuron_states):
         # Step 1: Multiply the input value by the flipped kernel to obtain partial output values
@@ -518,8 +537,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
 
         # Step 2: Build masks for owned region — zero out kernel positions outside this rank's slice.
         # Kernel position (oc, kx, ky) maps to output padded position (x + kx, y + ky) and output channel oc.
-        pad_h, pad_w = neuron_states.padding
-        event_pad_h, event_pad_w = k_h-1 - pad_h, k_w-1 - pad_w
+        # event_pad_h/w and H/W are captured from the outer scope (computed once, not per event).
 
         # Output channel mask: kernel rows for owned output channels only
         oc_indices = jnp.arange(out_ch)  # (out_ch,)
@@ -540,8 +558,8 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         # For output-channel / spatial splits the weights cover all input channels, so no masking needed.
         # For input-channel splits (not currently supported), the caller would need to restructure weights.
 
-        values_padded = jnp.pad(neuron_states.values, ((0, 0), (event_pad_h, event_pad_h), (event_pad_w, event_pad_w)), constant_values=pad_value)
-        thresholds_padded = jnp.pad(neuron_states.thresholds, ((0, 0), (event_pad_h, event_pad_h), (event_pad_w, event_pad_w)))
+        values_padded = neuron_states.values
+        thresholds_padded = neuron_states.thresholds
 
         start_indices = (0, x, y)
         slice_shape = partial_activations.shape  # (out_ch, k_h, k_w)
@@ -594,13 +612,14 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         # Step 9: Compute remaining values
         remaining_value = updated_values_slice - penalty
 
+        remaining_value = jnp.where(padding_mask == 0, pad_value, remaining_value)
         values_padded = jax.lax.dynamic_update_slice(values_padded, remaining_value, start_indices)
-        new_values = values_padded[:, event_pad_h:H+event_pad_h, event_pad_w:W+event_pad_w]
+        new_values = values_padded
 
         # Step 10: Apply pooling and compute output events
         nb_valid_elements, out_events, unpooled_coords, unpooled_vals = output_to_event_array_with_pooling(activated_output,
                                                                        start_indices,
-                                                                       new_values.shape,
+                                                                       (out_ch, H, W),
                                                                        (event_pad_h, event_pad_w),
                                                                        neuron_states.pooling,
                                                                        neuron_states.pool_size,
@@ -664,11 +683,8 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
 
     @jit
     def last_input(neuron_states):
-        sr = params.sync_rate
-        sr = sr if isinstance(sr, int) else sr[mpi_config.layer_idx]
-        if sr == 1:
-            C, H, W = params.flat_layer_sizes[mpi_config.layer_idx]
-            return jnp.array(0), jnp.zeros((C*H*W, 4)), neuron_states
+        if sr != 10000:
+            return jnp.array(0), jnp.zeros((event_array_size, 4)), neuron_states
 
         # For full sync case, fire all neurons that are above the threshold
         neuron_val = neuron_states.values
@@ -721,8 +737,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             new_layer_activity = neuron_states.layer_activity
         new_ns = neuron_states.replace(values=new_values, layer_activity=new_layer_activity)
         # No new fired events — firing happens when a future regular event crosses threshold.
-        C, H, W = params.flat_layer_sizes[mpi_config.layer_idx]
-        return jnp.array(0), jnp.zeros((C*H*W, 4)), new_ns
+        return jnp.array(0), jnp.zeros((event_array_size, 4)), new_ns
 
     nb_valid_elements, out_events, neuron_states = jax.lax.cond(
         is_residual,

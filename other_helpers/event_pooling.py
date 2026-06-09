@@ -118,77 +118,53 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
     )
     safe_pooled_idx = jnp.where(valid, pooled_idx, 0) # Replace invalid indices with a safe dummy (0)
 
-    num_segments = C * Hp * Wp # Number of cells in pooling layer
-    # jax.debug.print("After pooling indexes {} {} {} {} {}", pooled_c, pooled_x, pooled_y, pooled_idx, num_segments)
+    N = events.shape[0]
+    num_segments = C * Hp * Wp
 
-    # --- pooling ---
     if mode == "max":
-        # Replace invalid values so they never affect max
         safe_values = jnp.where(valid, values, -jnp.inf)
+        pooled_max = jax.ops.segment_max(safe_values, safe_pooled_idx, num_segments=num_segments)  # (C*Hp*Wp,)
 
-        pooled_values = jax.ops.segment_max(
-            safe_values,
+        # For each input event, check whether it is the unique winner of its pooling cell.
+        # "Unique" breaks ties by keeping the smallest event index.
+        per_event_max = pooled_max[safe_pooled_idx]  # (N,)
+        is_candidate = valid & (values > 0) & (values == per_event_max)
+        first_winner = jax.ops.segment_min(
+            jnp.where(is_candidate, jnp.arange(N), N),
             safe_pooled_idx,
-            num_segments=num_segments
-        )
-        # jax.debug.print("valid {}, \nsafe pooled idx {}, \nsafe values {}, \npooled values {} ",valid,  safe_pooled_idx, safe_values, pooled_values)
-        
-        # replace empty segments (-inf) with pad_value (0.0)
-        pooled_values = jnp.where(jnp.isneginf(pooled_values), pad_value, pooled_values)
+            num_segments=num_segments,
+        )  # (C*Hp*Wp,)
+        is_unique_winner = is_candidate & (jnp.arange(N) == first_winner[safe_pooled_idx])
 
-        # Compute the original index of the max values
-        is_max = values == pooled_values[safe_pooled_idx]
-        idx = jnp.arange(values.shape[0])
-        argmax_idx = jax.ops.segment_min(jnp.where(is_max, idx, values.shape[0]),
-                                        safe_pooled_idx,
-                                        num_segments=num_segments)
-        
-        # Get the unpooled values for bpp
-        unpooled = jnp.zeros_like(values)
-        unpooled = unpooled.at[argmax_idx].set(pooled_values) # out of bound indexes are ignored in JAX
-        # jax.debug.print("is max {}, idx {}, argmax_idx {}, segmin data {}, unpooled {} unpooled coords {} safe pooled idx {}, max pooled idx {} values {}", 
-        #                 is_max, idx, argmax_idx, jnp.where(is_max, idx, values.shape[0]), unpooled, coords, safe_pooled_idx, 
-        #                 jnp.where(argmax_idx < 1000000000, safe_pooled_idx[argmax_idx], -1), safe_values)
-        unpooled_vals = unpooled
-    elif mode == "avg": # TODO fix average pooling
-        # Replace invalid values so they never affect avg
-        safe_values = jnp.where(valid, values, 0)
+        out_val = jnp.where(is_unique_winner, values, 0.0)
+        unpooled_vals = out_val  # pre-pool value at the winning cell, 0 elsewhere
 
-        # segment_sum returns 0 for empty segments
+    elif mode == "avg":
+        safe_values = jnp.where(valid, values, 0.0)
         sums = jax.ops.segment_sum(safe_values, safe_pooled_idx, num_segments=num_segments)
-
-        # average over full kernel area (include zeros)
-        area = ph * pw
-        pooled_values = sums / float(area)
-        jax.debug.print("safe values {} after segment sum and avg {} {} ", safe_values, sums, pooled_values)
+        pooled_avg = sums / float(ph * pw)
+        first_event = jax.ops.segment_min(
+            jnp.where(valid, jnp.arange(N), N),
+            safe_pooled_idx,
+            num_segments=num_segments,
+        )
+        is_unique_winner = valid & (jnp.arange(N) == first_event[safe_pooled_idx])
+        out_val = jnp.where(is_unique_winner, pooled_avg[safe_pooled_idx], 0.0)
         unpooled_vals = safe_values
     else:
         raise ValueError("mode must be 'max' or 'avg'")
 
-    # # reconstruct coords for every pooled cell in canonical order
-    # pooled_c_full = jnp.repeat(jnp.arange(C, dtype=jnp.int32), Hp * Wp)
-    # pooled_x_full = jnp.tile(jnp.repeat(jnp.arange(Hp, dtype=jnp.int32), Wp), C)
-    # pooled_y_full = jnp.tile(jnp.arange(Wp, dtype=jnp.int32), C * Hp)
+    # Build (N, 4) output — one row per input event, using its pre-computed pooled coords.
+    # Sort winners to front ordered by pooling cell index so downstream emit order matches
+    # what the original full-map implementation produced (stable, ascending cell index).
+    out = jnp.stack([pooled_c.astype(jnp.float32),
+                     pooled_x.astype(jnp.float32),
+                     pooled_y.astype(jnp.float32),
+                     out_val], axis=-1)  # (N, 4)
 
-    # coords_full = jnp.stack([pooled_c_full, pooled_x_full, pooled_y_full], axis=-1)  # (num_segments, 3)
-    # jax.debug.print("pooled coords full {}, coords {} pooled values {}", coords_full, coords, pooled_values)
-    # out = jnp.concatenate([coords_full, pooled_values[:, None]], axis=-1)  # (num_segments, 4)
-
-    max_pooled_idx = jnp.where(argmax_idx < 1000000000, safe_pooled_idx[argmax_idx], -1)
-    # Convert flat indices to (c, x, y) coordinates
-    pooled_c = max_pooled_idx // (Hp * Wp)
-    pooled_x = (max_pooled_idx % (Hp * Wp)) // Wp
-    pooled_y = max_pooled_idx % Wp
-
-    # Stack to get coordinates
-    coords_sparse = jnp.stack([pooled_c, pooled_x, pooled_y], axis=-1)  # (num_events, 3)
-
-    # Concatenate with pooled values
-    out = jnp.concatenate([coords_sparse, pooled_values[:, None]], axis=-1)  # (num_events, 4)
-
-    # jax.debug.print("new pooled coords sparse {}, pooled values {}, out shape {}", coords_sparse, pooled_values, out.shape)
-
-    nb_valid_el, compact_out = compact_nonzero_and_pad(out)
+    sort_key = jnp.where(is_unique_winner, safe_pooled_idx, num_segments)
+    compact_out = out[jnp.argsort(sort_key)]
+    nb_valid_el = jnp.sum(is_unique_winner).astype(jnp.int32)
 
     return nb_valid_el, compact_out, coords, unpooled_vals
 
@@ -241,28 +217,10 @@ def output_to_event_array_with_pooling(activated_output, start_indices, end_indi
         nb_valid_el, padded_out_events, unpooled_coords, unpooled_vals = sparse_pool(out_events, end_indices, pooling, pool_size, pool_stride)
         # jax.debug.print("after pool el: {} and out shape: {}", nb_valid_el, padded_out_events.shape)
     else:
-        # Compute full size and valid size
-        target_size = (end_indices[0]) * (end_indices[1]) * (end_indices[2])
-        out_size = activated_output.size
-        nb_valid_el = jnp.count_nonzero(out_events[:, 3])
-        
-        # jax.lax.cond
-        # Pad out_events to full size
-        # pad_to_full_size = jnp.full((target_size-nb_valid_el, 4), -2)
-        # padded_out_events = jnp.concatenate([out_events, pad_to_full_size])
-        
-        pad_len = target_size - out_size
+        nb_valid_el, padded_out_events = compact_nonzero_and_pad(out_events)
 
-        padded_out_events = jnp.pad(
-            out_events,
-            pad_width=((0, pad_len), (0, 0)),  # pad rows only
-            mode="constant",
-            constant_values=-2
-        )
-        nb_valid_el, padded_out_events = compact_nonzero_and_pad(out_events, pad_len)
-
-        unpooled_coords = out_events[:, :3].astype(jnp.int32) # (N,3) integers
-        unpooled_vals = out_events[:, 3].astype(jnp.float32) # (N,)
+        unpooled_coords = out_events[:, :3].astype(jnp.int32)
+        unpooled_vals = out_events[:, 3].astype(jnp.float32)
 
         # jax.debug.print("rank {} nbvalid el: {}, values {} compact out {}", rank, nb_valid_el, out_events, compact_out)
     # jax.debug.print("nbvalid el: {}, padded out events shape: {}, out events: {}", nb_valid_el, padded_out_events.shape, out_events)

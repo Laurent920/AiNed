@@ -33,13 +33,14 @@ from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.iris_species_helper import torch_iris_loader
 from dataset_helpers.network_helper import one_hot_encode
 
-from other_helpers.helpers import Params, NeuronStates
+from other_helpers.helpers import BaseParams, NeuronStates
 from other_helpers.helpers import accuracy, store_training_data, rerun_init, store_data_to_json
 from other_helpers.helpers import process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
 from other_helpers.general_MPI_helper import data_split, model_split_custom, model_split
+from other_helpers.init_weights import init_params
 from forward_backward_pass.inference import predict, layer_computation
 
 jax.config.update("jax_debug_nans", True)
@@ -65,6 +66,9 @@ training_generator = None
 validation_generator = None
 test_generator = None
 
+@dataclasses.dataclass(frozen=True)
+class Params(BaseParams):
+    pass
 
 #region Training helpers
 @partial(jax.jit, static_argnames=['params'])
@@ -259,7 +263,10 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
         opt_state = solver.init(weights)
     
     th_solver = optax.adam(learning_rate=params.threshold_lr)
-    th_opt_state = th_solver.init(jax.scipy.special.logit(empty_neuron_states.thresholds))
+    if params.init_thresholds != 0:
+        th_opt_state = th_solver.init(jax.scipy.special.logit(empty_neuron_states.thresholds))
+    else:
+        th_opt_state = th_solver.init(empty_neuron_states.thresholds)
     
     # Synchronize all ranks and start timer
     mpi4jax.barrier(comm=comm)
@@ -342,11 +349,12 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
 
                     # Update thresholds
                     if params.threshold_lr != 0:
-                        # print(f"average threshold grad: {jnp.mean(threshold_grad)}")
-                        th_updates, th_opt_state = solver.update(threshold_grad, th_opt_state, empty_neuron_states.thresholds)
-                        new_thresholds = jax.nn.sigmoid(optax.apply_updates(
-                                                            jax.scipy.special.logit(empty_neuron_states.thresholds), th_updates))
-                                                                                 
+                        th_updates, th_opt_state = th_solver.update(threshold_grad, th_opt_state, empty_neuron_states.thresholds)
+                        if params.init_thresholds != 0:
+                            new_thresholds = jax.nn.sigmoid(optax.apply_updates(
+                                                jax.scipy.special.logit(empty_neuron_states.thresholds), th_updates))
+                        else:
+                            new_thresholds = optax.apply_updates(empty_neuron_states.thresholds, th_updates)
                         empty_neuron_states = empty_neuron_states.replace(thresholds=new_thresholds)
                 # Update weights
                 if solver is not None:
@@ -693,10 +701,10 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                 accuracies[dataset] = [epoch_accuracy]
 
             store_training_data(size,
-                                params, 
+                                params,
                                 "inference",
-                                accuracies["train"], 
-                                accuracies["val"], 
+                                accuracies["train"],
+                                accuracies["val"],
                                 accuracies["test"][0],
                                 execution_time,
                                 all_iteration_mean,
@@ -706,7 +714,8 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                                 "",
                                 "MLP",
                                 all_history,
-                                total_batches)
+                                total_batches,
+                                extra_fields={"processes_per_layer": processes_per_layer_global})
     return epoch_accuracy, mean, end_time - start_time
 
 # region Main
@@ -861,6 +870,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         top_weights=config['top_weights'],
         history_size=config['history_size'],
         use_bias=config['use_bias'],
+        output_decay=config.get('output_decay', 1.0),
     )
 
     if trial is not None:

@@ -77,27 +77,23 @@ def normalize_per_channel(flat_images):
     Apply (x - mean) / std per channel on a flat (N, H*W*C) array that still has
     RGB interleaved at each pixel (i.e. stride-3 channel dimension).
     """
-    # reshape to (N, H*W, 3) to broadcast per-channel mean/std
-    n = flat_images.shape[0]
-    reshaped = flat_images.reshape(n, NUM_PIXELS, NUM_CHANNELS)
+    n, total = flat_images.shape
+    reshaped = flat_images.reshape(n, total // NUM_CHANNELS, NUM_CHANNELS)
     reshaped = (reshaped - CIFAR10_MEAN) / CIFAR10_STD
-    return reshaped.reshape(n, NUM_FEATURES)
+    return reshaped.reshape(n, total)
 
 
 def preprocess_dataset_sequential(dataset_x):
     """
     Apply sequential preprocessing to the whole dataset.
 
-    dataset_x: shape (N, NUM_FEATURES), already normalized.
-    Returns: shape (N, NUM_FEATURES, 2), with column 0 holding the input-neuron
-    index (0..NUM_FEATURES-1 in row-major, RGB-interleaved order) and column 1
-    the normalized value — analogous to MNIST's non-sequential (idx, value)
-    format but with every pixel/channel emitted, so the network sees the whole
-    image row by row.
+    dataset_x: shape (N, num_features), already normalized.
+    Returns: shape (N, num_features, 2), with column 0 holding the input-neuron
+    index and column 1 the normalized value.
     """
-    N = dataset_x.shape[0]
-    out = np.zeros((N, NUM_FEATURES, 2), dtype=np.float32)
-    out[:, :, 0] = np.arange(NUM_FEATURES, dtype=np.float32)
+    N, num_features = dataset_x.shape
+    out = np.zeros((N, num_features, 2), dtype=np.float32)
+    out[:, :, 0] = np.arange(num_features, dtype=np.float32)
     out[:, :, 1] = dataset_x
     return out
 
@@ -106,23 +102,19 @@ def preprocess_dataset_CNN(dataset_x):
     """
     Apply CNN preprocessing to the whole dataset.
 
-    dataset_x: shape (N, NUM_FEATURES), already normalized, RGB interleaved per
-    pixel in row-major order (same layout as `preprocess_dataset_sequential`).
-    Returns: shape (N, NUM_FEATURES, 4), each event formatted as (channel, row,
-    col, value) — matching the CNN input format used by [async_CNN.py] and
-    mirroring `preprocess_dataset_CNN` in [dataset_helpers/mnist_helper.py].
-
-    Emission order per image: for row r in 0..31, for col c in 0..31, for
-    channel ch in (R=0, G=1, B=2): event (ch, r, c, v). So the network sees
-    every pixel's RGB triple together, row by row.
+    dataset_x: shape (N, num_features), already normalized, RGB interleaved per
+    pixel in row-major order.
+    Returns: shape (N, num_features, 4), each event formatted as (channel, row,
+    col, value) — matching the CNN input format used by async_CNN.py.
     """
-    N = dataset_x.shape[0]
-    # Build the (channel, row, col) index table once.
-    rows = np.repeat(np.arange(IMG_SIZE, dtype=np.float32), IMG_SIZE * NUM_CHANNELS)
-    cols = np.tile(np.repeat(np.arange(IMG_SIZE, dtype=np.float32), NUM_CHANNELS), IMG_SIZE)
-    chans = np.tile(np.arange(NUM_CHANNELS, dtype=np.float32), NUM_PIXELS)
+    N, num_features = dataset_x.shape
+    img_size = int(round((num_features / NUM_CHANNELS) ** 0.5))
 
-    out = np.zeros((N, NUM_FEATURES, 4), dtype=np.float32)
+    rows = np.repeat(np.arange(img_size, dtype=np.float32), img_size * NUM_CHANNELS)
+    cols = np.tile(np.repeat(np.arange(img_size, dtype=np.float32), NUM_CHANNELS), img_size)
+    chans = np.tile(np.arange(NUM_CHANNELS, dtype=np.float32), img_size * img_size)
+
+    out = np.zeros((N, num_features, 4), dtype=np.float32)
     out[:, :, 0] = chans
     out[:, :, 1] = rows
     out[:, :, 2] = cols
@@ -130,11 +122,69 @@ def preprocess_dataset_CNN(dataset_x):
     return out
 
 
+def _downsample_images_2x(images):
+    """2x2 average-pool (N, H, W, C) uint8 images to (N, H//2, W//2, C)."""
+    N, H, W, C = images.shape
+    pooled = images.reshape(N, H // 2, 2, W // 2, 2, C).mean(axis=(2, 4))
+    return np.clip(np.round(pooled), 0, 255).astype(np.uint8)
+
+
+def _augment_hwc(imgs):
+    """Random horizontal flip + pad-4/random-crop on (B, H, W, C) float32 images."""
+    B, H, W, C = imgs.shape
+    imgs = imgs.copy()
+    flip = np.random.rand(B) > 0.5
+    imgs[flip] = imgs[flip, :, ::-1, :]
+    padded = np.pad(imgs, [(0, 0), (4, 4), (4, 4), (0, 0)], mode='reflect')
+    for i in range(B):
+        t = np.random.randint(0, 9)
+        l = np.random.randint(0, 9)
+        imgs[i] = padded[i, t:t+H, l:l+W, :]
+    return imgs
+
+
+class AugmentingCNNDataLoader:
+    """Per-batch random augmentation + CNN preprocessing for CIFAR-10 training.
+
+    Stores flat normalized (N, H*W*C) images and applies flip+crop augmentation
+    followed by CNN event formatting (channel, row, col, value) in __next__, so
+    each epoch sees different augmentations without any preprocessing cache.
+    """
+
+    def __init__(self, flat_X, Y, batch_size, sample_indices, shuffle, img_size):
+        self.flat_X = flat_X
+        self.Y = Y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.array(sample_indices)
+        self.img_size = img_size
+
+    def __iter__(self):
+        idx = self.indices.copy()
+        if self.shuffle:
+            np.random.shuffle(idx)
+        self._batches = [idx[i:i + self.batch_size] for i in range(0, len(idx), self.batch_size)]
+        self._cur = 0
+        return self
+
+    def __next__(self):
+        if self._cur >= len(self._batches):
+            raise StopIteration
+        idx = self._batches[self._cur]
+        self._cur += 1
+        x = self.flat_X[idx]
+        imgs = x.reshape(len(idx), self.img_size, self.img_size, NUM_CHANNELS)
+        imgs = _augment_hwc(imgs)
+        return preprocess_dataset_CNN(imgs.reshape(len(idx), -1)), self.Y[idx]
+
+
 def cifar10_loader_manual(batch_size,
                           shuffle=False,
                           preprocess=True,
                           CNN_preprocess=False,
                           normalize=True,
+                          downsample=False,
+                          augment=False,
                           data_dir="",
                           cache_dir='./cache/cifar10',
                           **_ignored):
@@ -158,9 +208,47 @@ def cifar10_loader_manual(batch_size,
 
     download_cifar10(dataset_folder)
 
+    if augment and CNN_preprocess:
+        print("CIFAR-10: augmentation enabled (random flip + pad-4/crop) — bypassing event cache")
+        # Augmentation is applied per-batch at runtime, so we bypass the event-format
+        # cache and work on flat normalized images directly.
+        train_raw = np.load(os.path.join(dataset_folder, 'cifar10_train.npz'))
+        test_raw  = np.load(os.path.join(dataset_folder, 'cifar10_test.npz'))
+        train_imgs = _downsample_images_2x(train_raw['x']) if downsample else train_raw['x']
+        test_imgs  = _downsample_images_2x(test_raw['x'])  if downsample else test_raw['x']
+        cifar_x      = flatten_row_major(train_imgs)
+        cifar_y      = train_raw['y']
+        cifar_x_test = flatten_row_major(test_imgs)
+        cifar_y_test = test_raw['y']
+        if normalize:
+            cifar_x      = normalize_per_channel(cifar_x)
+            cifar_x_test = normalize_per_channel(cifar_x_test)
+        img_size = train_imgs.shape[1]
+
+        train_indices, val_indices = network_helper.train_validate_split(cifar_y, val_ratio=0.2, shuffle=shuffle)
+        test_indices, _ = network_helper.train_validate_split(cifar_y_test, val_ratio=0, shuffle=shuffle)
+
+        train_dataloader = AugmentingCNNDataLoader(
+            cifar_x, cifar_y, batch_size, train_indices, shuffle=shuffle, img_size=img_size)
+        val_x  = preprocess_dataset_CNN(cifar_x[val_indices])
+        test_x = preprocess_dataset_CNN(cifar_x_test[test_indices])
+        val_dataloader  = network_helper.DataLoader(val_x,  cifar_y[val_indices],       batch_size, list(range(len(val_indices))),  shuffle=False)
+        test_dataloader = network_helper.DataLoader(test_x, cifar_y_test[test_indices], batch_size, list(range(len(test_indices))), shuffle=False)
+
+        total_train_batches = network_helper.get_total_batches(batch_size, train_indices)
+        total_val_batches   = network_helper.get_total_batches(batch_size, val_indices)
+        total_test_batches  = network_helper.get_total_batches(batch_size, test_indices)
+
+        return ((train_dataloader, total_train_batches),
+                (val_dataloader, total_val_batches),
+                (test_dataloader, total_test_batches),
+                cifar_x.shape[1])
+
     if preprocess:
         suffix = "/async_CNN" if CNN_preprocess else "/async_MLP_sequential"
         cache_dir += suffix if normalize else suffix + "_no_norm"
+        if downsample:
+            cache_dir += "_ds2x"
 
     os.makedirs(cache_dir, exist_ok=True)
     train_cache_path = os.path.join(cache_dir, 'train.npz')
@@ -176,9 +264,12 @@ def cifar10_loader_manual(batch_size,
         train_raw = np.load(os.path.join(dataset_folder, 'cifar10_train.npz'))
         test_raw = np.load(os.path.join(dataset_folder, 'cifar10_test.npz'))
 
-        cifar_x = flatten_row_major(train_raw['x'])
+        train_images = _downsample_images_2x(train_raw['x']) if downsample else train_raw['x']
+        test_images = _downsample_images_2x(test_raw['x']) if downsample else test_raw['x']
+
+        cifar_x = flatten_row_major(train_images)
         cifar_y = train_raw['y']
-        cifar_x_test = flatten_row_major(test_raw['x'])
+        cifar_x_test = flatten_row_major(test_images)
         cifar_y_test = test_raw['y']
 
         if normalize:
@@ -209,8 +300,7 @@ def cifar10_loader_manual(batch_size,
     total_val_batches = network_helper.get_total_batches(batch_size, val_indices)
     total_test_batches = network_helper.get_total_batches(batch_size, test_indices)
 
-    # In sequential mode every feature is emitted, so max_nonzero == NUM_FEATURES.
-    max_nonzero = NUM_FEATURES
+    max_nonzero = cifar_x.shape[1]
 
     return ((train_dataloader, total_train_batches),
             (val_dataloader, total_val_batches),

@@ -36,13 +36,14 @@ from dataset_helpers.dvs_helper import torch_DVSGesture_loader
 from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.cnn_pytorch import get_weights_for_rank
 
-from other_helpers.helpers import Params, NeuronStates
+from other_helpers.helpers import BaseParams, NeuronStates
 from other_helpers.helpers import accuracy, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
 from other_helpers.general_MPI_helper import CNN_data_split, CNN_model_split_custom
+from other_helpers.init_weights import init_params
 from other_helpers.event_pooling import pool_output_size
 from forward_backward_pass.inference import predict, layer_computation as fc_layer_computation, conv_layer_computation
 
@@ -159,6 +160,11 @@ class ConvNeuronStates():
             pool_size=own_updates.get("pool_size", self.pool_size),
             pool_stride=own_updates.get("pool_stride", self.pool_stride),)
 
+@dataclasses.dataclass(frozen=True)
+class Params(BaseParams):
+    max_kernel: int | None = None
+    flat_layer_sizes: tuple[int, ...] | None = None
+
 #region Initialization
 @jax.tree_util.register_pytree_node_class
 @dataclasses.dataclass(frozen=True)
@@ -212,7 +218,8 @@ class Network:
                 key, subkey = jax.random.split(key) 
                 # thresholds = jax.random.uniform(subkey, layer) * params.init_thresholds + th_bias
                 thresholds = jnp.full(layer, params.init_thresholds)
-                sync_rate_vector = jnp.full(shape=layer, fill_value=params.sync_rate)
+                sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[i]
+                sync_rate_vector = jnp.full(shape=layer, fill_value=sr)
 
                 empty_neuron_states = NeuronStates(
                                     values=jnp.zeros(layer),
@@ -264,7 +271,11 @@ class Network:
 
                     if rank == 0 and debug:
                         print(f"rank {rank}, previous layer shape: {in_shape}, out shape: {(out_chan, h_out, w_out)}, kernel: {kernel}, padding: {padding}, stride: {stride}")
-                    values = jnp.zeros((out_chan, h_out, w_out))  # Initialize values for convolutional layer
+                    # Pre-pad values: border=-10000 (marks out-of-bounds), valid region=0.
+                    # Avoids a jnp.pad allocation on every conv event inside the while-loop.
+                    ep_h, ep_w = kernel[0] - 1 - padding[0], kernel[1] - 1 - padding[1]
+                    values = jnp.full((out_chan, h_out + 2*ep_h, w_out + 2*ep_w), -10000.0)
+                    values = values.at[:, ep_h:h_out+ep_h, ep_w:w_out+ep_w].set(0.0)
                     filename += f"_C{out_chan}x{in_chan}x{kernel[0]}x{kernel[1]}"
 
                 h_out_pool, w_out_pool = h_out, w_out
@@ -276,23 +287,24 @@ class Network:
                     elif pooling == "avg":
                         filename += f"_AvgP{pool_size[0]}x{pool_size[1]}"
 
-                key, subkey = jax.random.split(key) 
+                key, subkey = jax.random.split(key)
+                unpadded_shape = (out_chan, h_out, w_out)  # unpadded dims, used for gradient fields
                 # thresholds = jax.random.uniform(subkey, values.shape) * params.init_thresholds + th_bias
-                thresholds = jnp.full(values.shape, params.init_thresholds)
+                thresholds = jnp.full(values.shape, params.init_thresholds)  # pre-padded (same shape as values)
                 weights_shape = (out_chan, in_chan, kernel[0], kernel[1])
                 neuron_state = NeuronStates(
-                    values=values,
-                    bias=jnp.zeros(values.shape),
-                    thresholds=thresholds,
+                    values=values,                                                    # pre-padded
+                    bias=jnp.zeros(unpadded_shape),                                  # unpadded
+                    thresholds=thresholds,                                            # pre-padded
                     input_residuals=jnp.zeros(previous_layer.shape),
                     input_order=jnp.full(previous_layer.shape, -1, dtype=int),
                     input_activity=jnp.zeros(previous_layer.shape, dtype=int),
-                    layer_activity=jnp.zeros(values.shape),
-                    output_activity=jnp.zeros_like(values),  # placeholder, shape matches values
+                    layer_activity=jnp.zeros(unpadded_shape),                        # unpadded (used in gradient)
+                    output_activity=jnp.zeros_like(values),                          # pre-padded
                     last_sent_iteration=-1,
                     input_vector=jnp.zeros(previous_layer.shape),
-                    output_vector=jnp.zeros(values.shape),
-                    values_history=jnp.zeros((params.history_size, *values.shape)),
+                    output_vector=jnp.zeros(unpadded_shape),                         # unpadded (used in gradient)
+                    values_history=jnp.zeros((params.history_size, *unpadded_shape)),# unpadded
                     history_index=jnp.array(0, dtype=jnp.int32),
                     weights_shape=weights_shape,
                     is_conv=True
@@ -312,7 +324,7 @@ class Network:
                 layers.append(empty_conv_neuron)
                 previous_layer = jnp.zeros((out_chan, h_out_pool, w_out_pool)) # Shape after pooling 
                 flat_layer_sizes.append(previous_layer.shape)   # Shape after pooling
-                conv_layer_sizes.append(values.shape)           # Shape before pooling, needed to gather the thresholds after computation
+                conv_layer_sizes.append(unpadded_shape)          # Unpadded shape before pooling, used for gradient computation
         return cls(params=params, key=key, layers=tuple(layers), flat_layer_sizes=tuple(flat_layer_sizes), conv_layer_sizes=tuple(conv_layer_sizes), filename=filename)
 
     def init_weights(self):
@@ -321,7 +333,7 @@ class Network:
         
         Returns the weights correponding to the MPI layer_idx.
         ''' 
-        weights = init_params(self.key, self.layers, self.params, self.filename)
+        weights = init_params(self.key, self.layers, self.params, layer_idx, self.filename)
         return weights
     
     def rerun(self, thresholds):
@@ -352,51 +364,6 @@ class Network:
     def tree_unflatten(cls, aux_data, children):
         params, layers, key = children
         return cls(params=params, layers=layers, key=key)
-
-#region init_params
-def init_params(key, layers, params, filename="", best=False):
-    # Initialize weights for each layer
-    keys = jax.random.split(key, len(layers))
-    load_file = params.load_file
-
-    if layer_idx != 0:
-        if load_file:
-            folder = f"tensor_data/CNN/{params.dataset}/"
-            f = "tensor_data"+filename+".npz"
-            return get_weights_for_rank(folder+f, layer_idx)
-
-        # Random initialization of the weights       
-        layer = layers[layer_idx]
-        weights_shape = layer.weights_shape
-    
-        if layer.is_conv:
-            out_ch, in_ch, kh, kw = weights_shape            
-            fan_in = in_ch * kh * kw
-        else:
-            fan_in = weights_shape[0]
-            fan_out = weights_shape[1]
-        
-            # bound = jnp.sqrt(6.0 / (fan_in+fan_out))
-            # return jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-            # std = jnp.sqrt(2.0 / fan_in)    
-            std = 1e-2 
-            weights_linear_layer = std * jax.random.normal(keys[layer_idx], weights_shape)
-            return weights_linear_layer
-        
-        # Kaiming He Uniform initialization
-        bound = jnp.sqrt(6.0 / fan_in)
-        weights_conv_layer = jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-        
-        # Kaiming He Normal initialization
-        std = jnp.sqrt(2.0 / fan_in)
-        weights_conv_layer = std * jax.random.normal(keys[layer_idx], weights_shape)
-
-
-        bound = jnp.sqrt(2.0 / fan_in)
-        weights_conv_layer = jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-        return weights_conv_layer
-    else:
-        return jnp.zeros((1,1,1,1)) # Return an empty holder for the weights of the input layer
 
 #region Training helpers
 @partial(jax.jit, static_argnames=['params', 'layer_computation', 'conv_layer_sizes'])
@@ -560,12 +527,6 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     input_residuals = all_neuron_states.input_residuals # Shape: (B, 3, 28, 28)
     weight_grad = jax.vmap(grad_w)(input_residuals, next_grad) # Shape: (B, 5, 3, 3, 3) #TODO Use batches in convolution directly instead of vmap?
 
-    # Sum over the batch (keepdims for the size-1 batch axis) so combine_batch_avg's
-    # mean is a no-op — matching MLP_back_prop's FC convention. Previously conv grads
-    # were meaned over the batch while FC grads were summed, making conv grads
-    # batch_size x smaller than FC grads (a conv/FC learning-rate imbalance).
-    weight_grad = jnp.sum(weight_grad, axis=0, keepdims=True) # Shape: (1, 5, 3, 3, 3)
-
     # weight_grad = weight_grad * weight_res
     weight_grad += 2 * params.w_reg * weights
 
@@ -598,8 +559,9 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     layer_activity = jnp.where(all_neuron_states.layer_activity > 0, 1, 0)
 
     th_grad = -jnp.mean(next_grad * layer_activity, axis=0)
-    thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
-    th_grad = th_grad * thresholds * (thresholds - 1)
+    if params.init_thresholds != 0:
+        thresholds = all_neuron_states.thresholds[0]
+        th_grad = th_grad * thresholds * (1 - thresholds)
 
     if layer_idx > 1:
         # Compute gradient w.r.t. previous layer's activations and send to all previous-layer ranks.
@@ -770,7 +732,10 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         opt_state = solver.init(weights)
     
     th_solver = optax.adam(learning_rate=params.threshold_lr)
-    th_opt_state = th_solver.init(empty_neuron_states.thresholds)
+    if params.init_thresholds != 0:
+        th_opt_state = th_solver.init(jax.scipy.special.logit(empty_neuron_states.thresholds))
+    else:
+        th_opt_state = th_solver.init(empty_neuron_states.thresholds)
     
     # Synchronize all ranks and start timer
     mpi4jax.barrier(comm=comm)
@@ -866,10 +831,15 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                         weight_grad = weight_grad + weight_sparsity_grad
                         threshold_grad = threshold_grad + threshold_sparsity_grad
                     
-                    # Update thresholds                    
+                    # Update thresholds
                     if params.threshold_lr != 0:
-                        th_updates, th_opt_state = solver.update(threshold_grad, th_opt_state, empty_neuron_states.thresholds)
-                        empty_neuron_states.thresholds = jax.nn.sigmoid(optax.apply_updates(empty_neuron_states.thresholds, th_updates)) # TODO Check if this still works
+                        th_updates, th_opt_state = th_solver.update(threshold_grad, th_opt_state, empty_neuron_states.thresholds)
+                        if params.init_thresholds != 0:
+                            new_th = jax.nn.sigmoid(optax.apply_updates(
+                                         jax.scipy.special.logit(empty_neuron_states.thresholds), th_updates))
+                        else:
+                            new_th = optax.apply_updates(empty_neuron_states.thresholds, th_updates)
+                        empty_neuron_states = empty_neuron_states.replace(thresholds=new_th)
       
                 # Update weights
                 if solver is not None:
@@ -1138,7 +1108,7 @@ def store_training_data_distributed(size, network, mode, all_epoch_accuracies, a
 
 
 # region Inference loop
-def batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True, readInputJson=False):    
+def batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True, readInputJson=False, extra_fields=None):
     global training_generator
     global validation_generator
     global test_generator    
@@ -1278,10 +1248,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
-    # all_iteration_mean = []
-    # if save:
-    #     all_iteration_mean = gather_iteration_means(mean)
-    all_iteration_mean = jnp.array(mean)
+    all_iteration_mean = gather_iteration_means_per_layer([float(mean)])
 
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
@@ -1312,6 +1279,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             "CNN",
             all_history,
             total_batches,
+            extra_fields,
         )
     return epoch_accuracy, mean, end_time - start_time
 
@@ -1423,7 +1391,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     if layer_sizes[0][1] == 64:
                         downsample = True
                 case "ncars":
-                    loader = partial(torch_NCARS_loader)
+                    loader = partial(torch_NCARS_loader, dedup=config.get('dedup', False), augment=config.get('augment', False))
                     if tuple(layer_sizes[0][1:]) == (60, 50):
                         downsample = True
                 case "cifar10":
@@ -1470,7 +1438,10 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             top_weights=config['top_weights'],
             max_kernel=max_kernel,
             flat_layer_sizes=(),            # Each layer's shape
-            history_size=config['history_size']                  # How many output states should we keep for plotting output history
+            history_size=config['history_size'],                 # How many output states should we keep for plotting output history
+            output_decay=config.get('output_decay', 1.0),       # Per-event weight decay at output layer
+            dedup=config.get('dedup', False),
+            augment=config.get('augment', False),
         )
 
         # Build the network using the above parameters and initialize the weights
@@ -1510,7 +1481,9 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         mode = config['mode']
         if mode == 'inference':
             # To only run inference
-            batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
+            batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True,
+                          extra_fields={"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
+                                        "split_dims": list(split_dims) if split_dims else None})
         elif mode == 'training':
             # To run the full training pipeline
             result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam",
@@ -1534,13 +1507,16 @@ if __name__ == "__main__":
                        help='Debug level for bug tests in inference.py (0=off, 1=BT1, 2=BT2, 3=BT3)')
     parser.add_argument('--max-test-batches', type=int, default=0,
                        help='Cap number of test batches (0 = no limit, for quick BT runs)')
+    parser.add_argument('--exp3-ordered-recv', action='store_true', default=False,
+                       help='EXP3: force serialized per-sender receives instead of MPI.ANY_SOURCE')
     args, unknown = parser.parse_known_args()
-    
+
     random_seed = args.seed
     key = jax.random.key(random_seed)
 
     import forward_backward_pass.inference as _inf_mod
     _inf_mod._DEBUG_LEVEL = args.debug_level
+    _inf_mod._EXP3_ORDERED_RECV = args.exp3_ordered_recv
     max_test_batches = args.max_test_batches
 
     # Initialize MPI

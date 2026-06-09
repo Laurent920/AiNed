@@ -221,10 +221,10 @@ class BaseParams:
     rerun: str
     top_weights: int             # Top-k weights by absolute value used per neuron (-1 = all)
     history_size: int = 0        # Output states to keep for history plots
+    output_decay: float = 1.0   # Per-event weight decay at output layer: event t gets weight β^t (1.0 = no decay)
     use_bias: bool = False
-    dataset_file: str | None = None
-    collapse_units: bool = True
-    preserve_exact_times: bool = False
+    augment: bool = False        # CIFAR-10: random flip + pad-4/crop per batch
+    dedup: bool = False          # Remove spatial duplicates from event stream before training
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -234,6 +234,11 @@ class Params(BaseParams): #TODO Make params a file-local subclass of BaseParams 
     Legacy all-in-one params class kept for backwards compatibility.
     Prefer defining a file-local subclass of BaseParams instead.
     """
+    # Neural-decoding / event-timing parameters
+    dataset_file: str | None = None
+    collapse_units: bool = True
+    preserve_exact_times: bool = False
+
     # Additional inference logic parameters
     exploration_rate: float = 0.0
     trace_event_timing: bool = False
@@ -286,6 +291,7 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         - 'threshold_lr': Threshold learning rate
         - 'top_weights': Top-k weights to use
         - 'history_size': Number of output states to keep for plotting
+        - 'output_decay': Per-event weight decay at output layer
     
     Example:        
         # Override multiple training parameters
@@ -384,19 +390,25 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     threshold_lr_val = get_param('threshold_lr', 'threshold lr')
     top_weights_val = get_param('top_weights', 'top weights', default=-1)
     history_size_val = get_param('history_size', default=0)
+    output_decay_val = get_param('output_decay', default=1.0)
 
-    # Convert firing_nb to tuple if it's a list
+    # Convert firing_nb and sync_rate to tuple if it's a list
     if isinstance(firing_nb_val, list):
         firing_nb_val = tuple(firing_nb_val)
+        
+    if isinstance(sync_rate_val, list):
+        sync_rate_val = tuple(sync_rate_val)
 
     # Build the set of BaseParams fields to restore from the JSON, then call
     # dataclasses.replace(new_params, ...) so that any subclass-specific fields
     # (fptt_*, rhythm_*, etc.) are preserved from new_params unchanged.
     base_overrides = dict(
         dataset=new_params.dataset,
-        dataset_file=stored_data.get("dataset_file", new_params.dataset_file),
-        collapse_units=stored_data.get("collapse_units", new_params.collapse_units),
-        preserve_exact_times=stored_data.get("preserve_exact_times", new_params.preserve_exact_times),
+        **({
+            "dataset_file": stored_data.get("dataset_file", getattr(new_params, "dataset_file", None)),
+            "collapse_units": stored_data.get("collapse_units", getattr(new_params, "collapse_units", True)),
+            "preserve_exact_times": stored_data.get("preserve_exact_times", getattr(new_params, "preserve_exact_times", False)),
+        } if hasattr(new_params, "dataset_file") else {}),
         random_seed=new_params.random_seed,
         layer_sizes=layer_sizes,
         init_thresholds=init_thresholds_val,
@@ -416,6 +428,7 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
         rerun=data_file_path,
         top_weights=top_weights_val,
         history_size=history_size_val,
+        output_decay=output_decay_val,
     )
     # Only pass fields that actually exist on this subclass (guards against
     # files that use BaseParams directly without the optional base fields)
@@ -430,7 +443,11 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
     if layer_idx > 0:
         weights = jnp.array(weights_dict["layer_"+str(layer_idx)])
         if layer_idx < last_layer:
-            thresholds = jnp.array(threshold_dict["thresholds_"+str(layer_idx)])
+            stored_thresholds = jnp.array(threshold_dict["thresholds_"+str(layer_idx)])
+            if 'init_thresholds' in override_params:
+                thresholds = jnp.full_like(stored_thresholds, new_params.init_thresholds)
+            else:
+                thresholds = stored_thresholds
         else:
             thresholds = jnp.zeros(layer_sizes[layer_idx])
     else:
@@ -533,9 +550,11 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
     
     result_data = {
         "dataset": params.dataset,
-        "dataset_file": params.dataset_file,
-        "collapse_units": params.collapse_units,
-        "preserve_exact_times": params.preserve_exact_times,
+        **({
+            "dataset_file": params.dataset_file,
+            "collapse_units": params.collapse_units,
+            "preserve_exact_times": params.preserve_exact_times,
+        } if hasattr(params, "dataset_file") else {}),
         "time": float(execution_time),
         "loadfile": params.load_file,
         "shuffle activations": params.shuffle_activations,
@@ -554,6 +573,8 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "batch_size": params.batch_size,
         "learning rate": params.learning_rate,
         "use_bias": params.use_bias,
+        "augment": params.augment,
+        "dedup": params.dedup,
         "layer_sizes": params.layer_sizes,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
         "validation accuracy": np.array(all_validation_accuracies).tolist(),

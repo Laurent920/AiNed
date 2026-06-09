@@ -36,13 +36,14 @@ from dataset_helpers.dvs_helper import torch_DVSGesture_loader
 from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.cnn_pytorch import get_weights_for_rank
 
-from other_helpers.helpers import Params, NeuronStates
+from other_helpers.helpers import BaseParams, NeuronStates
 from other_helpers.helpers import accuracy, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
 from other_helpers.general_MPI_helper import CNN_data_split, CNN_model_split_custom, ResNet_data_split, ResNet_model_split_custom
+from other_helpers.init_weights import init_params
 from other_helpers.event_pooling import pool_output_size
 from forward_backward_pass.inference import predict, layer_computation as fc_layer_computation, conv_layer_computation
 
@@ -67,6 +68,11 @@ mpi_config = None           # MPIConfig class for mpi helpers functions
 training_generator = None
 validation_generator = None
 test_generator = None
+
+@dataclasses.dataclass(frozen=True)
+class Params(BaseParams):
+    max_kernel: int | None = None
+    flat_layer_sizes: tuple[int, ...] | None = None
 
 #region ConvNeuronStates
 @jax.tree_util.register_pytree_node_class
@@ -320,7 +326,7 @@ class Network:
         
         Returns the weights correponding to the MPI layer_idx.
         ''' 
-        weights = init_params(self.key, self.layers, self.params, self.filename)
+        weights = init_params(self.key, self.layers, self.params, layer_idx, self.filename)
         return weights
     
     def rerun(self, thresholds):
@@ -351,51 +357,6 @@ class Network:
     def tree_unflatten(cls, aux_data, children):
         params, layers, key = children
         return cls(params=params, layers=layers, key=key)
-
-#region init_params
-def init_params(key, layers, params, filename="", best=False):
-    # Initialize weights for each layer
-    keys = jax.random.split(key, len(layers))
-    load_file = params.load_file
-
-    if layer_idx != 0:
-        if load_file:
-            folder = f"tensor_data/CNN/{params.dataset}/"
-            f = "tensor_data"+filename+".npz"
-            return get_weights_for_rank(folder+f, layer_idx)
-
-        # Random initialization of the weights       
-        layer = layers[layer_idx]
-        weights_shape = layer.weights_shape
-    
-        if layer.is_conv:
-            out_ch, in_ch, kh, kw = weights_shape            
-            fan_in = in_ch * kh * kw
-        else:
-            fan_in = weights_shape[0]
-            fan_out = weights_shape[1]
-        
-            # bound = jnp.sqrt(6.0 / (fan_in+fan_out))
-            # return jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-            # std = jnp.sqrt(2.0 / fan_in)    
-            std = 1e-2 
-            weights_linear_layer = std * jax.random.normal(keys[layer_idx], weights_shape)
-            return weights_linear_layer
-        
-        # Kaiming He Uniform initialization
-        bound = jnp.sqrt(6.0 / fan_in)
-        weights_conv_layer = jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-        
-        # Kaiming He Normal initialization
-        std = jnp.sqrt(2.0 / fan_in)
-        weights_conv_layer = std * jax.random.normal(keys[layer_idx], weights_shape)
-
-
-        bound = jnp.sqrt(2.0 / fan_in)
-        weights_conv_layer = jax.random.uniform(keys[layer_idx], weights_shape, jnp.float32, -bound, bound)
-        return weights_conv_layer
-    else:
-        return jnp.zeros((1,1,1,1)) # Return an empty holder for the weights of the input layer
 
 #region Training helpers
 @partial(jax.jit, static_argnames=['params', 'layer_computation', 'conv_layer_sizes'])
@@ -1492,7 +1453,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             top_weights=config['top_weights'],
             max_kernel=max_kernel,
             flat_layer_sizes=(),            # Each layer's shape
-            history_size=config['history_size']                  # How many output states should we keep for plotting output history
+            history_size=config['history_size'],                 # How many output states should we keep for plotting output history
+            output_decay=config.get('output_decay', 1.0),       # Per-event weight decay at output layer
         )
 
         # Build the network using the above parameters and initialize the weights

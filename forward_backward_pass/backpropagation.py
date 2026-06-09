@@ -85,8 +85,9 @@ def MLP_back_prop(params, all_neuron_states, next_grad, layer_idx):
     mean_weight_grad = jnp.expand_dims(mean_weight_grad, axis=0)  # Shape: (1, 784, 128)
     layer_activity = jnp.where(all_neuron_states.layer_activity > 0, 1, 0)
     th_grad = -jnp.mean(next_grad * layer_activity, axis=0)  # Shape: (128)
-    thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
-    th_grad = th_grad * thresholds * (thresholds - 1)
+    if params.init_thresholds != 0:
+        thresholds = all_neuron_states.thresholds[0]
+        th_grad = th_grad * thresholds * (1 - thresholds)
     # jax.debug.print("{} {} {}", layer_activity.shape, thresholds, th_grad.shape)
     neuron_fired = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)  # (B, out_dim)
     # bias is added once per input event in the forward pass, so scale by total events per sample

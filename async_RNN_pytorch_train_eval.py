@@ -19,6 +19,7 @@ from async_RNN_pytorch_gradient_check import (  # noqa: E402
     keep_top_k_batch_torch,
 )
 from dataset_helpers.mnist_helper import mnist_loader_manual  # noqa: E402
+from other_helpers.init_weights import init_params  # noqa: E402
 
 
 class RTRLModel:

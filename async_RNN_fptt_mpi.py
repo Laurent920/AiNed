@@ -41,6 +41,7 @@ from other_helpers.helpers import update_history, process_history, load_config_w
 from forward_backward_pass.backpropagation import MLP_back_prop, RNN_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 from other_helpers.general_MPI_helper import model_split
+from other_helpers.init_weights import init_params
 
 jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_disable_jit", True)

@@ -13,6 +13,7 @@ from forward_backward_pass.backpropagation import MLP_back_prop
 from other_helpers.helpers import NeuronStates, Params, load_config_with_defaults
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 from other_helpers.event_pooling import pool_output_size
+from other_helpers.init_weights import init_params
 
 
 def one_hot(y, num_classes):
