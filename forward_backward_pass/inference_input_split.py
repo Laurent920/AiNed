@@ -9,7 +9,7 @@ from mpi4jax import send, recv, bcast
 from other_helpers.helpers import activation_func, keep_top_k
 from other_helpers.helpers import update_history
 from other_helpers.event_pooling import output_to_event_array_with_pooling, full_matrix_to_event_array_with_pooling
-from other_helpers.general_MPI_helper import CNN_layer_Partition
+from other_helpers.general_MPI_helper_input_split import CNN_layer_Partition
 
 # Set to 1/2/3 to enable Bug Tests 1/2/3 in conv runs.
 # 1 = BT1: output event coordinate assertion per input event
@@ -90,21 +90,24 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
         flat_layer_size = params.flat_layer_sizes[layer_idx-1]
         if len(flat_layer_size) == 3: # Fail safe in case there is no hidden layer
             C, H, W = flat_layer_size
-        
-        # if layer_idx == 2:
-        #     jax.debug.print("rank {}, is_MLP: {}, H {}, W {}, neuron idx: {}, flat layer sizes {}", mpi_config.rank, is_MLP, H, W, neuron_idx, flat_layer_size)
 
-        neuron_idx = c * (H * W) + x * W + y 
+        neuron_idx = c * (H * W) + x * W + y
 
-        # if layer_idx == 2:
-        #     jax.debug.print("rank {}, is_MLP: {}, H {}, W {}, neuron idx: {}, flat layer sizes {}", mpi_config.rank, is_MLP, H, W, neuron_idx, flat_layer_size)
+    # Compute local index (offset within this rank's input slice) for 2D weight blocks.
+    # When input_part is None (no split) or layer_idx == 0 the offset is 0.
+    _input_part = mpi_config.input_part
+    in_off = (_input_part.start_idx
+              if (_input_part is not None and layer_idx != 0)
+              else 0)
+    # local_idx is the index into the sliced weight/residual arrays; invalid when negative.
+    local_idx = jnp.where(neuron_idx >= 0, neuron_idx - in_off, neuron_idx)
 
     invalid_idx = neuron_idx < 0  # True when end-of-stream signal received
-    
+
     # Compute the new values of the neuron states
     activations = jax.lax.cond(invalid_idx,
                             lambda _: neuron_states.values,
-                            lambda _: jnp.dot(layer_input, weights[neuron_idx]) + neuron_states.values,
+                            lambda _: jnp.dot(layer_input, weights[local_idx]) + neuron_states.values,
                             None
                             )
     #TODO being able to compute multiple incoming index neurons
@@ -118,12 +121,12 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
     if grad:
         new_input_residuals = jax.lax.cond(invalid_idx,
                                 lambda _: neuron_states.input_residuals,
-                                lambda _: neuron_states.input_residuals.at[neuron_idx].add(layer_input),
+                                lambda _: neuron_states.input_residuals.at[local_idx].add(layer_input),
                                 None
                                 )
         new_input_activity = jax.lax.cond(invalid_idx,
                                 lambda _: neuron_states.input_activity,
-                                lambda _: neuron_states.input_activity.at[neuron_idx].add(1),
+                                lambda _: neuron_states.input_activity.at[local_idx].add(1),
                                 None
                                 )
     else:
@@ -186,16 +189,25 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
         if grad:
             active_indexes = active_mask.astype(neuron_states.layer_activity.dtype)
             last_neuron_idx = jnp.argmax(neuron_states.input_order)
-            new_neuron_idx = jax.lax.cond(invalid_idx, lambda _: last_neuron_idx, lambda _: neuron_idx, None)
+            new_local_idx = jax.lax.cond(invalid_idx, lambda _: last_neuron_idx, lambda _: local_idx, None)
+
+            # Guard input_vector update: END signal (invalid_idx) has neuron_idx < 0 which, after
+            # offset subtraction, may wrap to a large positive; use invalid_idx to skip the set.
+            safe_local_idx = jnp.where(invalid_idx, 0, local_idx)
 
             new_neuron_states = neuron_states.replace(
                 values=activations - penalty,
                 input_residuals=new_input_residuals,
                 input_activity=new_input_activity,
                 layer_activity=neuron_states.layer_activity + active_indexes,
-                input_order=neuron_states.input_order.at[new_neuron_idx].set(iteration),
-                output_activity=neuron_states.output_activity.at[new_neuron_idx].add(active_indexes),
-                input_vector=neuron_states.input_vector.at[neuron_idx].set(iteration + 1),
+                input_order=neuron_states.input_order.at[new_local_idx].set(iteration),
+                output_activity=neuron_states.output_activity.at[new_local_idx].add(active_indexes),
+                input_vector=jax.lax.cond(
+                    invalid_idx,
+                    lambda _: neuron_states.input_vector,
+                    lambda _: neuron_states.input_vector.at[safe_local_idx].set(iteration + 1),
+                    None,
+                ),
                 output_vector=jnp.where(active_mask, iteration + 1, neuron_states.output_vector),
                 last_sent_iteration=new_last_sent_iteration,
             )
@@ -284,40 +296,46 @@ def predict(params,
             perm = jax.random.permutation(key, x_p.shape[0])
             x_p = x_p[perm]
 
-        _next_sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[1]
-        if _next_sr == 10000:
-            # Bulk path: send all events in one MPI message instead of one per event.
-            # The receiver (sr=10000 layer) expects a (max_nonzero, 4) array followed by END_SIGNAL.
-            mask = x_p[:, 0] != -2
-            loop_iterations = jnp.count_nonzero(mask)
-            mpi_config.forward_send_bulk(x_p)
-        else:
-            def send_input(i, _):
-                data = x_p[i]
-                if _first_hidden_has_cnn_partition:
-                    # data = [c, x, y, value] — route only to affected next-layer ranks
-                    mpi_config.forward_send_cnn(
-                        data,
-                        data[0].astype(jnp.int32),
-                        data[1].astype(jnp.int32),
-                        data[2].astype(jnp.int32),
-                        _fh_k_h, _fh_k_w,
-                        _fh_event_pad_h, _fh_event_pad_w,
-                    )
-                else:
-                    mpi_config.forward_send(data)
-                return i
+        # Layer-0 input split: when multiple ranks share layer 0 (input_split > 1),
+        # each rank sends only the events whose feature index falls within its output
+        # (model_part) range.  Compact valid events to the front so the fori_loop count is right.
+        if layer_idx == 0 and len(mpi_config.current_layer) > 1 and message_size == 2:
+            mp = mpi_config.model_part
+            idxs = x_p[:, 0]
+            keep = jnp.logical_and(
+                jnp.logical_and(idxs >= mp.start_idx, idxs <= mp.end_idx),
+                idxs != -2
+            )
+            x_p = jnp.where(keep[:, None], x_p, jnp.full_like(x_p, -2.0))
+            # Move valid events to front (stable sort: False < True so ~keep pushes invalids back)
+            x_p = x_p[jnp.argsort(~keep, stable=True)]
 
-            mask = (x_p != -2)
-            loop_iterations = (jnp.count_nonzero(mask)/message_size).astype(int)
-            loop_iterations = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
+        def send_input(i, carry):
+            data = x_p[i]
+            if _first_hidden_has_cnn_partition:
+                # data = [c, x, y, value] — route only to affected next-layer ranks
+                mpi_config.forward_send_cnn(
+                    data,
+                    data[0].astype(jnp.int32),
+                    data[1].astype(jnp.int32),
+                    data[2].astype(jnp.int32),
+                    _fh_k_h, _fh_k_w,
+                    _fh_event_pad_h, _fh_event_pad_w,
+                )
+            else:
+                mpi_config.forward_send(data)
+            return i
+
+        mask = (x_p != -2)
+        loop_iterations = (jnp.count_nonzero(mask)/message_size).astype(int)
+        iteration = jax.lax.fori_loop(0, loop_iterations, send_input, (0))
 
         # Send end signal to ALL next-layer ranks regardless of selective routing
         mpi_config.forward_send(END_SIGNAL)
         if len(mpi_config.res_connect_next) > 0:
             mpi_config.residual_send_end_signal(END_SIGNAL)
 
-        return loop_iterations, jnp.zeros((BUFFER_SIZE, message_size))
+        return iteration, jnp.zeros((BUFFER_SIZE, message_size))
 
     def other_layers(neuron_states):
         # Determine next-layer kernel geometry for selective CNN event routing.
@@ -335,82 +353,6 @@ def predict(params,
             _next_event_pad_w = _next_k_w - 1 - _next_pad_w
         else:
             _next_k_h = _next_k_w = _next_event_pad_h = _next_event_pad_w = 0
-
-        _sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[layer_idx]
-
-        if _sr == 10000 and layer_idx == 1 and mpi_config.nb_previous == 1:
-            # Bulk path: receive all events in one MPI message, process locally, then
-            # receive END_SIGNAL to trigger the full-layer firing (last_input).
-            # Requires the input layer to have used forward_send_bulk (gated by _next_sr == 10000).
-
-            # Compute dummy activated_output shape for the no-op branch in jax.lax.cond.
-            # Mirrors event_array_size logic in conv_layer_computation.
-            _out_ch, _, _k_h, _k_w = weights.shape
-            _pad_h, _pad_w = neuron_states.padding
-            _ep_h, _ep_w = _k_h - 1 - _pad_h, _k_w - 1 - _pad_w
-            _, _pH, _pW = neuron_states.values.shape
-            if neuron_states.pooling != "":
-                _C_f, _H_f, _W_f = params.flat_layer_sizes[layer_idx]
-                _dummy_event_size = _C_f * _H_f * _W_f
-            else:
-                _dummy_event_size = _out_ch * (_pH - 2 * _ep_h) * (_pW - 2 * _ep_w)
-
-            # One recv for the entire event array (sender sent forward_send_bulk)
-            bulk = mpi_config.forward_recv_bulk(params.max_nonzero)  # (max_nonzero, 4)
-
-            # Process each event locally — no MPI per event
-            def process_event(i, ns):
-                event = bulk[i]
-                c_raw = event[0].astype(jnp.int32)
-                x_raw = event[1].astype(jnp.int32)
-                y_raw = event[2].astype(jnp.int32)
-                neuron_idx_e = jnp.stack([c_raw, x_raw, y_raw])
-                _, _, new_ns = jax.lax.cond(
-                    c_raw >= 0,  # -2 = padding sentinel
-                    lambda ns: layer_computation(params, mpi_config, key, neuron_idx_e, event[3], weights, ns, i, grad, is_residual=jnp.array(False)),
-                    lambda ns: (jnp.array(0), jnp.zeros((_dummy_event_size, 4)), ns),
-                    ns,
-                )
-                return new_ns
-
-            neuron_states = jax.lax.fori_loop(0, params.max_nonzero, process_event, neuron_states)
-
-            # Receive END_SIGNAL → conv_layer_computation routes to last_input, firing all neurons
-            end_data = mpi_config.forward_recv(message_size)
-            end_idx = jnp.stack([end_data[0].astype(jnp.int32), end_data[1].astype(jnp.int32), end_data[2].astype(jnp.int32)])
-            loop_iterations, activated_output, neuron_states = layer_computation(
-                params, mpi_config, key, end_idx, end_data[3], weights, neuron_states, params.max_nonzero, grad, is_residual=jnp.array(False)
-            )
-            layer_input = end_data[3]
-
-            if layer_idx != last_layer:
-                def send_act(i, _):
-                    out_val = activated_output[i]
-                    if _next_has_cnn_partition:
-                        mpi_config.forward_send_cnn(
-                            out_val,
-                            out_val[0].astype(jnp.int32),
-                            out_val[1].astype(jnp.int32),
-                            out_val[2].astype(jnp.int32),
-                            _next_k_h, _next_k_w,
-                            _next_event_pad_h, _next_event_pad_w,
-                        )
-                    else:
-                        mpi_config.forward_send(out_val)
-                    if len(mpi_config.res_connect_next) > 0:
-                        mpi_config.residual_send(
-                            out_val,
-                            out_val[0].astype(jnp.int32),
-                            out_val[1].astype(jnp.int32),
-                            out_val[2].astype(jnp.int32),
-                        )
-                    return None
-                jax.lax.fori_loop(0, loop_iterations, send_act, None)
-                mpi_config.forward_send(END_SIGNAL, params.max_nonzero)
-                if len(mpi_config.res_connect_next) > 0:
-                    mpi_config.residual_send_end_signal(END_SIGNAL)
-
-            return layer_input, neuron_states, jnp.array(params.max_nonzero, dtype=jnp.int32), jnp.zeros((BUFFER_SIZE, 2))
 
         def cond(state): # Stop when all previous-layer senders have signaled end-of-stream
             _, _, finished, _, _ = state
@@ -467,22 +409,53 @@ def predict(params,
 
             neuron_idx = jnp.asarray(neuron_idx, dtype=jnp.int32)
 
-            loop_iterations, activated_output, new_neuron_states = layer_computation(
-                params,
-                mpi_config,
-                key,
-                neuron_idx,
-                layer_input,
-                weights,
-                neuron_states,
-                iteration,
-                grad,
-                is_residual=is_residual,
+            # Receiver masking for 2D input-split (MLP only):
+            # If this rank owns only a slice of the input dimension, skip events whose
+            # global neuron index falls outside [input_part.start_idx, input_part.end_idx].
+            # END events (neuron_idx < 0) are never masked so finished counting is unchanged.
+            _in_part = mpi_config.input_part
+            _needs_mask = (
+                message_size == 2
+                and _in_part is not None
+                and _in_part.get_size < _in_part.total_size
             )
+            if _needs_mask:
+                _nidx = neuron_idx  # scalar int32
+                masked = jnp.logical_and(
+                    _nidx >= 0,
+                    jnp.logical_or(_nidx < _in_part.start_idx, _nidx > _in_part.end_idx),
+                )
+                _dummy_out = (jnp.array(0),
+                              jnp.zeros((mpi_config.model_part.get_size, 2)),
+                              neuron_states)
+                loop_iterations, activated_output, new_neuron_states = jax.lax.cond(
+                    masked,
+                    lambda _: _dummy_out,
+                    lambda _: layer_computation(
+                        params, mpi_config, key, neuron_idx, layer_input,
+                        weights, neuron_states, iteration, grad, is_residual=is_residual,
+                    ),
+                    None,
+                )
+            else:
+                loop_iterations, activated_output, new_neuron_states = layer_computation(
+                    params,
+                    mpi_config,
+                    key,
+                    neuron_idx,
+                    layer_input,
+                    weights,
+                    neuron_states,
+                    iteration,
+                    grad,
+                    is_residual=is_residual,
+                )
 
             neg_idx = jnp.any(neuron_idx == -1) if message_size == 2 else is_end
+            # Masked events do not advance iteration counter
+            skip_iter = neg_idx if not _needs_mask else jnp.logical_or(neg_idx, masked)
             finished = jax.lax.cond(neg_idx, lambda _: finished + 1, lambda _: finished, operand=None)
-            iteration = jax.lax.cond(neg_idx, lambda _: iteration, lambda _: iteration + 1, operand=None)
+            iteration = jax.lax.cond(skip_iter, lambda _: iteration, lambda _: iteration + 1, operand=None)
 
             # Bug Test 3: trace each END_SIGNAL receipt vs nb_previous.
             if _DEBUG_LEVEL >= 3:
@@ -709,12 +682,6 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
                                                                        neuron_states.pool_stride,
                                                                        mpi_config.rank)
 
-        # Sync layer (sr==10000) never emits per-event (the sync gate above zeros everything
-        # until the END_SIGNAL burst in last_input). Pad this per-event buffer up to the
-        # full-layer event_array_size so all jax.lax.cond branches share one static shape.
-        if sr == 10000 and neuron_states.pooling == "":
-            out_events = jnp.pad(out_events, ((0, event_array_size - out_events.shape[0]), (0, 0)), constant_values=-2.0)
-
         # Bug Test 1: assert all fired output events have coords inside the owned region.
         if _DEBUG_LEVEL >= 1 and is_partitioned:
             valid_mask = jnp.arange(out_events.shape[0]) < nb_valid_elements
@@ -775,17 +742,11 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         if sr != 10000:
             return jnp.array(0), jnp.zeros((event_array_size, 4)), neuron_states
 
-        # For full sync case, fire all neurons that are above the threshold.
-        # values/thresholds are stored pre-padded (border = pad sentinel); operate on the
-        # valid (unpadded) region only, so the fired events, layer_activity and the emitted
-        # event buffer are all in the unpadded (out_ch, H, W) frame.
-        valid_slice = (0, event_pad_h, event_pad_w)
-        valid_shape = (out_ch, H, W)
-        neuron_val = jax.lax.dynamic_slice(neuron_states.values, valid_slice, valid_shape)
-        thresholds = jax.lax.dynamic_slice(neuron_states.thresholds, valid_slice, valid_shape)
-        activated_output = activation_func(thresholds, neuron_val)
+        # For full sync case, fire all neurons that are above the threshold
+        neuron_val = neuron_states.values
+        activated_output = activation_func(neuron_states.thresholds, neuron_val)
 
-        # Mask to owned region only (unpadded output coords)
+        # Mask to owned region only
         if is_partitioned:
             c_indices = jnp.arange(activated_output.shape[0])
             x_indices = jnp.arange(activated_output.shape[1])
@@ -800,9 +761,8 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             )
             activated_output = jnp.where(region_mask, activated_output, 0.0)
 
-        # Compute remaining values and write them back into the pre-padded values array
+        # Step 4: Compute remaining values and update the neuron state
         remaining_value = neuron_val - activated_output
-        new_values = jax.lax.dynamic_update_slice(neuron_states.values, remaining_value, valid_slice)
         nb_valid_elements, out_events, unpooled = full_matrix_to_event_array_with_pooling(activated_output, activated_output.shape,
                                                                                           neuron_states.pooling, neuron_states.pool_size,
                                                                                           neuron_states.pool_stride, mpi_config.rank)
@@ -816,7 +776,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         )
 
         new_neuron_states = neuron_states.replace(
-            values=new_values,
+            values=remaining_value,
             input_activity=jnp.ones(neuron_states.input_activity.shape, dtype=int),
             layer_activity=new_layer_activity,)
 

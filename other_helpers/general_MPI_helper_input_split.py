@@ -179,6 +179,10 @@ class MPIConfig:
     res_connect_prev: tuple[tuple[int, Partition, Partition]]
     res_connect_next: tuple[tuple[int, Partition, Partition]]
 
+    input_part: Partition = None          # None → full input range (no input split)
+    input_splits_per_layer: tuple = None  # None → exact current behavior
+    current_layer_input_parts: tuple = None  # (rank, input_Partition|None) parallel to current_layer
+
     def __hash__(self):
         # Hash only hashable fields (exclude comm)
         return hash((
@@ -196,8 +200,15 @@ class MPIConfig:
             self.batch_distribution,
             self.batch_first_and_last_rank,
             self.res_connect_prev,
-            self.res_connect_next
+            self.res_connect_next,
+            self.input_part,
+            self.input_splits_per_layer,
+            self.current_layer_input_parts,
         ))
+
+    @property
+    def has_input_split(self):
+        return self.input_splits_per_layer is not None and any(s > 1 for s in self.input_splits_per_layer)
 
     @property
     def get_previous_layer_ranks(self):
@@ -354,24 +365,22 @@ class MPIConfig:
         # jax.debug.print("rank {}, received: {}", self.rank, data)
         return data
 
-    def forward_send_bulk(self, array):
-        """Send a full (N, 4) event array in one MPI message to every next-layer rank."""
-        for process, _ in self.next_layer:
-            send(array, dest=process, tag=0, comm=self.comm)
-
-    def forward_recv_bulk(self, bulk_size):
-        """Receive a (bulk_size, 4) event array in one MPI message."""
-        return recv(jnp.zeros((bulk_size, 4)), source=MPI.ANY_SOURCE, tag=0, comm=self.comm)
-
     def backward_send(self, data):
+        # in_lo: start of this rank's local input axis in global coordinates
+        in_lo = self.input_part.start_idx if self.input_part is not None else 0
         for process, partition in self.previous_layer:
-            # cond = jnp.logical_and(self.rank != -1, jnp.any(data!=-1))
-            # jax.lax.cond(cond,
-            #              lambda _: jax.debug.print("rank {} sending {} to rank {}", self.rank, data.shape, process),
-            #              lambda _: None, None)
-            # jax.debug.print("rank {} sending start idx{} end idx{} resulting in shape {} to rank {} with total shape {}", self.rank, partition.start_idx, partition.end_idx, data[:, partition.start_idx:partition.end_idx+1].shape, process, data.shape)
-            data_part = data[:, partition.start_idx:partition.end_idx+1]
-            send(data_part, dest=process, tag=2, comm=self.comm)
+            # Overlap between this rank's input range [in_lo, in_lo+data.shape[1]-1]
+            # and the receiver's output range [partition.start_idx, partition.end_idx].
+            lo = max(partition.start_idx, in_lo)
+            hi = min(partition.end_idx, in_lo + data.shape[1] - 1)
+            seg = data[:, lo - in_lo: hi - in_lo + 1]
+            if lo == partition.start_idx and hi == partition.end_idx:
+                send(seg, dest=process, tag=2, comm=self.comm)
+            else:
+                # Partial overlap: pad to receiver's full output-range shape
+                buf = jnp.zeros((data.shape[0], partition.get_size), dtype=data.dtype)
+                buf = buf.at[:, lo - partition.start_idx: hi - partition.start_idx + 1].set(seg)
+                send(buf, dest=process, tag=2, comm=self.comm)
 
     def backward_recv(self):
         data_shape = (self.batch_part.get_size, self.model_part.get_size)
@@ -490,47 +499,64 @@ class MPIConfig:
 
     #region split_batch
     def split_batch(self, params, batch_iterator, tuple_size, label_shape=None, label_pad_value=-1.0):
-        # tuple_size =2 for MLP and =4 for CNN 
+        # tuple_size =2 for MLP and =4 for CNN
         rank = self.rank
         comm = self.comm
         batch_part = self.batch_part
         batch_size = batch_part.total_size
         batch_distrib = self.batch_distribution
 
-        # jax.debug.print("rank {} batch distrib {}", rank, batch_distrib)
+        if label_shape is None:
+            label_shape_t = ()
+        elif isinstance(label_shape, int):
+            label_shape_t = (label_shape,)
+        else:
+            label_shape_t = tuple(label_shape)
+
+        x_shape = (batch_part.get_size, params.max_nonzero, tuple_size)
+        y_shape = (batch_part.get_size,) + label_shape_t
 
         if rank == 0:
             all_batch_x, all_batch_y = next(batch_iterator)
-            # print(rank, all_batch_x.shape)
             all_batch_y = jnp.array(all_batch_y, dtype=jnp.float32)
             all_batch_x = jnp.array(all_batch_x, dtype=jnp.float32)
-            # print('shape before pad batch: {}', all_batch_x[0])
             all_batch_x, all_batch_y = pad_batch(
                 all_batch_x, all_batch_y, batch_size, label_pad_value=label_pad_value
             )
-            
-            for process, b_partition in batch_distrib:
-                # print("rank in split batch:", rank, process, b_partition)
-                if process == 0:
-                    batch_x = all_batch_x[:b_partition.end_idx+1]
-                    batch_y = all_batch_y[:b_partition.end_idx+1]
-                else:
-                    batch_x_to_send = all_batch_x[b_partition.start_idx:b_partition.end_idx+1]
-                    batch_y_to_send = all_batch_y[b_partition.start_idx:b_partition.end_idx+1]
-                    # print(f"rank {rank}, Batch_x: {batch_x_to_send.shape}, Batch_y: {batch_y_to_send.shape}")
-                    
-                    send(batch_x_to_send, dest=process, tag=4, comm=comm)
-                    send(batch_y_to_send, dest=process, tag=4, comm=comm)
+
+            # For true data parallelism (multiple batch partitions) send each partition.
+            # For input splitting (len(batch_distrib)==1, get_process_per_batch==1), batch_distrib
+            # only contains rank 0 itself — skip sending to avoid self-send.
+            if self.get_process_per_batch > 1:
+                for process, b_partition in batch_distrib:
+                    if process == 0:
+                        batch_x = all_batch_x[:b_partition.end_idx + 1]
+                        batch_y = all_batch_y[:b_partition.end_idx + 1]
+                    else:
+                        batch_x_to_send = all_batch_x[b_partition.start_idx:b_partition.end_idx + 1]
+                        batch_y_to_send = all_batch_y[b_partition.start_idx:b_partition.end_idx + 1]
+                        send(batch_x_to_send, dest=process, tag=4, comm=comm)
+                        send(batch_y_to_send, dest=process, tag=4, comm=comm)
+            else:
+                # Single-batch-partition model parallelism: rank 0 keeps the full batch.
+                batch_x = all_batch_x
+                batch_y = all_batch_y
+
+        elif self.get_process_per_batch > 1:
+            # True data-parallel non-zero rank: receive slice from rank 0
+            batch_x = recv(jnp.zeros(x_shape), source=0, tag=4, comm=comm)
+            batch_y = recv(jnp.zeros(y_shape, dtype=jnp.float32), source=0, tag=4, comm=comm)
+
         else:
-            # print(f"rank {rank} waiting for shape {(batch_part.get_size, params.max_nonzero, tuple_size)}")
-            batch_x = recv(jnp.zeros((batch_part.get_size, params.max_nonzero, tuple_size)), source=0, tag=4, comm=comm)  
-            if label_shape is None:
-                label_shape = ()
-            elif isinstance(label_shape, int):
-                label_shape = (label_shape,)
-            batch_y = recv(jnp.zeros((batch_part.get_size,) + tuple(label_shape), dtype=jnp.float32), source=0, tag=4, comm=comm) 
-        # jax.debug.print("rank {} batch y {}", rank, batch_y)
-        # print(f'rank {rank} finished splitting batch')
+            # Input-split layer 0: non-rank-0 ranks in the same layer receive their batch from rank 0
+            # via a layer-level broadcast (labels need no broadcast — only rank 0 sends labels).
+            batch_x = jnp.zeros(x_shape)
+            batch_y = jnp.zeros(y_shape, dtype=jnp.float32)
+
+        # When multiple ranks share layer 0 (input split), broadcast batch_x from rank 0.
+        if self.layer_idx == 0 and len(self.current_layer) > 1:
+            batch_x = self.leader_share_to_whole_layer(batch_x)
+
         return batch_x, batch_y
 
     #region gather_model_part
@@ -647,10 +673,61 @@ class MPIConfig:
             full_layer_data = recv(full_layer_data, source=leader, tag=21, comm=self.comm)
         return full_layer_data
 
+    #region reconstruct input-split layer
+    def _reconstruct_input_split_layer(self, params, weights, thresholds):
+        """
+        Reconstruct the full layer weight matrix (prev_size, cur_size) and threshold
+        vector (cur_size,) at the layer leader by gathering all 2D blocks.
+
+        Weights tile exactly: block (in_range, out_range) owns W[in_range, out_range],
+        and the input/output ranges partition the matrix, so placement is unambiguous.
+        Thresholds are per-output-neuron and shared across input copies, so they are
+        averaged over the copies (exact for inference where copies are identical).
+
+        Returns (full_weights, full_thresholds) at the leader; the inputs unchanged at
+        non-leaders (they are not batch leaders, so their values are never sent on).
+        """
+        layer_idx = self.layer_idx
+        if layer_idx == 0:
+            return weights, thresholds  # layer-0 weights are dummy and never stored
+
+        prev_size = params.layer_sizes[layer_idx - 1]
+        cur_size = params.layer_sizes[layer_idx]
+        leader = self.get_current_group_leader
+        rank = self.rank
+        in_part_of = dict(self.current_layer_input_parts)
+
+        if rank != leader:
+            send(weights, dest=leader, tag=21, comm=self.comm)
+            send(thresholds, dest=leader, tag=21, comm=self.comm)
+            return weights, thresholds
+
+        full_w = jnp.zeros((prev_size, cur_size))
+        th_sum = jnp.zeros((cur_size,))
+        th_cnt = jnp.zeros((cur_size,))
+        for process, out_part in self.current_layer:
+            in_part = in_part_of.get(process)
+            in_s = in_part.start_idx if in_part is not None else 0
+            in_e = (in_part.end_idx + 1) if in_part is not None else prev_size
+            out_s, out_e = out_part.start_idx, out_part.end_idx + 1
+            if process == rank:
+                w_block, th_block = weights, thresholds
+            else:
+                w_block = recv(jnp.zeros((in_e - in_s, out_e - out_s)), source=process, tag=21, comm=self.comm)
+                th_block = recv(jnp.zeros((out_e - out_s,)), source=process, tag=21, comm=self.comm)
+            full_w = full_w.at[in_s:in_e, out_s:out_e].set(w_block)
+            th_sum = th_sum.at[out_s:out_e].add(th_block)
+            th_cnt = th_cnt.at[out_s:out_e].add(1.0)
+
+        full_th = th_sum / jnp.where(th_cnt == 0, 1.0, th_cnt)
+        return full_w, full_th
+
     #region gather w, it, th
     def gather_w_it_th(self, params, weights, mean_iterations, thresholds):
-        """ 
-        Gather all the weights, iteration values and thresholds at the last layer's leader rank to store them
+        """
+        Gather all the weights, iteration values and thresholds at the last layer's leader rank to store them.
+        When has_input_split is True, the full layer weights/thresholds are reconstructed by tiling the 2D
+        blocks (weights) and averaging across input copies (thresholds) before the same tag-5 exchange.
         """
         rank = self.rank
         layer_idx = self.layer_idx
@@ -658,40 +735,43 @@ class MPIConfig:
         comm = self.comm
         weights_dict = {}
         all_iteration_mean = []
-        thresholds_dict = {}    
+        thresholds_dict = {}
 
         if layer_idx == 0:
             mean_iterations = self.share_iteration_to_whole_layer(mean_iterations)
-        weights = self.concatenate_model_partition(weights, dim=len(weights.shape))
-        thresholds = self.concatenate_model_partition(thresholds, dim=len(thresholds.shape))
 
-        # print(rank, thresholds.shape, mean_iterations)
+        if self.has_input_split:
+            weights, thresholds = self._reconstruct_input_split_layer(params, weights, thresholds)
+        else:
+            weights = self.concatenate_model_partition(weights, dim=len(weights.shape))
+            thresholds = self.concatenate_model_partition(thresholds, dim=len(thresholds.shape))
+
         if not self.is_last_layer and self.is_batch_leader:
             dest = self.get_last_layer_batch_leader
 
-            # print(f"rank {rank}, iterations: {mean_iterations}")
-            send(jnp.array(mean_iterations), dest=dest, tag=5,comm=comm)
+            send(jnp.array(mean_iterations), dest=dest, tag=5, comm=comm)
             if layer_idx != 0:
-                send(weights, dest=dest, tag=5,comm=comm)
-                send(thresholds, dest=dest, tag=5,comm=comm)
+                send(weights, dest=dest, tag=5, comm=comm)
+                send(thresholds, dest=dest, tag=5, comm=comm)
 
         elif self.is_last_layer and self.is_batch_leader:
             for i, leader_rank in enumerate(self.all_leader_ranks):
-                if rank == leader_rank: continue
+                if rank == leader_rank:
+                    continue
                 # Storing mean iterations
                 it_mean = recv(mean_iterations, source=leader_rank, tag=5, comm=comm)
                 all_iteration_mean.append(it_mean)
-                if leader_rank==0: 
+                if leader_rank == 0:
                     continue
 
-                # Storing the weights 
-                w = recv(jnp.zeros((params.layer_sizes[i-1], params.layer_sizes[i])), source=leader_rank, tag=5, comm=comm)   
+                # Storing the weights
+                w = recv(jnp.zeros((params.layer_sizes[i - 1], params.layer_sizes[i])), source=leader_rank, tag=5, comm=comm)
                 weights_dict[f"layer_{i}"] = w.tolist()
-                
+
                 # Storing the thresholds
                 thr = recv(jnp.zeros(params.layer_sizes[i]), source=leader_rank, tag=5, comm=comm)
-                thresholds_dict[f"thresholds_{i}"]= thr.tolist()
-                
+                thresholds_dict[f"thresholds_{i}"] = thr.tolist()
+
             all_iteration_mean.append(mean_iterations)  # Append the mean iterations of the last layer
             weights_dict[f"layer_{last_layer}"] = weights.tolist()
 
@@ -701,36 +781,57 @@ class MPIConfig:
 
     #region MPI_partition
     def MPI_partition(self, weights, empty_neuron_states):
-        start = self.model_part.start_idx
-        end = self.model_part.end_idx+1
+        out_s = self.model_part.start_idx
+        out_e = self.model_part.end_idx + 1
         svec = empty_neuron_states.sync_rate_vector
         # Preserve optional fields used by the CNN script (absent in the MLP script's states)
         extra_fields = {}
         for field in ("weights_shape", "is_conv"):
             if field in empty_neuron_states._fields:
                 extra_fields[field] = getattr(empty_neuron_states, field)
+
+        # Input-side slicing when this rank has a non-trivial input partition
+        if self.input_part is not None and self.layer_idx != 0:
+            in_s = self.input_part.start_idx
+            in_e = self.input_part.end_idx + 1
+            input_residuals = empty_neuron_states.input_residuals[in_s:in_e]
+            input_order = empty_neuron_states.input_order[in_s:in_e]
+            input_activity = empty_neuron_states.input_activity[in_s:in_e]
+            input_vector = empty_neuron_states.input_vector[in_s:in_e]
+            output_activity = empty_neuron_states.output_activity[in_s:in_e, out_s:out_e]
+        else:
+            in_s = None
+            input_residuals = empty_neuron_states.input_residuals
+            input_order = empty_neuron_states.input_order
+            input_activity = empty_neuron_states.input_activity
+            input_vector = empty_neuron_states.input_vector
+            output_activity = empty_neuron_states.output_activity[:, out_s:out_e]
+
         part_empty_neuron_states = NeuronStates(
-            values=empty_neuron_states.values[start:end],
-            bias=empty_neuron_states.bias[start:end],
-            thresholds=empty_neuron_states.thresholds[start:end],
-            input_residuals=empty_neuron_states.input_residuals,
-            input_order=empty_neuron_states.input_order,
-            input_activity=empty_neuron_states.input_activity,
-            layer_activity=empty_neuron_states.layer_activity[start:end],
-            output_activity=empty_neuron_states.output_activity[:, start:end],
-            last_sent_iteration=empty_neuron_states.last_sent_iteration[start:end],
-            input_vector=empty_neuron_states.input_vector,
-            output_vector=empty_neuron_states.output_vector[start:end],
-            sync_rate_vector=svec[start:end] if svec is not None else None,
-            values_history=empty_neuron_states.values_history[:, start:end],
+            values=empty_neuron_states.values[out_s:out_e],
+            bias=empty_neuron_states.bias[out_s:out_e],
+            thresholds=empty_neuron_states.thresholds[out_s:out_e],
+            input_residuals=input_residuals,
+            input_order=input_order,
+            input_activity=input_activity,
+            layer_activity=empty_neuron_states.layer_activity[out_s:out_e],
+            output_activity=output_activity,
+            last_sent_iteration=empty_neuron_states.last_sent_iteration[out_s:out_e],
+            input_vector=input_vector,
+            output_vector=empty_neuron_states.output_vector[out_s:out_e],
+            sync_rate_vector=svec[out_s:out_e] if svec is not None else None,
+            values_history=empty_neuron_states.values_history[:, out_s:out_e],
             history_index=jnp.array(0, dtype=jnp.int32),
             **extra_fields,
         )
-        # print(f"weights shape: {weights.shape}, resulting size s-e: {start}-{end}")
+        # Slice weights: [in_s:in_e, out_s:out_e] when input split, else original behavior
         try:
-            part_weights = weights[:,start:end]
-        except:
-            part_weights = weights[start:end]
+            if in_s is not None:
+                part_weights = weights[in_s:in_e, out_s:out_e]
+            else:
+                part_weights = weights[:, out_s:out_e]
+        except Exception:
+            part_weights = weights[out_s:out_e]
         return part_weights, part_empty_neuron_states
 
     def print(self):
@@ -744,12 +845,18 @@ class MPIConfig:
         else:
             model_part_repr = f"[{self.model_part.start_idx}:{self.model_part.end_idx}]"
 
+        input_part_repr = (
+            f"[{self.input_part.start_idx}:{self.input_part.end_idx}]"
+            if self.input_part is not None else "full"
+        )
+
         print(f"Rank {self.rank}: Layer {self.layer_idx} \n| "
               f"Batch [{self.batch_part.start_idx}:{self.batch_part.end_idx}] \n| "
               f"Model {model_part_repr} \n| "
+              f"Input {input_part_repr} \n| "
               f"Current layer {list(self.current_layer)} \n| "
               f"Previous layer {list(self.previous_layer)} \n| "
-              f"Next layer {list(self.next_layer)} \n| " 
+              f"Next layer {list(self.next_layer)} \n| "
               f"all_leader_ranks {list(self.all_leader_ranks)} \n| "
               f"Batch distribution {list(self.batch_distribution)} \n| "
               f"batch_first_and_last_rank {list(self.batch_first_and_last_rank)}")
@@ -788,6 +895,8 @@ class MPIProcessDistribution:
             self.layer_sizes = layer_sizes
             self.batch_size = batch_size
             self.layer_assignments = {}  # rank -> (layer_idx, bach_part, model_part)
+            self.input_assignments = {}  # rank -> (in_start, in_end) or None
+            self.input_splits_per_layer = None  # set by model_split_custom when 2D splitting is used
             self.residual_connections = tuple(tuple(p) for p in residual_connections)
 
     def _get_batch_partition_bounds(self, batch_partition_idx: int, total_batch_partitions: int):
@@ -1066,11 +1175,15 @@ class MPIProcessDistribution:
             layer_idx = (layer_idx+1)%self.nb_layers
 
     #region MLP Model custom
-    def model_split_custom(self, processes_per_layer: tuple[int, ...]):
+    def model_split_custom(self, processes_per_layer: tuple[int, ...], input_splits_per_layer=None):
         """
         Model parallelism with a custom number of processes per layer.
         All processes in the same layer share the same batch partition.
         Rank layout: layers are assigned in order, e.g. processes_per_layer=(1,2,1) → ranks 0|1,2|3
+
+        When input_splits_per_layer is provided, each layer gets
+        processes_per_layer[l] * input_splits_per_layer[l] ranks.
+        Ranks are ordered input-major: for each input slice, iterate over output slices.
 
         Example: processes_per_layer=(1, 2, 1), batch_size=36
             rank 0 → layer 0, neurons [0:784]
@@ -1078,32 +1191,78 @@ class MPIProcessDistribution:
             rank 2 → layer 1, neurons [129:256]
             rank 3 → layer 2, neurons [0:10]
         """
-        assert len(processes_per_layer) == self.nb_layers, \
-            f"processes_per_layer length ({len(processes_per_layer)}) must match number of layers ({self.nb_layers})"
-        assert sum(processes_per_layer) == self.mpi_size, \
-            f"sum of processes_per_layer ({sum(processes_per_layer)}) must equal total MPI size ({self.mpi_size})"
-        assert all(p >= 1 for p in processes_per_layer), "each layer needs at least 1 process"
+        if input_splits_per_layer is None:
+            # Original behavior — no input splits
+            assert len(processes_per_layer) == self.nb_layers, \
+                f"processes_per_layer length ({len(processes_per_layer)}) must match number of layers ({self.nb_layers})"
+            assert sum(processes_per_layer) == self.mpi_size, \
+                f"sum of processes_per_layer ({sum(processes_per_layer)}) must equal total MPI size ({self.mpi_size})"
+            assert all(p >= 1 for p in processes_per_layer), "each layer needs at least 1 process"
+
+            process_rank = 0
+            for layer_idx, nb_processes in enumerate(processes_per_layer):
+                layer_neurons = self.layer_sizes[layer_idx]
+                layer_part_size = layer_neurons // nb_processes
+                layer_remain = layer_neurons % nb_processes
+
+                model_part_start = 0
+                model_part_end = model_part_start + layer_part_size - 1
+                for _ in range(nb_processes):
+                    self.layer_assignments[process_rank] = (layer_idx,
+                                                            (0, self.batch_size - 1),
+                                                            (model_part_start, model_part_end))
+                    self.input_assignments[process_rank] = None
+                    model_part_start = model_part_end + 1
+                    model_part_end = model_part_start + layer_part_size - 1
+                    if layer_remain != 0:
+                        model_part_end += 1
+                        layer_remain -= 1
+                    process_rank += 1
+            print(self.layer_assignments)
+            return
+
+        # 2D block split: each layer has out_splits * in_splits ranks
+        assert len(processes_per_layer) == self.nb_layers
+        assert len(input_splits_per_layer) == self.nb_layers
+        total_ranks = sum(p * s for p, s in zip(processes_per_layer, input_splits_per_layer))
+        assert total_ranks == self.mpi_size, \
+            f"sum(processes_per_layer * input_splits_per_layer) = {total_ranks} must equal MPI size {self.mpi_size}"
+        self.input_splits_per_layer = tuple(input_splits_per_layer)
+
+        def _ranges(total, n):
+            part = total // n
+            rem = total % n
+            start = 0
+            result = []
+            for i in range(n):
+                end = start + part - 1
+                if i < rem:
+                    end += 1
+                result.append((start, end))
+                start = end + 1
+            return result
 
         process_rank = 0
-        for layer_idx, nb_processes in enumerate(processes_per_layer):
-            layer_neurons = self.layer_sizes[layer_idx]     
-            layer_part_size = layer_neurons // nb_processes
-            layer_remain = layer_neurons % nb_processes
+        for layer_idx, (nb_out, nb_in) in enumerate(zip(processes_per_layer, input_splits_per_layer)):
+            # Output (neuron) ranges
+            out_ranges = _ranges(self.layer_sizes[layer_idx], nb_out)
+            # Input ranges: layer 0 has no input split; nb_in==1 means no split (full range → None)
+            if layer_idx == 0 or nb_in == 1:
+                in_ranges = [None]
+            else:
+                in_ranges = _ranges(self.layer_sizes[layer_idx - 1], nb_in)
 
-            model_part_start = 0
-            model_part_end = model_part_start + layer_part_size -1
-            for _ in range(nb_processes):
-                self.layer_assignments[process_rank] =  (layer_idx, 
-                                                        (0, self.batch_size-1), 
-                                                        (model_part_start, model_part_end))
-                model_part_start = model_part_end + 1
-                model_part_end = model_part_start + layer_part_size -1
-                if layer_remain != 0:   # Distribute the remain of the layer's neurons one by one to the first few processes in the layer until all neurons are assigned
-                    model_part_end += 1
-                    layer_remain -= 1
+            # Input-major ordering: a11,a12,a21,a22
+            for in_r in in_ranges:
+                for out_r in out_ranges:
+                    self.layer_assignments[process_rank] = (layer_idx,
+                                                            (0, self.batch_size - 1),
+                                                            out_r)
+                    self.input_assignments[process_rank] = in_r
+                    process_rank += 1
 
-                process_rank += 1
         print(self.layer_assignments)
+        print(self.input_assignments)
 
     #region MLP Model uniform
     def model_split_uniform(self):
@@ -1165,9 +1324,21 @@ class MPIProcessDistribution:
         model_part = Partition(start_idx=model_parts[0],
                                end_idx=model_parts[1],
                                total_size=self.layer_sizes[layer_idx])
-        
 
-        prev, curr, next = [], [], []
+        # Input partition for this rank (None if no input split or layer 0)
+        my_in_raw = self.input_assignments.get(rank)  # (in_start, in_end) or None
+        if my_in_raw is not None and layer_idx > 0:
+            input_part = Partition(start_idx=my_in_raw[0],
+                                   end_idx=my_in_raw[1],
+                                   total_size=self.layer_sizes[layer_idx - 1])
+        else:
+            input_part = None
+
+        # Determine if any input splits are active (for routing)
+        has_any_input_split = self.input_splits_per_layer is not None
+
+        prev, curr, next_l = [], [], []
+        curr_in_parts = []  # input Partition (or None) for each rank in curr, same order
         batch_distrib = []
         all_leaders = []
         for _ in range(self.nb_layers):
@@ -1175,47 +1346,76 @@ class MPIProcessDistribution:
 
         b_first_rank, b_last_rank = self.mpi_size, 0
         for r in self.layer_assignments.keys():
-            l_idx, b_parts, m_parts = self.layer_assignments[r] # Layer index, batch parts, model parts
+            l_idx, b_parts, m_parts = self.layer_assignments[r]  # Layer index, batch parts, model parts
             all_leaders[l_idx].append(r)
-            
+
             # Check if the rank belongs to the same batch partition
             batch_cond = b_parts[0] == batch_part.start_idx and b_parts[1] == batch_part.end_idx
-            if batch_cond: 
-                if m_parts[0] == 0: # Only consider the first model partition of the layer (leader ranks)
-                    b_last_rank = max(b_last_rank, r)   # Last rank of the batch partition where to send the labels
-                    b_first_rank = min(b_first_rank, r) # First rank of the batch partition from which we receive the labels
-                
-                # print(rank, r, b_parts, batch_part)
+            if batch_cond:
+                if m_parts[0] == 0:  # Only consider the first model partition of the layer (leader ranks)
+                    b_last_rank = max(b_last_rank, r)
+                    b_first_rank = min(b_first_rank, r)
+
                 m_part = Partition(start_idx=m_parts[0],
-                                    end_idx=m_parts[1],
-                                    total_size=self.layer_sizes[l_idx])
-                
+                                   end_idx=m_parts[1],
+                                   total_size=self.layer_sizes[l_idx])
+
                 info = (r, m_part)
-                if l_idx == layer_idx-1:    # Previous layer model parts where we receive the data from
-                    prev.append(info)
-                elif l_idx == layer_idx:    # Current layer model parts 
+                if l_idx == layer_idx - 1:
+                    # Previous layer: include only if their output range overlaps my input range.
+                    # When no input split, include all (original behavior).
+                    if not has_any_input_split or input_part is None:
+                        prev.append(info)
+                    else:
+                        # Overlap: their output [m_parts[0], m_parts[1]] vs my input [input_part.start_idx, input_part.end_idx]
+                        a, b = input_part.start_idx, input_part.end_idx
+                        c, d = m_parts[0], m_parts[1]
+                        if a <= d and c <= b:
+                            prev.append(info)
+                elif l_idx == layer_idx:
                     if rank == 0:
                         print(f"r {r}, l_idx {l_idx}, layer_index {layer_idx}")
                     curr.append(info)
-                elif l_idx == layer_idx+1:  # Next layer model parts where we send the data to
-                    next.append(info)
-            # if l_idx == layer_idx:
+                    # Record this rank's input partition (for weight/threshold reconstruction)
+                    r_in_raw = self.input_assignments.get(r)
+                    if r_in_raw is not None and l_idx > 0:
+                        r_in_part = Partition(start_idx=r_in_raw[0],
+                                              end_idx=r_in_raw[1],
+                                              total_size=self.layer_sizes[l_idx - 1])
+                    else:
+                        r_in_part = None
+                    curr_in_parts.append((r, r_in_part))
+                elif l_idx == layer_idx + 1:
+                    # Next layer: include only if my output range overlaps their input range.
+                    # When no input split, include all (original behavior).
+                    if not has_any_input_split:
+                        next_l.append(info)
+                    else:
+                        r_in_raw = self.input_assignments.get(r)
+                        if r_in_raw is None:
+                            # Next layer has no input split → receives all
+                            next_l.append(info)
+                        else:
+                            # Overlap: my output [model_parts[0], model_parts[1]] vs their input [r_in_raw[0], r_in_raw[1]]
+                            a, b_end = model_parts[0], model_parts[1]
+                            c, d = r_in_raw[0], r_in_raw[1]
+                            if a <= d and c <= b_end:
+                                next_l.append(info)
+
             if l_idx == layer_idx and (not batch_cond or r == rank):
                 b_part = Partition(start_idx=b_parts[0],
-                               end_idx=b_parts[1],
-                               total_size=self.batch_size)
-                batch_distrib.append((r, b_part))              
+                                   end_idx=b_parts[1],
+                                   total_size=self.batch_size)
+                batch_distrib.append((r, b_part))
 
         all_leaders_rank = tuple([min(layer_ranks) for layer_ranks in all_leaders])
         batch_first_and_last_rank = (b_first_rank, b_last_rank)
 
         # Populate residual connections
-        res_prev_list = []  # ranks in src layers that point AT this layer (this rank receives from them)
-        res_next_list = []  # ranks in dst layers that this rank's layer points AT (this rank sends to them)
+        res_prev_list = []
+        res_next_list = []
 
         for src_idx, dst_idx in self.residual_connections:
-            # If this rank is in the destination layer, every rank in the source layer that shares
-            # this batch partition becomes a residual previous-layer entry.
             if layer_idx == dst_idx:
                 for r_other in self.layer_assignments.keys():
                     l_other, b_other, m_other = self.layer_assignments[r_other]
@@ -1238,25 +1438,31 @@ class MPIProcessDistribution:
                     dst_part = self._build_cnn_partition(dst_idx, m_other)
                     res_next_list.append((r_other, src_part, dst_part))
 
+        # input_splits_per_layer for MPIConfig (None when not used)
+        input_splits_tuple = self.input_splits_per_layer
+
         return MPIConfig(
             rank=rank,
             size=self.mpi_size,
             comm=comm,
             layer_idx=layer_idx,
-            last_layer_idx=self.nb_layers-1,
+            last_layer_idx=self.nb_layers - 1,
             batch_part=batch_part,
             model_part=model_part,
             previous_layer=tuple(prev),
             current_layer=tuple(curr),
-            next_layer=tuple(next),
+            next_layer=tuple(next_l),
             nb_previous=len(prev) + len(res_prev_list),
             all_leader_ranks=all_leaders_rank,
             batch_distribution=tuple(batch_distrib),
             batch_first_and_last_rank=batch_first_and_last_rank,
             res_connect_next=tuple(res_next_list),
-            res_connect_prev=tuple(res_prev_list)
+            res_connect_prev=tuple(res_prev_list),
+            input_part=input_part,
+            input_splits_per_layer=input_splits_tuple,
+            current_layer_input_parts=tuple(curr_in_parts),
         )
-    
+
     def CNN_build(self, rank, comm):
         """
             Builds the partitions according to the specifications in self.layer_assignments
@@ -1371,9 +1577,9 @@ def CNN_data_split(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...
     mpi_config = mpi_process_distribution.CNN_build(rank, comm)
     return mpi_config
 
-def model_split_custom(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...], processes_per_layer: tuple[int, ...]):
+def model_split_custom(rank, comm, mpi_size, batch_size, layer_sizes: tuple[int, ...], processes_per_layer: tuple[int, ...], input_splits_per_layer=None):
     mpi_process_distribution = MPIProcessDistribution(mpi_size, batch_size, layer_sizes)
-    mpi_process_distribution.model_split_custom(processes_per_layer)
+    mpi_process_distribution.model_split_custom(processes_per_layer, input_splits_per_layer)
     mpi_config = mpi_process_distribution.build(rank, comm)
     return mpi_config
 

@@ -225,6 +225,7 @@ class BaseParams:
     use_bias: bool = False
     augment: bool = False        # CIFAR-10: random flip + pad-4/crop per batch
     dedup: bool = False          # Remove spatial duplicates from event stream before training
+    use_best: bool = False       # Use best-validation checkpoint for test inference and saving
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -564,6 +565,7 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "firing number": params.firing_nb,
         "synchronization rate": params.sync_rate,
         "top weights": params.top_weights,
+        "output_decay": params.output_decay,
         "restrict": params.restrict,
         "sparsity impact": params.sparsity_impact,
         "weight regularization": params.w_reg,
@@ -575,6 +577,10 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "use_bias": params.use_bias,
         "augment": params.augment,
         "dedup": params.dedup,
+<<<<<<< HEAD
+=======
+        "use_best": params.use_best,
+>>>>>>> 8ed6394 (Added input split + bulk sending)
         "layer_sizes": params.layer_sizes,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
         "validation accuracy": np.array(all_validation_accuracies).tolist(),
@@ -867,6 +873,12 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         # Example: [1, 2, 1] for 3 layers with 4 total processes
         # If None, falls back to uniform split (requires MPI size % nb_layers == 0)
         'processes_per_layer': None,
+
+        # Input-dimension splits per layer (optional, for 2D block parallelism).
+        # Must have same length as layer_sizes; first and last entries must be 1.
+        # Ranks per layer = processes_per_layer[l] * input_splits_per_layer[l].
+        # If None, no input splitting (exact current behavior).
+        'input_splits_per_layer': None,
 
         # Reset rate for each layer (tuple, must match number of layers)
         # Example: (1, 1, 1) for 3 layers, (2, 2, 1) for different reset rates

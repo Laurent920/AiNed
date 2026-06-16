@@ -392,6 +392,9 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     for _next_rank, _ in mpi_config.next_layer:
         next_grad = next_grad + recv(jnp.zeros((batch_part_size,) + params.flat_layer_sizes[layer_idx]), source=_next_rank, tag=2, comm=comm)
 
+    # Weights/states are model-partitioned (see MPI_partition in main): keep the owned slice
+    next_grad = next_grad[:, mpi_config.model_part.start_idx:mpi_config.model_part.end_idx+1]
+
     # Compute input's gradient and weight gradient
     weight_grad, th_grad, weight_res, bias_grad = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
@@ -616,9 +619,13 @@ def loss_fn(params, key, weights, empty_neuron_states, layer_computation, target
     # jax.debug.print("Rank {} finished forward pass in loss_fn with {} and {} it", rank, all_outputs, iterations)
     # w_sum = l2_weight_regularization(mpi_config, weights)
 
+    # Reconstruct the full output vector from the model-partitioned last-layer ranks
+    full_outputs = mpi_config.gather_model_partition(all_outputs)
+
     # Compute Loss and loss gradient
-    loss, loss_grad = jax.value_and_grad(loss_func)(all_outputs, target)
+    loss, loss_grad = jax.value_and_grad(loss_func)(full_outputs, target)
     loss_grad /= mpi_config.get_process_per_batch  # Shape (B, 10)
+    loss_grad = loss_grad[:, mpi_config.model_part.start_idx:mpi_config.model_part.end_idx+1] # Keep this rank's owned slice
     # loss += params.w_reg * w_sum
 
     # Compute output gradient and weight gradient
@@ -641,7 +648,7 @@ def loss_fn(params, key, weights, empty_neuron_states, layer_computation, target
         target_labels = jnp.argmax(target, axis=-1)
         acc_history, avg_rank = process_history(all_neuron_states.values_history, all_neuron_states.history_index, target_labels)
 
-    return (loss, all_outputs, iterations, total_loss, (acc_history, avg_rank)), (mean_weight_grad, loss_grad)
+    return (loss, full_outputs, iterations, total_loss, (acc_history, avg_rank)), (mean_weight_grad, loss_grad)
 
 def sparsity_loss(params, all_neuron_states, iterations):
     '''
@@ -714,19 +721,26 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     # Initialize the optimizer
     if rank == 0:
         print(f"{opti} optimizer selected")
+    # Cosine LR decay (to 1/10 of base) + global-norm gradient clipping stabilize training
+    # under data augmentation: clipping caps the per-batch gradient spikes that augmentation
+    # amplifies, and the decay damps the late-epoch divergence seen with a constant LR.
+    steps_per_epoch = max(1, int(total_batches[0]))
+    total_steps = max(1, params.num_epochs * steps_per_epoch)
+    lr_schedule = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
+    grad_clip = optax.clip_by_global_norm(1.0)
     if opti == "adam":
-        solver = optax.adam(learning_rate=params.learning_rate)
-    elif opti == "adamw":        
-        solver = optax.adam(learning_rate=params.learning_rate)
+        solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
+    elif opti == "adamw":
+        solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
     elif opti == "sgd":
-        solver = optax.sgd(learning_rate=params.learning_rate)
+        solver = optax.chain(grad_clip, optax.sgd(learning_rate=lr_schedule))
     elif opti == "rmsprop":
-        solver = optax.rmsprop(learning_rate=params.learning_rate, decay=0.9, eps=1e-8)
+        solver = optax.chain(grad_clip, optax.rmsprop(learning_rate=lr_schedule, decay=0.9, eps=1e-8))
         print("amsgrad optimizer selected")
-        solver = optax.amsgrad(learning_rate=params.learning_rate)
+        solver = optax.chain(grad_clip, optax.amsgrad(learning_rate=lr_schedule))
     elif opti == "lion":
-        solver = optax.lion(learning_rate=params.learning_rate)
-    else: 
+        solver = optax.chain(grad_clip, optax.lion(learning_rate=lr_schedule))
+    else:
         solver = None
     if solver is not None:
         opt_state = solver.init(weights)
@@ -740,6 +754,11 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     # Synchronize all ranks and start timer
     mpi4jax.barrier(comm=comm)
     start_time = time.time()
+
+    best_val_acc = -float('inf')
+    best_weights = weights
+    best_neuron_states = empty_neuron_states
+    best_epoch = 0
 
     for epoch in tqdm(range(params.num_epochs), disable=TQDM_DISABLE):
         key, subkey = jax.random.split(key) 
@@ -756,7 +775,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             if rank == 0:
                 batch_iterator = iter(training_generator) # Make the dataloader iterable
             
-        for i in tqdm(range(total_batches[0]), disable=TQDM_DISABLE):
+        for i in tqdm(range(total_batches[0]), miniters=total_batches[0]//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
             neuron_states = empty_neuron_states
             if layer_idx == 0: # Input layer
                 batch_x, batch_y = mpi_config.split_batch(params, batch_iterator, 4)
@@ -795,7 +814,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                     weight_grad = gradients[0]
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
                     weight_grad = mpi_config.combine_batch_avg(weight_grad) # Gather the weight gradients from all ranks in the same layer
-                    weight_grad = mpi_config.sum_model_parallel(weight_grad)
+                    # No sum_model_parallel: the last layer is linear, each rank owns a disjoint weight slice
 
                     # Store the accuracy, loss and history
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
@@ -821,10 +840,12 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
                     weight_grad = mpi_config.combine_batch_avg(weight_grad) # Gather the weight gradients from all ranks in the same layer
 
-                    # Sum partial gradients across model-parallel ranks of this layer so every
-                    # rank's shared weight tensor receives the same update under x/y/c splits.
-                    weight_grad = mpi_config.sum_model_parallel(weight_grad)
-                    threshold_grad = mpi_config.sum_model_parallel(threshold_grad)
+                    # Conv ranks replicate the full weight tensor and compute partial gradients
+                    # for their owned region — sum them so every rank applies the same update.
+                    # Linear layers are model-partitioned (disjoint weight slices), so no sum.
+                    if empty_neuron_states.is_conv:
+                        weight_grad = mpi_config.sum_model_parallel(weight_grad)
+                        threshold_grad = mpi_config.sum_model_parallel(threshold_grad)
 
                     # Add sparsity loss' impact to the gradient if relevant
                     if params.sparsity_impact[layer_idx] > 0:
@@ -883,6 +904,12 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                 jax.debug.print("Epoch {} , Training Accuracy: {:.2f}%, Validation Accuracy: {:.2f}%, mean loss: {}, mean val iterations: {}", epoch, all_epoch_accuracies[-1] * 100, val_accuracy * 100, mean_loss, val_mean)
                 jax.debug.print("----------------------------\n")
         epoch_accuracy = bcast(epoch_accuracy, root=size-1, comm=comm)
+        val_accuracy_bcast = float(bcast(jnp.array([float(val_accuracy)]), root=size-1, comm=comm)[0])
+        if params.use_best and val_accuracy_bcast > best_val_acc:
+            best_val_acc = val_accuracy_bcast
+            best_weights = weights
+            best_neuron_states = empty_neuron_states
+            best_epoch = epoch
         gc.collect()
         if epoch_accuracy >= 0.9999:
             break
@@ -908,14 +935,18 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             )
 
     # Inference on the test set
-    test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset="test", save=False, debug=False)
+    final_weights = best_weights if params.use_best else weights
+    final_states = best_neuron_states if params.use_best else empty_neuron_states
+    if params.use_best and mpi_config.is_last_layer_leader:
+        print(f"Using best checkpoint from epoch {best_epoch} (val acc={best_val_acc:.4f})")
+    test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, network, final_weights, final_states, layer_computation, dataset="test", save=False, debug=False)
 
     all_iteration_mean = gather_iteration_means_per_layer(all_mean_iterations)
 
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
     end_time = time.time()
-    
+
     execution_time = end_time - start_time
     if mpi_config.is_last_layer_leader:
         print(f"Execution Time: {execution_time:.6f} seconds")
@@ -929,8 +960,8 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         test_accuracy,
         execution_time,
         all_iteration_mean,
-        weights,
-        empty_neuron_states.thresholds,
+        final_weights,
+        final_states.thresholds,
         all_loss,
         opti,
         "CNN",
@@ -1034,6 +1065,12 @@ def gather_iteration_means_per_layer(mean_iterations):
 
 
 def store_training_data_distributed(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights, thresholds, all_loss, optiname, network_type, all_history=None, total_batches=None, extra_fields=None):
+    # Linear layers are model-partitioned: reassemble the full weights/thresholds
+    # across the layer's ranks before storing (conv layers replicate full arrays).
+    if layer_idx != 0 and not network.layers[layer_idx].is_conv:
+        weights = mpi_config.concatenate_model_partition(weights, dim=weights.ndim)
+        thresholds = mpi_config.concatenate_model_partition(thresholds, dim=thresholds.ndim)
+
     # save_root = last_layer_idx * processes_per_layer_global
     save_root = mpi_config.get_last_layer_batch_leader
     result_path = None
@@ -1153,7 +1190,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
 
     epoch_iter_sum = 0.0
     epoch_iter_count = 0
-    for i in tqdm(range(total_batches), disable=TQDM_DISABLE):
+    for i in tqdm(range(total_batches), miniters=total_batches//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
         if layer_idx == 0:         
             # readInputJson = True        
             if readInputJson: # Test with stored input
@@ -1214,9 +1251,12 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
                 # y_buf = np.empty((batch_part_size,), dtype=np.float32)
                 # comm.Recv(y_buf, source=rank - (last_layer_idx * processes_per_layer_global), tag=10)
                 # y = y_buf
-                y = mpi_config.recv_labels()        
+                y = mpi_config.recv_labels()
 
-                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
+                # Reconstruct the full output vector from the model-partitioned last-layer ranks
+                outputs = mpi_config.gather_model_partition(outputs)
+
+                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)
                 
                 epoch_correct += int(batch_correct)
                 epoch_total += valid_y.shape[0]
@@ -1338,7 +1378,6 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     batch_size = config['batch_size']
 
     load_file = config['load_file']
-    best = config['best']
     rerun = config['rerun']
     
     # Get the size of the biggest kernel (Partially used for getting top k elements but not mandatory anymore)
@@ -1442,6 +1481,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             output_decay=config.get('output_decay', 1.0),       # Per-event weight decay at output layer
             dedup=config.get('dedup', False),
             augment=config.get('augment', False),
+            use_best=config.get('use_best', False),
         )
 
         # Build the network using the above parameters and initialize the weights
@@ -1463,6 +1503,12 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
             if layer_idx > 0:
                 empty_neuron_states = network.rerun(thresholds)
+
+        # Slice linear-layer weights and neuron states to this rank's model partition,
+        # mirroring async_MLP_general. Conv layers keep full arrays and mask their owned
+        # region inside conv_layer_computation instead.
+        if layer_idx != 0 and not empty_neuron_states.is_conv:
+            weights, empty_neuron_states = mpi_config.MPI_partition(weights, empty_neuron_states)
 
         params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes)
         network = dataclasses.replace(network, params=params)

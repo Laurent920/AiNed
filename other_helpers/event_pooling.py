@@ -33,13 +33,13 @@ def compact_nonzero_and_pad(events, pad_len=0):
     # Boolean mask: 1 for nonzero values
     mask = values != 0
 
-    # Get indices that would sort mask so that True come first
-    # (~mask) is used so that True (1) goes before False (0)
-    sort_keys = ~mask
-    perm = jnp.argsort(sort_keys.astype(jnp.int32))
+    # Order nonzero events by descending value (strongest first); zeros are pushed
+    # to the back with +inf. Single argsort — same cost as the old nonzero-first sort.
+    sort_keys = jnp.where(mask, -values, jnp.inf)
+    perm = jnp.argsort(sort_keys)
 
     # Reorder events
-    compacted = events[perm] #TODO Order the events from highest to lowest value
+    compacted = events[perm]
 
     # Count nonzero
     nonzero_count = jnp.sum(mask).astype(jnp.int32)
@@ -155,14 +155,14 @@ def sparse_pool(events, input_shape, mode="max", pool_size=(2, 2), stride=(2, 2)
         raise ValueError("mode must be 'max' or 'avg'")
 
     # Build (N, 4) output — one row per input event, using its pre-computed pooled coords.
-    # Sort winners to front ordered by pooling cell index so downstream emit order matches
-    # what the original full-map implementation produced (stable, ascending cell index).
+    # Sort winners to the front ordered by descending pooled value (strongest first);
+    # non-winners are pushed to the back with +inf. Single argsort — same cost as before.
     out = jnp.stack([pooled_c.astype(jnp.float32),
                      pooled_x.astype(jnp.float32),
                      pooled_y.astype(jnp.float32),
                      out_val], axis=-1)  # (N, 4)
 
-    sort_key = jnp.where(is_unique_winner, safe_pooled_idx, num_segments)
+    sort_key = jnp.where(is_unique_winner, -out_val, jnp.inf)
     compact_out = out[jnp.argsort(sort_key)]
     nb_valid_el = jnp.sum(is_unique_winner).astype(jnp.int32)
 

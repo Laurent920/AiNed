@@ -385,6 +385,9 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     for _next_rank, _ in mpi_config.next_layer:
         next_grad = next_grad + recv(jnp.zeros((batch_part_size,) + params.flat_layer_sizes[layer_idx]), source=_next_rank, tag=2, comm=comm)
 
+    # Weights/states are model-partitioned (see MPI_partition in main): keep the owned slice
+    next_grad = next_grad[:, mpi_config.model_part.start_idx:mpi_config.model_part.end_idx+1]
+
     # Compute input's gradient and weight gradient
     weight_grad, th_grad, weight_res, bias_grad = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
@@ -636,9 +639,13 @@ def loss_fn(params, key, weights, empty_neuron_states, layer_computation, target
     # jax.debug.print("Rank {} finished forward pass in loss_fn with {} and {} it", rank, all_outputs, iterations)
     # w_sum = l2_weight_regularization(mpi_config, weights)
 
+    # Reconstruct the full output vector from the model-partitioned last-layer ranks
+    full_outputs = mpi_config.gather_model_partition(all_outputs)
+
     # Compute Loss and loss gradient
-    loss, loss_grad = jax.value_and_grad(loss_func)(all_outputs, target)
+    loss, loss_grad = jax.value_and_grad(loss_func)(full_outputs, target)
     loss_grad /= mpi_config.get_process_per_batch  # Shape (B, 10)
+    loss_grad = loss_grad[:, mpi_config.model_part.start_idx:mpi_config.model_part.end_idx+1] # Keep this rank's owned slice
     # loss += params.w_reg * w_sum
 
     # Compute output gradient and weight gradient
@@ -661,7 +668,7 @@ def loss_fn(params, key, weights, empty_neuron_states, layer_computation, target
         target_labels = jnp.argmax(target, axis=-1)
         acc_history, avg_rank = process_history(all_neuron_states.values_history, all_neuron_states.history_index, target_labels)
 
-    return (loss, all_outputs, iterations, total_loss, (acc_history, avg_rank)), (mean_weight_grad, loss_grad)
+    return (loss, full_outputs, iterations, total_loss, (acc_history, avg_rank)), (mean_weight_grad, loss_grad)
 
 def sparsity_loss(params, all_neuron_states, iterations):
     '''
@@ -812,7 +819,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                     weight_grad = gradients[0]
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
                     weight_grad = mpi_config.combine_batch_avg(weight_grad) # Gather the weight gradients from all ranks in the same layer
-                    weight_grad = mpi_config.sum_model_parallel(weight_grad)
+                    # No sum_model_parallel: the last layer is linear, each rank owns a disjoint weight slice
 
                     # Store the accuracy, loss and history
                     valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
@@ -838,10 +845,12 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                     # weight_grad = gather_batch(weight_grad, mpi_config, average=True)
                     weight_grad = mpi_config.combine_batch_avg(weight_grad) # Gather the weight gradients from all ranks in the same layer
 
-                    # Sum partial gradients across model-parallel ranks of this layer so every
-                    # rank's shared weight tensor receives the same update under x/y/c splits.
-                    weight_grad = mpi_config.sum_model_parallel(weight_grad)
-                    threshold_grad = mpi_config.sum_model_parallel(threshold_grad)
+                    # Conv ranks replicate the full weight tensor and compute partial gradients
+                    # for their owned region — sum them so every rank applies the same update.
+                    # Linear layers are model-partitioned (disjoint weight slices), so no sum.
+                    if empty_neuron_states.is_conv:
+                        weight_grad = mpi_config.sum_model_parallel(weight_grad)
+                        threshold_grad = mpi_config.sum_model_parallel(threshold_grad)
 
                     # Add sparsity loss' impact to the gradient if relevant
                     if params.sparsity_impact[layer_idx] > 0:
@@ -1046,6 +1055,12 @@ def gather_iteration_means_per_layer(mean_iterations):
 
 
 def store_training_data_distributed(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights, thresholds, all_loss, optiname, network_type, all_history=None, total_batches=None, extra_fields=None):
+    # Linear layers are model-partitioned: reassemble the full weights/thresholds
+    # across the layer's ranks before storing (conv layers replicate full arrays).
+    if layer_idx != 0 and not network.layers[layer_idx].is_conv:
+        weights = mpi_config.concatenate_model_partition(weights, dim=weights.ndim)
+        thresholds = mpi_config.concatenate_model_partition(thresholds, dim=thresholds.ndim)
+
     # save_root = last_layer_idx * processes_per_layer_global
     save_root = mpi_config.get_last_layer_batch_leader
     result_path = None
@@ -1224,9 +1239,12 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
                 # y_buf = np.empty((batch_part_size,), dtype=np.float32)
                 # comm.Recv(y_buf, source=rank - (last_layer_idx * processes_per_layer_global), tag=10)
                 # y = y_buf
-                y = mpi_config.recv_labels()        
+                y = mpi_config.recv_labels()
 
-                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)                 
+                # Reconstruct the full output vector from the model-partitioned last-layer ranks
+                outputs = mpi_config.gather_model_partition(outputs)
+
+                valid_y, batch_correct = accuracy(i, outputs, y, iterations, print=False)
                 
                 epoch_correct += int(batch_correct)
                 epoch_total += valid_y.shape[0]
@@ -1476,6 +1494,12 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
             if layer_idx > 0:
                 empty_neuron_states = network.rerun(thresholds)
+
+        # Slice linear-layer weights and neuron states to this rank's model partition,
+        # mirroring async_MLP_general. Conv layers keep full arrays and mask their owned
+        # region inside conv_layer_computation instead.
+        if layer_idx != 0 and not empty_neuron_states.is_conv:
+            weights, empty_neuron_states = mpi_config.MPI_partition(weights, empty_neuron_states)
 
         params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes)
         network = dataclasses.replace(network, params=params)

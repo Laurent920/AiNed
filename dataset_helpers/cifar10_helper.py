@@ -74,13 +74,12 @@ def flatten_row_major(images):
 
 def normalize_per_channel(flat_images):
     """
-    Apply (x - mean) / std per channel on a flat (N, H*W*C) array that still has
-    RGB interleaved at each pixel (i.e. stride-3 channel dimension).
+    Scale to [0, 1] by dividing by 255.
+    Mean/std normalization is intentionally avoided: subtracting the channel mean
+    produces ~50% negative pixel values, which conflict with positive-weight neurons
+    in the AED network and cause gradients to cancel, collapsing activations over epochs.
     """
-    n, total = flat_images.shape
-    reshaped = flat_images.reshape(n, total // NUM_CHANNELS, NUM_CHANNELS)
-    reshaped = (reshaped - CIFAR10_MEAN) / CIFAR10_STD
-    return reshaped.reshape(n, total)
+    return flat_images / 255.0
 
 
 def preprocess_dataset_sequential(dataset_x):

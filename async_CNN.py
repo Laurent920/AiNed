@@ -1571,7 +1571,6 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     batch_size = config['batch_size']
 
     load_file = config['load_file']
-    best = config['best']
     rerun = config['rerun']
     
     # Get the size of the biggest kernel (Partially used for getting top k elements but not mandatory anymore)
@@ -1666,6 +1665,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             output_decay=config.get('output_decay', 1.0),       # Per-event weight decay at output layer
             augment=config.get('augment', False),
             dedup=config.get('dedup', False),
+            use_best=config.get('use_best', False),
         )
 
         # Build the network using the above parameters and initialize the weights

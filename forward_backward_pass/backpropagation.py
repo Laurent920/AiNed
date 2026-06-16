@@ -38,7 +38,11 @@ def compute_full_bpp(params, all_neuron_states, next_grad, layer_idx):
     layer_activity = all_neuron_states.layer_activity
 
     # (1) Shape: (784, 128)
-    weight_res = (input_vector[:, None] <= output_vector[None, :])
+    # Use a fired/not-fired mask instead of the timing-based (input_time <= output_time) mask.
+    # The timing mask biased gradient toward late-firing (monopolizing) neurons because a higher
+    # last-fire-time includes more inputs, amplifying their gradient over epochs until they dominate
+    # and all other neurons die. The activity mask gives equal weight to all fired neurons.
+    weight_res = jnp.broadcast_to((output_vector > 0)[None, :], (len(input_vector), len(output_vector)))
 
     # (2) Shape: (784, 128)
     # if next_weight_res is not None:

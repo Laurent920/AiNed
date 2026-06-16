@@ -39,9 +39,9 @@ from other_helpers.helpers import process_history, load_config_with_defaults, pa
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
 
-from other_helpers.general_MPI_helper import data_split, model_split_custom, model_split
+from other_helpers.general_MPI_helper_input_split import data_split, model_split_custom, model_split
 from other_helpers.init_weights import init_params
-from forward_backward_pass.inference import predict, layer_computation
+from forward_backward_pass.inference_input_split import predict, layer_computation
 
 jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_disable_jit", True)
@@ -58,6 +58,7 @@ size = None
 
 layer_idx = None           # Rank corresponding to the layer
 processes_per_layer_global = None    # Number of processes for each layer
+input_splits_per_layer_global = None # Input splits for each layer (2D block parallelism)
 last_layer = None            # Rank of last layer
 batch_part_size = None           # The size of the batch on each process
 mpi_config = None
@@ -245,23 +246,19 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
     # Initialize the optimizer
     if rank == 0:
         print(f"{opti} optimizer selected")
-    steps_per_epoch = max(1, int(total_batches[0]))
-    total_steps = max(1, params.num_epochs * steps_per_epoch)
-    lr_schedule = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
-    grad_clip = optax.clip_by_global_norm(1.0)
     if opti == "adam":
-        solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
-    elif opti == "adamw":
-        solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
+        solver = optax.adam(learning_rate=params.learning_rate)
+    elif opti == "adamw":        
+        solver = optax.adam(learning_rate=params.learning_rate)
     elif opti == "sgd":
-        solver = optax.chain(grad_clip, optax.sgd(learning_rate=lr_schedule, momentum=0.9))
+        solver = optax.sgd(learning_rate=params.learning_rate, momentum=0.9)
     elif opti == "rmsprop":
-        solver = optax.rmsprop(learning_rate=lr_schedule, decay=0.9, eps=1e-8)
+        solver = optax.rmsprop(learning_rate=params.learning_rate, decay=0.9, eps=1e-8)
         print("amsgrad optimizer selected")
-        solver = optax.chain(grad_clip, optax.amsgrad(learning_rate=lr_schedule))
+        solver = optax.amsgrad(learning_rate=params.learning_rate)
     elif opti == "lion":
-        solver = optax.chain(grad_clip, optax.lion(learning_rate=lr_schedule))
-    else:
+        solver = optax.lion(learning_rate=params.learning_rate)
+    else: 
         solver = None
     if solver is not None:
         opt_state = solver.init(weights)
@@ -424,8 +421,9 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             "MLP_temp",
                             all_history,
                             total_batches[0],
-                            extra_fields={"processes_per_layer": processes_per_layer_global})
-            
+                            extra_fields={"processes_per_layer": processes_per_layer_global,
+                                          "input_splits_per_layer": input_splits_per_layer_global})
+
         if trial is not None: # If using Optuna Hyper-parameter tuner
             # Return values if the run is not promising and should be pruned  
             all_mean_it = mpi_config.combine_batch_avg(all_mean_iterations) # Gather the weight gradients from all ranks in the split rank
@@ -486,8 +484,9 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             "MLP",
                             all_history,
                             total_batches[0],
-                            extra_fields={"processes_per_layer": processes_per_layer_global})
-        
+                            extra_fields={"processes_per_layer": processes_per_layer_global,
+                                          "input_splits_per_layer": input_splits_per_layer_global})
+
         encoded = np.frombuffer(result_path_str.encode("utf-8"), dtype=np.uint8)
         if encoded.size > MAX_LEN:
             raise ValueError("result_path too long")
@@ -615,7 +614,7 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
     
     epoch_iter_sum = 0.0
     epoch_iter_count = 0
-    for i in tqdm(range(total_batches), miniters=total_batches//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
+    for i in tqdm(range(total_batches), miniters=int(total_batches)//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
         neuron_states = empty_neuron_states
         
         if layer_idx == 0:                 
@@ -719,11 +718,12 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                                 "MLP",
                                 all_history,
                                 total_batches,
-                                extra_fields={"processes_per_layer": processes_per_layer_global})
+                                extra_fields={"processes_per_layer": processes_per_layer_global,
+                                              "input_splits_per_layer": input_splits_per_layer_global})
     return epoch_accuracy, mean, end_time - start_time
 
 # region Main
-def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, trial=None):
+def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, input_splits_per_layer=None, trial=None):
     '''
     Define each MPI rank's split_rank.
     If processes_per_layer is given (tuple with one int per layer), uses custom data split.
@@ -734,14 +734,16 @@ def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, trial=None)
     global batch_part_size
     global mpi_config
     global processes_per_layer_global
+    global input_splits_per_layer_global
 
+    input_splits_per_layer_global = list(input_splits_per_layer) if input_splits_per_layer is not None else None
     if processes_per_layer is not None:
-        mpi_config = model_split_custom(rank, comm, size, batch_size, layer_sizes, tuple(processes_per_layer))
+        isl = tuple(input_splits_per_layer) if input_splits_per_layer is not None else None
+        mpi_config = model_split_custom(rank, comm, size, batch_size, layer_sizes, tuple(processes_per_layer), isl)
         processes_per_layer_global = list(processes_per_layer)
     else:
         mpi_config = model_split(rank, comm, size, batch_size, layer_sizes)
         processes_per_layer_global = None
-        # mpi_config = data_split(rank, comm, size, batch_size, layer_sizes)
 
     layer_idx = mpi_config.layer_idx
     last_layer = mpi_config.last_layer_idx
@@ -779,6 +781,9 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     processes_per_layer = config.get('processes_per_layer', None)
     if processes_per_layer is not None:
         processes_per_layer = tuple(processes_per_layer)
+    input_splits_per_layer = config.get('input_splits_per_layer', None)
+    if input_splits_per_layer is not None:
+        input_splits_per_layer = tuple(input_splits_per_layer)
 
     if trial is not None:
         dataset = trial_params.dataset
@@ -791,15 +796,41 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         if len(processes_per_layer) != len(layer_sizes):
             print(f"Error: processes_per_layer length ({len(processes_per_layer)}) must match number of layers ({len(layer_sizes)})")
             sys.exit(1)
-        if sum(processes_per_layer) != size:
-            print(f"Error: sum of processes_per_layer ({sum(processes_per_layer)}) must equal MPI size ({size})")
-            sys.exit(1)
+        if input_splits_per_layer is None:
+            if sum(processes_per_layer) != size:
+                print(f"Error: sum of processes_per_layer ({sum(processes_per_layer)}) must equal MPI size ({size})")
+                sys.exit(1)
     else:
         if size % len(layer_sizes) != 0:
             print(f"Error: MPI size ({size}) must be a multiple of number of layers ({len(layer_sizes)}). Use processes_per_layer in config for custom distribution.")
             sys.exit(1)
 
-    get_layer_idx(batch_size, layer_sizes, processes_per_layer, trial)
+    if input_splits_per_layer is not None:
+        if processes_per_layer is None:
+            print("Error: input_splits_per_layer requires processes_per_layer to be set")
+            sys.exit(1)
+        if len(input_splits_per_layer) != len(layer_sizes):
+            print(f"Error: input_splits_per_layer length ({len(input_splits_per_layer)}) must match number of layers ({len(layer_sizes)})")
+            sys.exit(1)
+        if input_splits_per_layer[0] != 1:
+            print("Error: input_splits_per_layer[0] must be 1 (first layer has no incoming input to split)")
+            sys.exit(1)
+        if input_splits_per_layer[-1] != 1:
+            print("Error: input_splits_per_layer[-1] must be 1 (last layer must be unsplit)")
+            sys.exit(1)
+        if not all(s >= 1 for s in input_splits_per_layer):
+            print("Error: all input_splits_per_layer entries must be >= 1")
+            sys.exit(1)
+        expected_size = sum(p * s for p, s in zip(processes_per_layer, input_splits_per_layer))
+        if expected_size != size:
+            print(f"Error: sum(processes_per_layer * input_splits_per_layer) = {expected_size} must equal MPI size ({size})")
+            sys.exit(1)
+        sparsity = config.get('sparsity_impact', (0,) * len(layer_sizes))
+        if any(s > 1 for s in input_splits_per_layer) and any(v > 0 for v in sparsity):
+            print("Error: sparsity_impact must be all 0 when any input split > 1")
+            sys.exit(1)
+
+    get_layer_idx(batch_size, layer_sizes, processes_per_layer, input_splits_per_layer, trial)
 
     if batch_size % mpi_config.get_process_per_batch != 0:
         print(f"Error: batch_size ({batch_size}) must be divisible by processes per layer ({mpi_config.get_process_per_batch})")
