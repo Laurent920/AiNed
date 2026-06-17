@@ -1,0 +1,28 @@
+
+# ── Mode ──────────────────────────────────────────────────────────────────────
+# training  : not implemented yet
+# inference : run test set prediction only (مثل لورنت mode: inference)
+mode: inference
+
+#layer size
+layer_sizes: [2312, 64, 64, 64, 10]
+
+# ── Weight file ───────────────────────────────────────────────────────────────
+weight_file: "weights_nmnist/weights_nmnist_3hidden_2312x64x64x64x10_fgs8_12062026.npz"   # must contain arr_0, arr_1, arr_2, arr_3
+
+# ── Neuron parameters ─────────────────────────────────────────────────────────
+tau_m: 1000.0
+threshold: 0.3
+firing_nb: -1
+forward_group_size: 8
+use_refrac: true      # true = strict refractory per frame, false = no refractory (matches training refrac_dropout=0.8)
+
+# ── Data parameters ───────────────────────────────────────────────────────────
+time_window: 10000.0
+data_dir: "./data"
+debug: true
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+# JAX_PLATFORMS=cpu mpirun -n 3 python sepi_tmlr_10062026.py --config sepi_tmlr_conf_1006.yaml
+# smoke-test:
+# JAX_PLATFORMS=cpu mpirun -n 3 python sepi_tmlr_10062026.py --config sepi_tmlr_conf_1006.yaml --max_samples 50
