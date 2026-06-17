@@ -1,1 +1,62 @@
+# Async SNN Inference — N-MNIST (`sepi_tmlr_jax_syncL1_1006_v2.py`)
 
+Frame-based asynchronous SNN inference on N-MNIST using JAX and MPI.
+
+## MPI Pipeline
+
+```
+rank 0        —  input feeder
+rank 1        —  sync LIF  (fires once per frame at frame-end)
+rank 2 … N-2  —  async LIF (fires every forward_group_size events)
+rank N-1      —  output accumulator
+```
+
+Number of ranks = number of layers (e.g. `[2312, 64, 64, 64, 10]` → `mpirun -n 5`).
+
+## Run
+
+```bash
+# Basic inference
+mpirun -n 5 python sepi_tmlr_jax_syncL1_1006_v2.py --config sepi_tmlr_conf_5layer.yaml
+
+# Quick test (50 samples)
+mpirun -n 5 python sepi_tmlr_jax_syncL1_1006_v2.py --config sepi_tmlr_conf_5layer.yaml --max_samples 50
+
+# Save per-sample stats to Excel + CSV
+mpirun -n 5 python sepi_tmlr_jax_syncL1_1006_v2.py --config sepi_tmlr_conf_5layer.yaml --out_stats results
+```
+
+## Key Config Fields (YAML)
+
+| Field | Description |
+|-------|-------------|
+| `layer_sizes` | Network architecture |
+| `weight_file` | Path to `.npz` weights (`arr_0`, `arr_1`, …) |
+| `forward_group_size` | Async fire rate (events before firing) |
+| `threshold` | Firing threshold |
+| `tau_m` | Membrane time constant (ms) |
+| `time_window` | Frame duration (ms) |
+| `use_refrac` | Refractory within frames |
+
+## CLI Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--config` | YAML config path |
+| `--max_samples` | Limit test samples |
+| `--fgs` | Override `forward_group_size` |
+| `--scheduler` | `momentum` (default) or `random` |
+| `--out_stats` | Save per-sample stats to `.xlsx` and `.csv` |
+| `--benchmark` | Sweep fgs × scheduler × use_refrac |
+
+## Output (`--out_stats`)
+
+Saves one row per sample: `sample, label, pred, correct, input_ev, hid_spk, L1_ev … LN_ev, t_ms`
+
+## Results (5-layer, 10k samples)
+
+| Architecture | fgs | Accuracy |
+|-------------|-----|----------|
+| 2312→64→64→64→10 | 8 | **93.38%** (9338/10000) |
+
+  Accuracy=93.38%  in=899  hid_spk=41.5  L1_ev=898.9  L2_ev=41.5  L3_ev=58.0  L4_ev=124.4  t/sample=4.3ms  total=119.8s
