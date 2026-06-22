@@ -51,6 +51,11 @@ STORE_EACH_EPOCH = False
 BUFFER_SIZE = 0
 END_SIGNAL = jnp.array([-1.0, -1.0], dtype=jnp.float32)
 
+# Hidden→hidden backward gradient. DEFAULT: old unmasked dot(next_grad, W.T) (trains deep
+# nets much faster). Set AINED_LEGACY_BWD=0 to restore the (output_vector>0) ReLU-derivative mask.
+# (This script already uses a constant LR / plain Adam.)
+_LEGACY_BWD_GRAD = os.environ.get("AINED_LEGACY_BWD", "1") == "1"
+
 # Initialize empty global MPI variables
 comm = None
 rank = None      
@@ -59,6 +64,7 @@ size = None
 layer_idx = None           # Rank corresponding to the layer
 processes_per_layer_global = None    # Number of processes for each layer
 input_splits_per_layer_global = None # Input splits for each layer (2D block parallelism)
+result_extra_fields_global = None    # Extra fields persisted into result JSONs (set in main)
 last_layer = None            # Rank of last layer
 batch_part_size = None           # The size of the batch on each process
 mpi_config = None
@@ -95,10 +101,13 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
     weight_grad += 2 * params.w_reg * weights
 
     if layer_idx > 1:
-        cur_relu_mask = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)
-
-        # Send gradient to the previous layer
-        send_grad = jnp.dot(next_grad * cur_relu_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
+        if _LEGACY_BWD_GRAD:
+            # Old form: unmasked gradient propagation (no ReLU-derivative gate on next_grad).
+            send_grad = jnp.dot(next_grad, weights.T)
+        else:
+            cur_relu_mask = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)
+            # Send gradient to the previous layer
+            send_grad = jnp.dot(next_grad * cur_relu_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
         mpi_config.backward_send(send_grad)
     
     # Sparsity loss gradients 
@@ -421,8 +430,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             "MLP_temp",
                             all_history,
                             total_batches[0],
-                            extra_fields={"processes_per_layer": processes_per_layer_global,
-                                          "input_splits_per_layer": input_splits_per_layer_global})
+                            extra_fields=result_extra_fields_global)
 
         if trial is not None: # If using Optuna Hyper-parameter tuner
             # Return values if the run is not promising and should be pruned  
@@ -484,8 +492,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             "MLP",
                             all_history,
                             total_batches[0],
-                            extra_fields={"processes_per_layer": processes_per_layer_global,
-                                          "input_splits_per_layer": input_splits_per_layer_global})
+                            extra_fields=result_extra_fields_global)
 
         encoded = np.frombuffer(result_path_str.encode("utf-8"), dtype=np.uint8)
         if encoded.size > MAX_LEN:
@@ -718,8 +725,7 @@ def batch_predict(params: Params, key, total_batches, weights, empty_neuron_stat
                                 "MLP",
                                 all_history,
                                 total_batches,
-                                extra_fields={"processes_per_layer": processes_per_layer_global,
-                                              "input_splits_per_layer": input_splits_per_layer_global})
+                                extra_fields=result_extra_fields_global)
     return epoch_accuracy, mean, end_time - start_time
 
 # region Main
@@ -759,6 +765,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
     global size
     global comm
     global TQDM_DISABLE
+    global result_extra_fields_global
 
     rank, size, comm = rank_, size_, comm_
     if rank != 0:
@@ -832,6 +839,13 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
 
     get_layer_idx(batch_size, layer_sizes, processes_per_layer, input_splits_per_layer, trial)
 
+    # Fields persisted into the result JSON alongside the Params (set once, after
+    # get_layer_idx has populated the *_global vars).
+    result_extra_fields_global = {"processes_per_layer": processes_per_layer_global,
+                                  "input_splits_per_layer": input_splits_per_layer_global}
+    if dataset == "nmnist":
+        result_extra_fields_global["first_saccade_only"] = config['first_saccade_only']
+
     if batch_size % mpi_config.get_process_per_batch != 0:
         print(f"Error: batch_size ({batch_size}) must be divisible by processes per layer ({mpi_config.get_process_per_batch})")
         sys.exit(1)
@@ -852,7 +866,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             case "shd":
                 loader = torch_SHD_loader
             case "nmnist":
-                loader = partial(torch_nmnist_loader)
+                loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
             case "dvs":
                 if layer_sizes[0] == 64*64*2:
                     downsample = True
@@ -862,6 +876,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     downsample = True
                 loader = partial(torch_NCARS_loader)
             case "cifar10":
+                if layer_sizes[0] == 16 * 16 * 3:
+                    downsample = True
                 loader = cifar10_loader_manual
             case _:
                 raise ValueError(f"Unknown dataset: {dataset}")
@@ -940,7 +956,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         input_vector=jnp.zeros((prev_size,), dtype=int),
         output_vector=jnp.zeros((cur_size,), dtype=int),
         sync_rate_vector=sync_rate_vector,
-        values_history=jnp.zeros((params.history_size, cur_size)),
+        # Only the output layer records history; other layers keep an empty buffer.
+        values_history=jnp.zeros((params.history_size if layer_idx == last_layer else 0, cur_size)),
         history_index=jnp.array(0, dtype=jnp.int32),
     )
     weights, empty_neuron_states = mpi_config.MPI_partition(weights, empty_neuron_states)

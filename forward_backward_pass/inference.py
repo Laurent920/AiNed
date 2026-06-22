@@ -156,13 +156,32 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
                                                                         history_index=new_history_index,)
     
     def hidden_layer_case():
-        # APPLY THE SYNC RATE (per-neuron, vector-based)
-        sync_fire = (iteration - neuron_states.last_sent_iteration >= neuron_states.sync_rate_vector).astype(jnp.int32)
+        # APPLY THE SYNC RATE
+        if params.global_sync:
+            # Global per-layer (per-shard) gate: the layer can fire at all only if
+            # sync_rate events have elapsed since its last firing (max over owned
+            # neurons of last_sent_iteration). All-or-nothing, so raising sync_rate
+            # to the split factor S cleanly divides each shard's firing rate by S.
+            layer_last = jnp.max(neuron_states.last_sent_iteration)
+            layer_eligible = (iteration - layer_last >= neuron_states.sync_rate_vector[0]).astype(jnp.int32)
+            sync_fire = jnp.full(neuron_states.last_sent_iteration.shape, layer_eligible, dtype=jnp.int32)
+        else:
+            # Per-neuron gate: only neurons that fired within the last sync_rate
+            # events are blocked; the top-k among the rest still fires.
+            sync_fire = (iteration - neuron_states.last_sent_iteration >= neuron_states.sync_rate_vector).astype(jnp.int32)
         sync_fire = jax.lax.cond(invalid_idx, lambda _: jnp.ones(sync_fire.shape, dtype=jnp.int32), lambda _: sync_fire, None)
         activated_output = activations * sync_fire
 
         # APPLY ACTIVATION FUNCTION
         activated_output = activation_func(neuron_states.thresholds, activated_output)
+
+        # APPLY PER-SAMPLE DROPOUT (training only): mask candidate neurons before top-k.
+        # The mask is drawn once per sample in loop_over_batches and held fixed across
+        # all of that sample's events, so a dropped neuron stays out of the running for
+        # the whole sample (works with firing_nb=1: the runner-up fires instead).
+        _drop_p = params.dropout[layer_idx] if getattr(params, "dropout", None) is not None else 0.0
+        if grad and _drop_p > 0.0:
+            activated_output = activated_output * neuron_states.dropout_mask
 
         # APPLY THE FIRING NUMBER
         f_nb = params.firing_nb
@@ -277,12 +296,33 @@ def predict(params,
     else:
         _fh_k_h = _fh_k_w = _fh_event_pad_h = _fh_event_pad_w = 0
 
+    # Input-layer model parallelism: at trace time, decide whether this rank owns only a
+    # spatial sub-region of the input. When split, each input rank emits only the events
+    # inside its model_part; the union over ranks is the full (non-overlapping) input.
+    _input_mp = mpi_config.model_part
+    _input_is_split = (
+        isinstance(_input_mp, CNN_layer_Partition)
+        and _input_mp.get_size != _input_mp.total_size
+    )
+
     def input_layer(x):
         x_p = jnp.array(x)
 
         if params.shuffle_input:
             perm = jax.random.permutation(key, x_p.shape[0])
             x_p = x_p[perm]
+
+        if _input_is_split:
+            # Keep only this rank's region; compact those events to the front so the send
+            # loop below (which forwards the first `loop_iterations` rows) emits exactly them.
+            ev_c, ev_x, ev_y = x_p[:, 0], x_p[:, 1], x_p[:, 2]
+            active = ev_c != -2
+            in_c = (ev_c >= _input_mp.c_start_idx) & (ev_c <= _input_mp.c_end_idx)
+            in_x = (ev_x >= _input_mp.x_start_idx) & (ev_x <= _input_mp.x_end_idx)
+            in_y = (ev_y >= _input_mp.y_start_idx) & (ev_y <= _input_mp.y_end_idx)
+            keep = active & in_c & in_x & in_y
+            x_p = jnp.where(keep[:, None], x_p, -2.0)
+            x_p = x_p[jnp.argsort(~keep)]
 
         _next_sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[1]
         if _next_sr == 10000:
@@ -536,10 +576,22 @@ def predict(params,
 
     # jax.debug.print("rank {} data has shape {}", rank, batch_data.shape)
 
+    # Per-sample neuron dropout: static gate (params/grad/layer_idx all static at trace).
+    _drop_p = params.dropout[layer_idx] if getattr(params, "dropout", None) is not None else 0.0
+    _apply_dropout = grad and (layer_idx != 0) and (layer_idx != last_layer) and (_drop_p > 0.0)
+
     # Loop over batches, accumulate output values and return them
     @jit
-    def loop_over_batches(_, x):
+    def loop_over_batches(carry_key, x):
         neuron_states = empty_neuron_states
+        if _apply_dropout:
+            # Fresh Bernoulli keep-mask per sample, fixed across the sample's events.
+            carry_key, sample_key = jax.random.split(carry_key)
+            keep = jax.random.bernoulli(sample_key, p=1.0 - _drop_p,
+                                        shape=neuron_states.values.shape).astype(neuron_states.values.dtype)
+            if params.dropout_invert_scaling:
+                keep = keep / (1.0 - _drop_p)
+            neuron_states = neuron_states.replace(dropout_mask=keep)
         if layer_idx==0:
             iterations, buffer = input_layer(x)
             layer_input, new_neuron_states = jnp.zeros(()), neuron_states
@@ -548,9 +600,9 @@ def predict(params,
         # Barrier between samples prevents events from bleeding across sample boundaries
         # when a layer has multiple senders and the receiver uses MPI.ANY_SOURCE.
         mpi4jax.barrier(comm=mpi_config.comm)
-        return None, (new_neuron_states.values, iterations, new_neuron_states, buffer)
-    
-    _, (all_outputs, all_iterations, all_neuron_states, buffer) = jax.lax.scan(loop_over_batches, None, batch_data)    
+        return carry_key, (new_neuron_states.values, iterations, new_neuron_states, buffer)
+
+    _, (all_outputs, all_iterations, all_neuron_states, buffer) = jax.lax.scan(loop_over_batches, key, batch_data)
 
     # Synchronize all ranks before starting the backward pass
     mpi4jax.barrier(comm=mpi_config.comm)

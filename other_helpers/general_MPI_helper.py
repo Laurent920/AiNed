@@ -518,9 +518,19 @@ class MPIConfig:
                     batch_x_to_send = all_batch_x[b_partition.start_idx:b_partition.end_idx+1]
                     batch_y_to_send = all_batch_y[b_partition.start_idx:b_partition.end_idx+1]
                     # print(f"rank {rank}, Batch_x: {batch_x_to_send.shape}, Batch_y: {batch_y_to_send.shape}")
-                    
+
                     send(batch_x_to_send, dest=process, tag=4, comm=comm)
                     send(batch_y_to_send, dest=process, tag=4, comm=comm)
+
+            # Input-layer model parallelism: model-split siblings share the same (full) batch
+            # partition and so are absent from batch_distrib. Send each of them the full batch
+            # (they emit only their own spatial region). No-op when the input is not split.
+            _distrib_ranks = {p for p, _ in batch_distrib}
+            for process, _ in self.current_layer:
+                if process == rank or process in _distrib_ranks:
+                    continue
+                send(all_batch_x[batch_part.start_idx:batch_part.end_idx+1], dest=process, tag=4, comm=comm)
+                send(all_batch_y[batch_part.start_idx:batch_part.end_idx+1], dest=process, tag=4, comm=comm)
         else:
             # print(f"rank {rank} waiting for shape {(batch_part.get_size, params.max_nonzero, tuple_size)}")
             batch_x = recv(jnp.zeros((batch_part.get_size, params.max_nonzero, tuple_size)), source=0, tag=4, comm=comm)  
@@ -749,7 +759,9 @@ class MPIConfig:
               f"Model {model_part_repr} \n| "
               f"Current layer {list(self.current_layer)} \n| "
               f"Previous layer {list(self.previous_layer)} \n| "
-              f"Next layer {list(self.next_layer)} \n| " 
+              f"Next layer {list(self.next_layer)} \n| "
+              f"Residual prev {list(self.res_connect_prev)} \n| "
+              f"Residual next {list(self.res_connect_next)} \n| "
               f"all_leader_ranks {list(self.all_leader_ranks)} \n| "
               f"Batch distribution {list(self.batch_distribution)} \n| "
               f"batch_first_and_last_rank {list(self.batch_first_and_last_rank)}")

@@ -483,6 +483,33 @@ def custom_preprocess_event_pad_collate(batch, max_len, x_size, y_size):
     return batch_array, label_array
 
 
+def augmenting_preprocess_event_pad_collate(batch, max_len, x_size, y_size):
+    """
+    Like custom_preprocess_event_pad_collate but applies random flip + translation
+    per sample. Only used for the train loader.
+    """
+    data, labels = zip(*batch)
+    padded_data = []
+
+    for d in data:
+        d = _augment_events(d, x_size, y_size)
+        num_events = len(d)
+
+        d_padded = np.full((max_len, 2), -2, dtype=np.int32)
+        p = d["p"].astype(np.int32)
+        x = d["x"].astype(np.int32)
+        y = d["y"].astype(np.int32)
+        neuron_idx = p * (x_size * y_size) + x * y_size + y
+
+        d_padded[:num_events, 0] = neuron_idx
+        d_padded[:num_events, 1] = 1
+        padded_data.append(d_padded)
+
+    batch_array = jnp.array(padded_data, dtype=jnp.int32)
+    label_array = jnp.array(labels, dtype=jnp.int32)
+    return batch_array, label_array
+
+
 def _events_to_dense_matrix(events, x_size, y_size):
     """
     Aggregate all events from one sample into a dense (C, H, W) matrix.
@@ -604,7 +631,12 @@ def torch_NCARS_loader(
             collate_fn = lambda batch: custom_preprocess_event_pad_collate(
                 batch, max_data_length, x_size, y_size
             )
-            train_collate_fn = collate_fn
+            if augment:
+                train_collate_fn = lambda batch: augmenting_preprocess_event_pad_collate(
+                    batch, max_data_length, x_size, y_size
+                )
+            else:
+                train_collate_fn = collate_fn
 
     trainloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=train_collate_fn, shuffle=shuffle)
     valloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=collate_fn, shuffle=False)

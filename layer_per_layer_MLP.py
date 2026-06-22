@@ -337,7 +337,8 @@ class EventBasedNN:
                 last_sent_iteration=0,
                 input_vector=jnp.zeros((prev_layer_size), dtype=int),
                 output_vector=jnp.zeros((self.layer_sizes[i]), dtype=int),
-                values_history=jnp.zeros((params.history_size, self.layer_sizes[i])),
+                # Only the output layer records history; other layers keep an empty buffer.
+                values_history=jnp.zeros((params.history_size if i == self.num_layers - 1 else 0, self.layer_sizes[i])),
                 history_index=jnp.array(0, dtype=jnp.int32)
             )
             self.empty_neuron_states.append(state)

@@ -11,7 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 
-def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmentation=False, binned=False, aggregate_time=True, downsample=False, data_dir=""):
+def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmentation=False, binned=False, aggregate_time=True, downsample=False, data_dir="", first_saccade_only=True):
     '''
     If not binned it returns the raw dataset in forms of tuples of 4 which correspond to (x, y, time, polarity)=>(polarity, x, y, 1),
     x and y are comprised in [0,34] and polarity is 1 for positive spike and 0 for negative spike
@@ -41,9 +41,8 @@ def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmenta
     os.makedirs(save_dir, exist_ok=True)
     
     print(f"Loading N-MNIST dataset from: {save_dir}")
-
-    trainset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=True)
-    testset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=False)
+    trainset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=True, first_saccade_only=first_saccade_only)
+    testset = tonic.datasets.NMNIST(save_to=save_dir, transform=frame_transform, train=False, first_saccade_only=first_saccade_only)
 
     # for x, y in testset:
     #     print(f"data shape: {np.array(x).shape}, data[0]: {x[0]}, label: {y}")
@@ -54,12 +53,13 @@ def torch_nmnist_loader(batch_size, CNN_preprocess=True, shuffle=False, augmenta
     transform = tonic.transforms.Compose([torch.from_numpy,
                                         torchvision.transforms.RandomRotation([-10,10])])
     
+    saccade_tag = 'first_saccade' if first_saccade_only else 'full'
     if binned:
-        train_cache_path = os.path.join(base_cache_dir, 'binned/train')
-        test_cache_path = os.path.join(base_cache_dir, 'binned/test')
+        train_cache_path = os.path.join(base_cache_dir, 'binned', saccade_tag, 'train')
+        test_cache_path = os.path.join(base_cache_dir, 'binned', saccade_tag, 'test')
     else:
-        train_cache_path = os.path.join(base_cache_dir, 'raw/train')
-        test_cache_path = os.path.join(base_cache_dir, 'raw/test')
+        train_cache_path = os.path.join(base_cache_dir, 'raw', saccade_tag, 'train')
+        test_cache_path = os.path.join(base_cache_dir, 'raw', saccade_tag, 'test')
         
     if augmentation:
         cached_trainset = DiskCachedDataset(trainset, transform=transform, cache_path=train_cache_path)

@@ -136,7 +136,7 @@ class NeuronStates:
     })
     _OPTIONAL_ARRAY_FIELDS = frozenset({
         "sync_rate_vector", "recurrent_weight", "values_history",
-        "history_index", "weights_shape",
+        "history_index", "weights_shape", "dropout_mask",
     })
     _STATIC_FIELDS = frozenset({"is_conv"})  # non-array, treated as aux
 
@@ -226,6 +226,9 @@ class BaseParams:
     augment: bool = False        # CIFAR-10: random flip + pad-4/crop per batch
     dedup: bool = False          # Remove spatial duplicates from event stream before training
     use_best: bool = False       # Use best-validation checkpoint for test inference and saving
+    dropout: tuple[float, ...] | None = None  # Per-layer per-sample neuron dropout rate (None = off)
+    dropout_invert_scaling: bool = False      # Scale surviving activations by 1/(1-p) (inverted dropout)
+    global_sync: bool = False    # Sync-rate scope: False = per-neuron gate, True = global per-layer gate
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -460,6 +463,21 @@ def rerun_init(data_file_path, mpi_config, new_params, override_params=None):
             
     return params, weights, thresholds
 
+def load_stored_residual_connections(data_file_path):
+    """Read the residual skip-connection wiring saved in a checkpoint.
+
+    The MPI topology (which ranks exchange skip events) is built in get_layer_idx
+    *before* rerun_init runs, so a rerun must read the wiring from the checkpoint
+    here rather than trusting the current config. Returns None for checkpoints that
+    predate residual connections, so the caller can fall back to the config value.
+    """
+    with open(data_file_path, "r") as f:
+        stored_data = json.load(f)
+    rc = stored_data.get("residual_connections", None)
+    if rc is None:
+        return None
+    return tuple(tuple(c) for c in rc)
+
 def check_core_structure(ls1, ls2):
     # Check whether two network structures match, for CNN we only check the channel dimension, the filter sizes and the pooling
     if len(ls1) != len(ls2):
@@ -569,6 +587,8 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "restrict": params.restrict,
         "sparsity impact": params.sparsity_impact,
         "weight regularization": params.w_reg,
+        "dropout": params.dropout,
+        "dropout_invert_scaling": params.dropout_invert_scaling,
         "threshold init": params.init_thresholds,
         "threshold lr": params.threshold_lr,
         "test accuracy": test_accuracy,
@@ -577,10 +597,7 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "use_bias": params.use_bias,
         "augment": params.augment,
         "dedup": params.dedup,
-<<<<<<< HEAD
-=======
         "use_best": params.use_best,
->>>>>>> 8ed6394 (Added input split + bulk sending)
         "layer_sizes": params.layer_sizes,
         "training accuracy": np.array(all_epoch_accuracies).tolist(),
         "validation accuracy": np.array(all_validation_accuracies).tolist(),
@@ -727,9 +744,20 @@ def process_history(history, index, target_labels):
 
     out_hist, correct_target = preprocess_history(values_history, target_labels)
 
-    # Compute the average value over the batch 
-    acc_history = jnp.sum(out_hist, axis=0) / out_hist.shape[0]
-    avg_rank = jnp.sum(correct_target, axis=0) / correct_target.shape[0]
+    # Mask out unwritten history slots: samples that produced fewer events than
+    # history_size leave all-zero output vectors in the unused slots, which would
+    # otherwise bias accuracy toward class 0 and report an artificially perfect
+    # rank of 1. A slot counts as valid if its output vector is not all zeros.
+    valid = jnp.any(values_history != 0, axis=-1).astype(jnp.float32)  # (B, T)
+    counts = jnp.sum(valid, axis=0)                                    # (T,)
+
+    # Masked average over the batch. Use a safe denominator (>=1) to avoid a 0/0
+    # NaN when a timestep has no valid sample; such timesteps then evaluate to 0,
+    # which is a harmless "no data" marker (rank 0 is impossible otherwise) and
+    # keeps this NaN-free so it works under jax_debug_nans.
+    safe_counts = jnp.maximum(counts, 1.0)
+    acc_history = jnp.sum(out_hist * valid, axis=0) / safe_counts
+    avg_rank = jnp.sum(correct_target * valid, axis=0) / safe_counts
 
     return acc_history, avg_rank
 
@@ -904,6 +932,7 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'exploration_rate': 0.0,  # Probability of replacing a top-k fired neuron with a random non-top-k non-zero neuron
         'trace_event_timing': False,  # Capture one-batch event timing traces during inference
         'residual_connections': (),  # Residual skip connections: [(src_layer_idx, dst_layer_idx), ...]
+        'first_saccade_only': True,  # NMNIST: use only the first saccade (True) or the full event stream (False)
 
         # FPTT parameters
         'cell_type': 'aed',         # "aed" or "minimalrnn"

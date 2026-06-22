@@ -235,7 +235,8 @@ class Network:
                                     input_vector=jnp.zeros((prev_size,)),
                                     output_vector=jnp.zeros((layer[0],)),
                                     sync_rate_vector=sync_rate_vector,
-                                    values_history=jnp.zeros((params.history_size, layer[0])),
+                                    # Only the output layer records history; other layers keep an empty buffer.
+                                    values_history=jnp.zeros((params.history_size if i == len(layer_sizes) - 1 else 0, layer[0])),
                                     history_index=jnp.array(0, dtype=jnp.int32),
                                     weights_shape=(prev_size, layer[0]),
                                     is_conv=False,
@@ -303,7 +304,8 @@ class Network:
                     last_sent_iteration=-1,
                     input_vector=jnp.zeros(previous_layer.shape),
                     output_vector=jnp.zeros(unpadded_shape),
-                    values_history=jnp.zeros((params.history_size, *unpadded_shape)),
+                    # Conv layers are never the output layer, so no history is stored.
+                    values_history=jnp.zeros((0, *unpadded_shape)),
                     history_index=jnp.array(0, dtype=jnp.int32),
                     weights_shape=weights_shape,
                     is_conv=True

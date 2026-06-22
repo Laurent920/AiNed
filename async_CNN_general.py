@@ -54,6 +54,14 @@ STORE_EACH_EPOCH = False
 BUFFER_SIZE = 0
 END_SIGNAL = jnp.array([-1.0, -1.0, -1.0, -1.0], dtype=jnp.float32)
 
+# Hidden→hidden (FC) backward gradient. DEFAULT: old unmasked dot(next_grad, W.T) (trains deep
+# nets faster). Set AINED_LEGACY_BWD=0 to restore the (output_vector>0) ReLU-derivative mask.
+_LEGACY_BWD_GRAD = os.environ.get("AINED_LEGACY_BWD", "1") == "1"
+
+# Optimizer schedule. DEFAULT: cosine decay + grad clip (kept ON here for data-augmentation
+# stability, see optimizer comment). Set AINED_CONST_LR=1 for constant LR / plain Adam.
+_CONST_LR = os.environ.get("AINED_CONST_LR", "0") == "1"
+
 # Initialize empty global MPI variables
 comm = None
 rank = None      
@@ -234,7 +242,8 @@ class Network:
                                     input_vector=jnp.zeros((prev_size,)),
                                     output_vector=jnp.zeros((layer[0],)),
                                     sync_rate_vector=sync_rate_vector,
-                                    values_history=jnp.zeros((params.history_size, layer[0])),
+                                    # Only the output layer records history; other layers keep an empty buffer.
+                                    values_history=jnp.zeros((params.history_size if i == len(layer_sizes) - 1 else 0, layer[0])),
                                     history_index=jnp.array(0, dtype=jnp.int32),
                                     weights_shape=(prev_size, layer[0]),
                                     is_conv=False,
@@ -304,7 +313,8 @@ class Network:
                     last_sent_iteration=-1,
                     input_vector=jnp.zeros(previous_layer.shape),
                     output_vector=jnp.zeros(unpadded_shape),                         # unpadded (used in gradient)
-                    values_history=jnp.zeros((params.history_size, *unpadded_shape)),# unpadded
+                    # Conv layers are never the output layer, so no history is stored.
+                    values_history=jnp.zeros((0, *unpadded_shape)),                   # unpadded
                     history_index=jnp.array(0, dtype=jnp.int32),
                     weights_shape=weights_shape,
                     is_conv=True
@@ -400,10 +410,13 @@ def predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states, lay
     weight_grad += 2 * params.w_reg * weights
 
     if layer_idx > 1:
-        cur_relu_mask = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)
-
+        if _LEGACY_BWD_GRAD:
+            # Old form: unmasked gradient propagation (no ReLU-derivative gate on next_grad).
+            send_grad = jnp.dot(next_grad, weights.T)
+        else:
+            cur_relu_mask = (all_neuron_states.output_vector > 0).astype(next_grad.dtype)
+            send_grad = jnp.dot(next_grad * cur_relu_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
         # Send gradient to all previous-layer ranks (may be multiple with model parallelism)
-        send_grad = jnp.dot(next_grad * cur_relu_mask, weights.T) # Shape: (B, 128) @ (128, 784) = (B, 784)
         for _prev_rank, _ in mpi_config.previous_layer:
             send(send_grad, dest=_prev_rank, tag=2, comm=comm)
 
@@ -726,8 +739,12 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     # amplifies, and the decay damps the late-epoch divergence seen with a constant LR.
     steps_per_epoch = max(1, int(total_batches[0]))
     total_steps = max(1, params.num_epochs * steps_per_epoch)
-    lr_schedule = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
-    grad_clip = optax.clip_by_global_norm(1.0)
+    if _CONST_LR:
+        lr_schedule = params.learning_rate
+        grad_clip = optax.identity()
+    else:
+        lr_schedule = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
+        grad_clip = optax.clip_by_global_norm(1.0)
     if opti == "adam":
         solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
     elif opti == "adamw":
@@ -1424,7 +1441,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 case "shd":
                     loader = torch_SHD_loader
                 case "nmnist":
-                    loader = torch_nmnist_loader
+                    loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
                 case "dvs":
                     loader = partial(torch_DVSGesture_loader)
                     if layer_sizes[0][1] == 64:
@@ -1435,6 +1452,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                         downsample = True
                 case "cifar10":
                     loader = cifar10_loader_manual
+                    if layer_sizes[0][1] == 16:
+                        downsample = True
                 case _:
                     raise ValueError(f"Unknown dataset: {dataset}")
                 
@@ -1495,11 +1514,19 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         if rerun is not None:
             override_list = config.get('override_params', None)
             params, weights, thresholds = rerun_init(
-                rerun, 
-                mpi_config, 
-                params, 
+                rerun,
+                mpi_config,
+                params,
                 override_params=override_list
             )
+
+            # The first build used the config's sync_rate; rebuild with the resolved
+            # params so params-derived neuron state (notably sync_rate_vector) reflects
+            # the checkpoint/override values rather than the config.
+            network = Network.build(params, key, layer_sizes=layer_sizes,
+                                    flat_layer_sizes=(), conv_layer_sizes=(),
+                                    th_bias=0.0)
+            empty_neuron_states = network.layers[layer_idx]
 
             if layer_idx > 0:
                 empty_neuron_states = network.rerun(thresholds)
@@ -1525,16 +1552,18 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         total_batches = (total_train_batches, total_val_batches, total_test_batches)
 
         mode = config['mode']
+        extra_fields = {"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
+                        "split_dims": list(split_dims) if split_dims else None}
+        if dataset == "nmnist":
+            extra_fields["first_saccade_only"] = config['first_saccade_only']
         if mode == 'inference':
             # To only run inference
             batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True,
-                          extra_fields={"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
-                                        "split_dims": list(split_dims) if split_dims else None})
+                          extra_fields=extra_fields)
         elif mode == 'training':
             # To run the full training pipeline
             result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam",
-                               extra_fields={"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
-                                             "split_dims": list(split_dims) if split_dims else None})
+                               extra_fields=extra_fields)
         else:
             print(f"Unknown mode in config file, choose either 'training' or 'inference', got {mode}")
             sys.exit(1)

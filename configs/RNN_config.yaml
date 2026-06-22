@@ -49,6 +49,7 @@ layer_sizes: [1, 256, 10]
 # layer_sizes: [1, 256, 256, 10] 
 
 # dataset: nmnist
+# first_saccade_only: false   # N-MNIST only: True = first saccade, False = full event stream
 # layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 

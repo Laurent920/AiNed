@@ -54,6 +54,7 @@ layer_sizes: [1, 256, 256, 10]
 # layer_sizes: [1, 256, 256, 10] 
 
 # dataset: nmnist
+# first_saccade_only: false   # N-MNIST only: True = first saccade, False = full event stream
 # layer_sizes: [784, 256, 256, 10]
 # layer_sizes: [784, 256, 10]
 
@@ -148,6 +149,11 @@ exploration_rate: 0.0  # Probability [0, 1] of replacing a fired top-k neuron wi
 threshold_lr: 0.0
 sparsity_impact: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 w_reg: 0.0
+# Per-sample neuron dropout (training only): randomly mask hidden neurons, one fixed
+# mask per sample. One rate per layer index (input/output entries ignored). null = off.
+# Works with firing_nb=1: when the would-be winner is masked, the runner-up fires.
+dropout: null  # e.g. [0.0, 0.3, 0.3, 0.0] for layer_sizes [700, 256, 256, 20]
+dropout_invert_scaling: false  # scale survivors by 1/(1-p); usually skip at firing_nb=1
 top_weights: -1
 history_size: 0
 

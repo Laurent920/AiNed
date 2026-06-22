@@ -37,7 +37,7 @@ from dataset_helpers.ncars_helper import torch_NCARS_loader
 from dataset_helpers.cnn_pytorch import get_weights_for_rank
 
 from other_helpers.helpers import BaseParams, NeuronStates
-from other_helpers.helpers import accuracy, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
+from other_helpers.helpers import accuracy, load_stored_residual_connections, prepare_result_payload, rerun_init, store_data_to_json, store_result_artifacts
 from other_helpers.helpers import update_history, process_history, load_config_with_defaults, parse_unknown_args_and_overrides_config
 from forward_backward_pass.backpropagation import MLP_back_prop
 from forward_backward_pass.loss_functions import loss_bpp, loss_func
@@ -217,7 +217,8 @@ class Network:
                 key, subkey = jax.random.split(key) 
                 # thresholds = jax.random.uniform(subkey, layer) * params.init_thresholds + th_bias
                 thresholds = jnp.full(layer, params.init_thresholds)
-                sync_rate_vector = jnp.full(shape=layer, fill_value=params.sync_rate)
+                sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[i]
+                sync_rate_vector = jnp.full(shape=layer, fill_value=sr)
 
                 empty_neuron_states = NeuronStates(
                                     values=jnp.zeros(layer),
@@ -232,7 +233,8 @@ class Network:
                                     input_vector=jnp.zeros((prev_size,)),
                                     output_vector=jnp.zeros((layer[0],)),
                                     sync_rate_vector=sync_rate_vector,
-                                    values_history=jnp.zeros((params.history_size, layer[0])),
+                                    # Only the output layer records history; other layers keep an empty buffer.
+                                    values_history=jnp.zeros((params.history_size if i == len(layer_sizes) - 1 else 0, layer[0])),
                                     history_index=jnp.array(0, dtype=jnp.int32),
                                     weights_shape=(prev_size, layer[0]),
                                     is_conv=False,
@@ -269,7 +271,10 @@ class Network:
 
                     if rank == 0 and debug:
                         print(f"rank {rank}, previous layer shape: {in_shape}, out shape: {(out_chan, h_out, w_out)}, kernel: {kernel}, padding: {padding}, stride: {stride}")
-                    values = jnp.zeros((out_chan, h_out, w_out))  # Initialize values for convolutional layer
+                    # Pre-pad values: border=-10000 (out-of-bounds sentinel), valid region=0.
+                    ep_h, ep_w = kernel[0] - 1 - padding[0], kernel[1] - 1 - padding[1]
+                    values = jnp.full((out_chan, h_out + 2*ep_h, w_out + 2*ep_w), -10000.0)
+                    values = values.at[:, ep_h:h_out+ep_h, ep_w:w_out+ep_w].set(0.0)
                     filename += f"_C{out_chan}x{in_chan}x{kernel[0]}x{kernel[1]}"
 
                 h_out_pool, w_out_pool = h_out, w_out
@@ -281,23 +286,25 @@ class Network:
                     elif pooling == "avg":
                         filename += f"_AvgP{pool_size[0]}x{pool_size[1]}"
 
-                key, subkey = jax.random.split(key) 
+                key, subkey = jax.random.split(key)
+                unpadded_shape = (out_chan, h_out, w_out)
                 # thresholds = jax.random.uniform(subkey, values.shape) * params.init_thresholds + th_bias
-                thresholds = jnp.full(values.shape, params.init_thresholds)
+                thresholds = jnp.full(values.shape, params.init_thresholds)  # pre-padded
                 weights_shape = (out_chan, in_chan, kernel[0], kernel[1])
                 neuron_state = NeuronStates(
-                    values=values,
-                    bias=jnp.zeros(values.shape),
-                    thresholds=thresholds,
+                    values=values,                                        # pre-padded
+                    bias=jnp.zeros(unpadded_shape),                       # unpadded
+                    thresholds=thresholds,                                # pre-padded
                     input_residuals=jnp.zeros(previous_layer.shape),
                     input_order=jnp.full(previous_layer.shape, -1, dtype=int),
                     input_activity=jnp.zeros(previous_layer.shape, dtype=int),
-                    layer_activity=jnp.zeros(values.shape),
-                    output_activity=jnp.zeros_like(values),  # placeholder, shape matches values
+                    layer_activity=jnp.zeros(unpadded_shape),             # unpadded
+                    output_activity=jnp.zeros_like(values),               # pre-padded
                     last_sent_iteration=-1,
                     input_vector=jnp.zeros(previous_layer.shape),
-                    output_vector=jnp.zeros(values.shape),
-                    values_history=jnp.zeros((params.history_size, *values.shape)),
+                    output_vector=jnp.zeros(unpadded_shape),              # unpadded
+                    # Conv layers are never the output layer, so no history is stored.
+                    values_history=jnp.zeros((0, *values.shape)),
                     history_index=jnp.array(0, dtype=jnp.int32),
                     weights_shape=weights_shape,
                     is_conv=True
@@ -317,7 +324,7 @@ class Network:
                 layers.append(empty_conv_neuron)
                 previous_layer = jnp.zeros((out_chan, h_out_pool, w_out_pool)) # Shape after pooling 
                 flat_layer_sizes.append(previous_layer.shape)   # Shape after pooling
-                conv_layer_sizes.append(values.shape)           # Shape before pooling, needed to gather the thresholds after computation
+                conv_layer_sizes.append(unpadded_shape)         # Unpadded shape before pooling, needed to gather thresholds after computation
         return cls(params=params, key=key, layers=tuple(layers), flat_layer_sizes=tuple(flat_layer_sizes), conv_layer_sizes=tuple(conv_layer_sizes), filename=filename)
 
     def init_weights(self):
@@ -569,8 +576,14 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
     layer_activity = jnp.where(all_neuron_states.layer_activity > 0, 1, 0)
 
     th_grad = -jnp.mean(next_grad * layer_activity, axis=0)
-    thresholds = all_neuron_states.thresholds[0] # The whole batch has the same thresholds
-    th_grad = th_grad * thresholds * (thresholds - 1)
+    if params.init_thresholds != 0:
+        thresholds = all_neuron_states.thresholds[0]  # pre-padded for conv layers
+        if isinstance(all_neuron_states, ConvNeuronStates):
+            k_h, k_w = all_neuron_states.kernel
+            pad_h, pad_w = all_neuron_states.padding
+            ep_h, ep_w = k_h - 1 - pad_h, k_w - 1 - pad_w
+            thresholds = thresholds[:, ep_h:thresholds.shape[1]-ep_h, ep_w:thresholds.shape[2]-ep_w]
+        th_grad = th_grad * thresholds * (thresholds - 1)
 
     # Residual backward: send ∂L/∂(values_pre_act) (== activity_mask * next_grad, available
     # as `next_grad` after line 568) to every src layer that sent us a residual.
@@ -780,7 +793,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
             if rank == 0:
                 batch_iterator = iter(training_generator) # Make the dataloader iterable
             
-        for i in tqdm(range(total_batches[0]), disable=TQDM_DISABLE):
+        for i in tqdm(range(total_batches[0]), miniters=total_batches[0]//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
             neuron_states = empty_neuron_states
             if layer_idx == 0: # Input layer
                 batch_x, batch_y = mpi_config.split_batch(params, batch_iterator, 4)
@@ -1178,7 +1191,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
 
     epoch_iter_sum = 0.0
     epoch_iter_count = 0
-    for i in tqdm(range(total_batches), disable=TQDM_DISABLE):
+    for i in tqdm(range(total_batches), miniters=total_batches//10, maxinterval=float('inf'), disable=TQDM_DISABLE):
         if layer_idx == 0:         
             # readInputJson = True        
             if readInputJson: # Test with stored input
@@ -1397,6 +1410,13 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         split_dims = tuple(split_dims)
 
     residual_connections = tuple(config['residual_connections'])
+    if rerun is not None:
+        # The skip-event topology must match the trained model, so use the wiring
+        # stored in the checkpoint rather than the rerun config (older checkpoints
+        # without it fall back to the config value).
+        stored_residual_connections = load_stored_residual_connections(rerun)
+        if stored_residual_connections is not None:
+            residual_connections = stored_residual_connections
 
     get_layer_idx(batch_size, layer_sizes, processes_per_layer, split_dims, residual_connections)
     
@@ -1418,7 +1438,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 case "shd":
                     loader = torch_SHD_loader
                 case "nmnist":
-                    loader = torch_nmnist_loader
+                    loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
                 case "dvs":
                     loader = partial(torch_DVSGesture_loader)
                     if layer_sizes[0][1] == 64:
@@ -1429,6 +1449,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                         downsample = True
                 case "cifar10":
                     loader = cifar10_loader_manual
+                    if layer_sizes[0][1] == 16:
+                        downsample = True
                 case _:
                     raise ValueError(f"Unknown dataset: {dataset}")
                 
@@ -1486,11 +1508,19 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         if rerun is not None:
             override_list = config.get('override_params', None)
             params, weights, thresholds = rerun_init(
-                rerun, 
-                mpi_config, 
-                params, 
+                rerun,
+                mpi_config,
+                params,
                 override_params=override_list
             )
+
+            # The first build used the config's sync_rate; rebuild with the resolved
+            # params so params-derived neuron state (notably sync_rate_vector) reflects
+            # the checkpoint/override values rather than the config.
+            network = Network.build(params, key, layer_sizes=layer_sizes,
+                                    flat_layer_sizes=(), conv_layer_sizes=(),
+                                    th_bias=0.0)
+            empty_neuron_states = network.layers[layer_idx]
 
             if layer_idx > 0:
                 empty_neuron_states = network.rerun(thresholds)
@@ -1534,10 +1564,13 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
         elif mode == 'training':
             # To run the full training pipeline
+            extra_fields = {"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
+                            "split_dims": list(split_dims) if split_dims else None,
+                            "residual_connections": [list(rc) for rc in residual_connections]}
+            if dataset == "nmnist":
+                extra_fields["first_saccade_only"] = config['first_saccade_only']
             result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam",
-                               extra_fields={"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
-                                             "split_dims": list(split_dims) if split_dims else None,
-                                             "residual_connections": [list(rc) for rc in residual_connections]})
+                               extra_fields=extra_fields)
         else:
             print(f"Unknown mode in config file, choose either 'training' or 'inference', got {mode}")
             sys.exit(1)

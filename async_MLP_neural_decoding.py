@@ -1717,7 +1717,7 @@ def main(
                 case "shd":
                     loader = torch_SHD_loader
                 case "nmnist":
-                    loader = torch_nmnist_loader
+                    loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
                 case "dvs":
                     if layer_sizes[0] == 64*64*2:
                         downsample = True 
@@ -1847,7 +1847,8 @@ def main(
                                             input_vector=jnp.zeros((prev_size), dtype=int),
                                             output_vector=jnp.zeros((cur_size), dtype=int),
                                             sync_rate_vector=sync_rate_vector,
-                                            values_history=jnp.zeros((params.history_size, cur_size)),
+                                            # Only the output layer records history; other layers keep an empty buffer.
+                                            values_history=jnp.zeros((params.history_size if layer_idx == last_layer else 0, cur_size)),
                                             history_index=jnp.array(0, dtype=jnp.int32))
         # print(f"rank {rank} sync rates: {sync_rate_vector}")
         total_batches = (total_train_batches, total_val_batches, total_test_batches)

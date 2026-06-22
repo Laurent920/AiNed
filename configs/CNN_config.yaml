@@ -112,6 +112,7 @@ layer_sizes:
 
 # ---------- N-MNIST (34x34 neuromorphic) ----------
 # dataset: nmnist
+# first_saccade_only: false   # N-MNIST only: True = first saccade, False = full event stream
 # layer_sizes:
 #   - [2, 34, 34]                           # Input: 2 polarities, 34x34
 #   - [3, [3, 3], [1, 1], [1, 1], ""]       # Conv: 3 filters
