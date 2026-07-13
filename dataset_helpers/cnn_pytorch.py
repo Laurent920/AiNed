@@ -17,11 +17,11 @@ import json
 from tqdm import tqdm
 
 save = True
-epochs = 10
-batch_size = 64
+epochs = 20
+batch_size = 36
 
 dataset = "mnist"
-# dataset = "nmnist"
+dataset = "nmnist"
 # dataset = "ncars"
 # dataset = "cifar10"
 ncars_downsample = False
@@ -620,14 +620,14 @@ class VGG8Light(nn.Module):
         super(VGG8Light, self).__init__()
         
         # Block 1: 32 filters
-        self.conv1_1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False)
-        self.conv1_2 = nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False)
+        self.conv1_1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
+        self.conv1_2 = nn.Conv2d(16, 32, kernel_size=3, padding=1, bias=False)
         self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 2: 64 filters
-        self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
-        self.conv2_2 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        # self.conv2_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
+        # self.conv2_2 = nn.Conv2d(128, 256, kernel_size=3, padding=1, bias=False)
+        # self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # Block 3: 128 filters
         # self.conv3_1 = nn.Conv2d(64, 128, kernel_size=3, padding=1, bias=False)
@@ -640,8 +640,9 @@ class VGG8Light(nn.Module):
         # self.pool4 = nn.AdaptiveAvgPool2d((1, 1))
         
         # FC layers
-        self.fc1 = nn.Linear(256*7*7, 256, bias=False)
-        self.fc2 = nn.Linear(256, 128, bias=False)
+        spatial = input_shape[1] // 2  # one 2x2 pool: 28->14 (mnist) or 34->17 (nmnist)
+        self.fc1 = nn.Linear(32 * spatial * spatial, 128, bias=False)
+        # self.fc2 = nn.Linear(256, 128, bias=False)
         self.out = nn.Linear(128, num_classes, bias=False)
         
         # Activation stats (matching your format)
@@ -670,9 +671,9 @@ class VGG8Light(nn.Module):
         x = self.pool1(x);           self._record_activation("pool1", x)
         
         # Block 2
-        x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
-        x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
-        x = self.pool2(x);           self._record_activation("pool2", x)
+        # x = F.relu(self.conv2_1(x)); self._record_activation("conv2_1", x)
+        # x = F.relu(self.conv2_2(x)); self._record_activation("conv2_2", x)
+        # x = self.pool2(x);           self._record_activation("pool2", x)
         
         # # Block 3
         # x = F.relu(self.conv3_1(x)); self._record_activation("conv3_1", x)
@@ -689,7 +690,7 @@ class VGG8Light(nn.Module):
         
         # FC
         x = F.relu(self.fc1(x));     self._record_activation("fc1", x)
-        x = F.relu(self.fc2(x));     self._record_activation("fc2", x)
+        # x = F.relu(self.fc2(x));     self._record_activation("fc2", x)
         x = self.out(x);             self._record_activation("out", x)
         
         return x

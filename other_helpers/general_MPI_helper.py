@@ -359,9 +359,10 @@ class MPIConfig:
         for process, _ in self.next_layer:
             send(array, dest=process, tag=0, comm=self.comm)
 
-    def forward_recv_bulk(self, bulk_size):
-        """Receive a (bulk_size, 4) event array in one MPI message."""
-        return recv(jnp.zeros((bulk_size, 4)), source=MPI.ANY_SOURCE, tag=0, comm=self.comm)
+    def forward_recv_bulk(self, bulk_size, cols=4):
+        """Receive a (bulk_size, cols) event array in one MPI message.
+        cols=4 for CNN (c,x,y,value), cols=2 for MLP (neuron_idx, value)."""
+        return recv(jnp.zeros((bulk_size, cols)), source=MPI.ANY_SOURCE, tag=0, comm=self.comm)
 
     def backward_send(self, data):
         for process, partition in self.previous_layer:

@@ -157,18 +157,13 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
     
     def hidden_layer_case():
         # APPLY THE SYNC RATE
-        if params.global_sync:
-            # Global per-layer (per-shard) gate: the layer can fire at all only if
-            # sync_rate events have elapsed since its last firing (max over owned
-            # neurons of last_sent_iteration). All-or-nothing, so raising sync_rate
-            # to the split factor S cleanly divides each shard's firing rate by S.
-            layer_last = jnp.max(neuron_states.last_sent_iteration)
-            layer_eligible = (iteration - layer_last >= neuron_states.sync_rate_vector[0]).astype(jnp.int32)
-            sync_fire = jnp.full(neuron_states.last_sent_iteration.shape, layer_eligible, dtype=jnp.int32)
-        else:
-            # Per-neuron gate: only neurons that fired within the last sync_rate
-            # events are blocked; the top-k among the rest still fires.
-            sync_fire = (iteration - neuron_states.last_sent_iteration >= neuron_states.sync_rate_vector).astype(jnp.int32)
+        # Global per-layer (per-shard) gate: the layer can fire at all only if
+        # sync_rate events have elapsed since its last firing (max over owned
+        # neurons of last_sent_iteration). All-or-nothing, so raising sync_rate
+        # to the split factor S cleanly divides each shard's firing rate by S.
+        layer_last = jnp.max(neuron_states.last_sent_iteration)
+        layer_eligible = (iteration - layer_last >= neuron_states.sync_rate_vector[0]).astype(jnp.int32)
+        sync_fire = jnp.full(neuron_states.last_sent_iteration.shape, layer_eligible, dtype=jnp.int32)
         sync_fire = jax.lax.cond(invalid_idx, lambda _: jnp.ones(sync_fire.shape, dtype=jnp.int32), lambda _: sync_fire, None)
         activated_output = activations * sync_fire
 
@@ -378,6 +373,45 @@ def predict(params,
 
         _sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[layer_idx]
 
+        if _sr == 10000 and layer_idx == 1 and mpi_config.nb_previous == 1 and message_size == 2:
+            # Dense (MLP) bulk path: receive the whole input frame in ONE MPI message
+            # (sender used forward_send_bulk), accumulate every event locally, then
+            # receive END_SIGNAL to fire the fully-synchronised first hidden layer.
+            # Mirrors the CNN bulk path below but for (neuron_idx, value) events.
+            _dense_out = neuron_states.values.shape[0]  # activated_output is (cur_size, 2)
+
+            bulk = mpi_config.forward_recv_bulk(params.max_nonzero, cols=2)  # (max_nonzero, 2)
+
+            def process_event_dense(i, ns):
+                event = bulk[i]
+                idx = event[0].astype(jnp.int32)
+                _, _, new_ns = jax.lax.cond(
+                    idx >= 0,  # -2 = padding sentinel
+                    lambda ns: layer_computation(params, mpi_config, key, idx, event[1], weights, ns, i, grad, is_residual=jnp.array(False)),
+                    lambda ns: (jnp.array(0), jnp.zeros((_dense_out, 2)), ns),
+                    ns,
+                )
+                return new_ns
+
+            neuron_states = jax.lax.fori_loop(0, params.max_nonzero, process_event_dense, neuron_states)
+
+            # END_SIGNAL → invalid_idx triggers the full-layer top-k firing.
+            end_data = mpi_config.forward_recv(message_size)
+            end_idx = end_data[0].astype(jnp.int32)
+            loop_iterations, activated_output, neuron_states = layer_computation(
+                params, mpi_config, key, end_idx, end_data[1], weights, neuron_states, params.max_nonzero, grad, is_residual=jnp.array(False)
+            )
+            layer_input = end_data[1]
+
+            if layer_idx != last_layer:
+                def send_act_dense(i, _):
+                    mpi_config.forward_send(activated_output[i])
+                    return None
+                jax.lax.fori_loop(0, loop_iterations, send_act_dense, None)
+                mpi_config.forward_send(END_SIGNAL, params.max_nonzero)
+
+            return layer_input, neuron_states, jnp.array(params.max_nonzero, dtype=jnp.int32), jnp.zeros((BUFFER_SIZE, 2))
+
         if _sr == 10000 and layer_idx == 1 and mpi_config.nb_previous == 1:
             # Bulk path: receive all events in one MPI message, process locally, then
             # receive END_SIGNAL to trigger the full-layer firing (last_input).
@@ -579,6 +613,11 @@ def predict(params,
     # Per-sample neuron dropout: static gate (params/grad/layer_idx all static at trace).
     _drop_p = params.dropout[layer_idx] if getattr(params, "dropout", None) is not None else 0.0
     _apply_dropout = grad and (layer_idx != 0) and (layer_idx != last_layer) and (_drop_p > 0.0)
+    # Conv layers use channel-wise dropout (Dropout2d): one keep-bit per output channel,
+    # broadcast over the spatial grid. FC layers keep the per-neuron mask. values is
+    # (out_ch, H, W) for conv and (num_neurons,) for FC; is_conv is None for MLP -> FC path.
+    _mask_shape = ((empty_neuron_states.values.shape[0],) if empty_neuron_states.is_conv
+                   else empty_neuron_states.values.shape)
 
     # Loop over batches, accumulate output values and return them
     @jit
@@ -588,7 +627,7 @@ def predict(params,
             # Fresh Bernoulli keep-mask per sample, fixed across the sample's events.
             carry_key, sample_key = jax.random.split(carry_key)
             keep = jax.random.bernoulli(sample_key, p=1.0 - _drop_p,
-                                        shape=neuron_states.values.shape).astype(neuron_states.values.dtype)
+                                        shape=_mask_shape).astype(neuron_states.values.dtype)
             if params.dropout_invert_scaling:
                 keep = keep / (1.0 - _drop_p)
             neuron_states = neuron_states.replace(dropout_mask=keep)
@@ -718,6 +757,13 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         # Step 5: Apply activation function (ReLU / threshold)
         activated_output = activation_func(thresholds_sliced, activations)
 
+        # Step 5b: Apply per-sample channel dropout (Dropout2d, training only). The mask is
+        # (out_ch,), drawn once per sample in loop_over_batches and held fixed across the
+        # sample's events, so dropped feature maps stay out of the top-k for the whole sample.
+        _drop_p = params.dropout[mpi_config.layer_idx] if getattr(params, "dropout", None) is not None else 0.0
+        if grad and _drop_p > 0.0:
+            activated_output = activated_output * neuron_states.dropout_mask[:, None, None]
+
         # Step 6: Apply firing number — owned region only fires top-k
         f_nb = params.firing_nb
         k = f_nb if isinstance(f_nb, int) else f_nb[mpi_config.layer_idx]
@@ -764,7 +810,7 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         # Sync layer (sr==10000) never emits per-event (the sync gate above zeros everything
         # until the END_SIGNAL burst in last_input). Pad this per-event buffer up to the
         # full-layer event_array_size so all jax.lax.cond branches share one static shape.
-        if sr == 10000 and neuron_states.pooling == "":
+        if sr == 10000:
             out_events = jnp.pad(out_events, ((0, event_array_size - out_events.shape[0]), (0, 0)), constant_values=-2.0)
 
         # Bug Test 1: assert all fired output events have coords inside the owned region.
@@ -852,6 +898,22 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             )
             activated_output = jnp.where(region_mask, activated_output, 0.0)
 
+        # Apply firing number: at each spatial location, only the top-k feature maps
+        # above threshold fire. The regular event-driven path applies firing_nb per
+        # kernel window; in the synchronous full-layer fire the analogue is a per-pixel
+        # top-k across channels. Applied after the region mask so non-owned channels
+        # (already zeroed) cannot be selected, mirroring regular_input.
+        f_nb = params.firing_nb
+        k = f_nb if isinstance(f_nb, int) else f_nb[mpi_config.layer_idx]
+        if k >= 0:
+            k_eff = min(k, activated_output.shape[0])  # out_ch (static)
+            chan_last = jnp.moveaxis(activated_output, 0, -1)  # (H, W, out_ch)
+            _, top_idx = jax.lax.top_k(chan_last, k_eff)       # (H, W, k_eff)
+            H_i = jnp.arange(chan_last.shape[0])[:, None, None]
+            W_i = jnp.arange(chan_last.shape[1])[None, :, None]
+            fire_mask = jnp.zeros_like(chan_last).at[H_i, W_i, top_idx].set(1.0)
+            activated_output = activated_output * jnp.moveaxis(fire_mask, -1, 0)
+
         # Compute remaining values and write them back into the pre-padded values array
         remaining_value = neuron_val - activated_output
         new_values = jax.lax.dynamic_update_slice(neuron_states.values, remaining_value, valid_slice)
@@ -867,10 +929,17 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             neuron_states.layer_activity
         )
 
+        # Store the pre-pool activation map so the max-pool VJP in conv_predict_bwd routes
+        # each window's gradient to the true argmax cell. In the synchronous (last_input)
+        # path this is the only place the fired activations exist; without it output_vector
+        # stays zero and the pooled gradient is misrouted to a fixed corner cell.
+        new_output_vector = activated_output if grad else neuron_states.output_vector
+
         new_neuron_states = neuron_states.replace(
             values=new_values,
             input_activity=jnp.ones(neuron_states.input_activity.shape, dtype=int),
-            layer_activity=new_layer_activity,)
+            layer_activity=new_layer_activity,
+            output_vector=new_output_vector,)
 
         return nb_valid_elements, out_events, new_neuron_states
 

@@ -52,6 +52,9 @@ jax.config.update("jax_debug_nans", True)
 TQDM_DISABLE = False
 STORE_EACH_EPOCH = False
 BUFFER_SIZE = 0
+# Diagnostic: dump init weights + per-layer grads + logits + input batch for batch 0, then exit.
+_GRAD_DUMP = os.environ.get("AED_GRAD_DUMP", "") == "1"
+_GRAD_DUMP_DIR = os.environ.get("AED_GRAD_DUMP_DIR", "grad_dump")
 END_SIGNAL = jnp.array([-1.0, -1.0, -1.0, -1.0], dtype=jnp.float32)
 
 # Hidden→hidden (FC) backward gradient. DEFAULT: old unmasked dot(next_grad, W.T) (trains deep
@@ -61,6 +64,12 @@ _LEGACY_BWD_GRAD = os.environ.get("AINED_LEGACY_BWD", "1") == "1"
 # Optimizer schedule. DEFAULT: cosine decay + grad clip (kept ON here for data-augmentation
 # stability, see optimizer comment). Set AINED_CONST_LR=1 for constant LR / plain Adam.
 _CONST_LR = os.environ.get("AINED_CONST_LR", "0") == "1"
+# Grad clip: "auto" = on unless const LR (legacy behavior); "1"/"0" force on/off independently.
+_GRAD_CLIP = os.environ.get("AINED_GRAD_CLIP", "auto")
+
+# Optional per-run output subfolder, so parallel sweep runs whose architecture
+# (and thus filename) is identical don't collide. Mirrors async_MLP_general.py.
+_RUN_TAG = os.environ.get("AINED_RUN_TAG", "")
 
 # Initialize empty global MPI variables
 comm = None
@@ -343,7 +352,9 @@ class Network:
         
         Returns the weights correponding to the MPI layer_idx.
         ''' 
-        weights = init_params(self.key, self.layers, self.params, layer_idx, self.filename)
+        # params.flat_layer_sizes is only populated after init_weights(), so pass the built one.
+        weights = init_params(self.key, self.layers, self.params, layer_idx, self.filename,
+                              flat_layer_sizes=self.flat_layer_sizes)
         return weights
     
     def rerun(self, thresholds):
@@ -541,6 +552,12 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
         return grad # (5, 3, 3, 3)
 
     input_residuals = all_neuron_states.input_residuals # Shape: (B, 3, 28, 28)
+    if _GRAD_DUMP:
+        def _dump_internals(ng1, ng, ir):
+            os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+            np.savez(os.path.join(_GRAD_DUMP_DIR, f"conv{int(layer_idx)}_intern.npz"),
+                     next_grad_1=np.asarray(ng1), next_grad=np.asarray(ng), input_residuals=np.asarray(ir))
+        jax.debug.callback(_dump_internals, next_grad_1, next_grad, input_residuals)
     weight_grad = jax.vmap(grad_w)(input_residuals, next_grad) # Shape: (B, 5, 3, 3, 3) #TODO Use batches in convolution directly instead of vmap?
 
     # weight_grad = weight_grad * weight_res
@@ -741,10 +758,10 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     total_steps = max(1, params.num_epochs * steps_per_epoch)
     if _CONST_LR:
         lr_schedule = params.learning_rate
-        grad_clip = optax.identity()
     else:
         lr_schedule = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
-        grad_clip = optax.clip_by_global_norm(1.0)
+    _clip_on = (_GRAD_CLIP == "1") or (_GRAD_CLIP == "auto" and not _CONST_LR)
+    grad_clip = optax.clip_by_global_norm(1.0) if _clip_on else optax.identity()
     if opti == "adam":
         solver = optax.chain(grad_clip, optax.adam(learning_rate=lr_schedule))
     elif opti == "adamw":
@@ -815,6 +832,11 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                                                                     END_SIGNAL=END_SIGNAL,
                                                                     BUFFER_SIZE=BUFFER_SIZE)
                 all_activations, all_iterations, sparsity_L = sparsity_loss(params, all_neuron_states, iterations)
+                if _GRAD_DUMP and i == 0:
+                    os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+                    np.savez(os.path.join(_GRAD_DUMP_DIR, "input.npz"),
+                             batch_x=np.asarray(batch_x), batch_y=np.asarray(batch_y))
+                    comm.Barrier(); sys.exit(0)
             else:
                 if layer_idx==last_layer_idx: # Output layer
                     # Receive the labels from the input layer via plain mpi4py
@@ -879,6 +901,17 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                             new_th = optax.apply_updates(empty_neuron_states.thresholds, th_updates)
                         empty_neuron_states = empty_neuron_states.replace(thresholds=new_th)
       
+                if _GRAD_DUMP and i == 0:
+                    os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+                    _d = {"layer_idx": np.asarray(layer_idx),
+                          "weights": np.asarray(weights),
+                          "weight_grad": np.asarray(weight_grad)}
+                    if layer_idx == last_layer_idx:
+                        _d["logits"] = np.asarray(outputs)
+                        _d["targets"] = np.asarray(y)
+                    np.savez(os.path.join(_GRAD_DUMP_DIR, f"layer{int(layer_idx)}.npz"), **_d)
+                    comm.Barrier(); sys.exit(0)
+
                 # Update weights
                 if solver is not None:
                     # Optax optimizer
@@ -981,7 +1014,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         final_states.thresholds,
         all_loss,
         opti,
-        "CNN",
+        f"CNN/{_RUN_TAG}" if _RUN_TAG else "CNN",
         all_history,
         total_batches[0],
         extra_fields=extra_fields,
@@ -1277,6 +1310,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
                 
                 epoch_correct += int(batch_correct)
                 epoch_total += valid_y.shape[0]
+                # print(f"[infer:{dataset}] batch {i+1}/{total_batches}  running_acc={epoch_correct/epoch_total:.4f}", flush=True)
                 # store_data_to_json(f"{len(params.layer_sizes)}hidden_single_output.json", outputs.tolist(), y.tolist())
 
                 if params.history_size > 0:
@@ -1451,7 +1485,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     if tuple(layer_sizes[0][1:]) == (60, 50):
                         downsample = True
                 case "cifar10":
-                    loader = cifar10_loader_manual
+                    loader = partial(cifar10_loader_manual, augment=config.get('augment', False))
                     if layer_sizes[0][1] == 16:
                         downsample = True
                 case _:
@@ -1501,6 +1535,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             dedup=config.get('dedup', False),
             augment=config.get('augment', False),
             use_best=config.get('use_best', False),
+            dropout=tuple(config['dropout']) if config.get('dropout') is not None else None,
+            dropout_invert_scaling=config.get('dropout_invert_scaling', False),
         )
 
         # Build the network using the above parameters and initialize the weights
@@ -1532,8 +1568,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                 empty_neuron_states = network.rerun(thresholds)
 
         # Slice linear-layer weights and neuron states to this rank's model partition,
-        # mirroring async_MLP_general. Conv layers keep full arrays and mask their owned
-        # region inside conv_layer_computation instead.
+        # mirroring async_MLP_general. Conv layers keep full arrays and mask their owned region
+        # inside conv_layer_computation instead.
         if layer_idx != 0 and not empty_neuron_states.is_conv:
             weights, empty_neuron_states = mpi_config.MPI_partition(weights, empty_neuron_states)
 

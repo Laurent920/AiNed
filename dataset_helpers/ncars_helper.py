@@ -620,10 +620,10 @@ def torch_NCARS_loader(
         )
         if CNN_preprocess:
             collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length)
-            train_collate_fn = (
-                lambda batch: augmenting_event_pad_collate(batch, max_data_length, x_size, y_size)
-                if augment else collate_fn
-            )
+            if augment:
+                train_collate_fn = lambda batch: augmenting_event_pad_collate(batch, max_data_length, x_size, y_size)
+            else:
+                train_collate_fn = collate_fn
         elif CNN_preprocess is None:
             collate_fn = basic_event_collate
             train_collate_fn = collate_fn

@@ -54,10 +54,17 @@ END_SIGNAL = jnp.array([-1.0, -1.0], dtype=jnp.float32)
 # Hidden→hidden backward gradient. DEFAULT: old unmasked dot(next_grad, W.T) (trains deep
 # nets much faster). Set AINED_LEGACY_BWD=0 to restore the (output_vector>0) ReLU-derivative mask.
 _LEGACY_BWD_GRAD = os.environ.get("AINED_LEGACY_BWD", "1") == "1"
+# Diagnostic: dump init weights + per-layer grads + logits + input batch for batch 0, then exit.
+_GRAD_DUMP = os.environ.get("AED_GRAD_DUMP", "") == "1"
+_GRAD_DUMP_DIR = os.environ.get("AED_GRAD_DUMP_DIR", "grad_dump")
 
 # Optimizer schedule. DEFAULT: constant learning rate, no gradient clipping (old plain-Adam
 # setup). Set AINED_CONST_LR=0 to restore cosine decay + grad clipping.
 _CONST_LR = os.environ.get("AINED_CONST_LR", "1") == "1"
+
+# Optional per-run output subfolder, so parallel sweep runs don't collide on the
+# per-epoch MLP_temp checkpoints (filenames are otherwise identical bar accuracy).
+_RUN_TAG = os.environ.get("AINED_RUN_TAG", "")
 
 # Initialize empty global MPI variables
 comm = None
@@ -99,6 +106,12 @@ def predict_bwd(params, key, weights, empty_neuron_states, batch_data):
 
     next_grad = mpi_config.backward_recv()   # Shape: (B, layer_size)
     # jax.debug.print("Rank {} received next_grad shape: {}, next grad mean {}", rank, next_grad.shape, jnp.mean(next_grad))
+    if _GRAD_DUMP:
+        def _dump_fc_internals(ng, ir, ov):
+            os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+            np.savez(os.path.join(_GRAD_DUMP_DIR, f"fc{int(layer_idx)}_intern.npz"),
+                     next_grad=np.asarray(ng), input_residuals=np.asarray(ir), output_vector=np.asarray(ov))
+        jax.debug.callback(_dump_fc_internals, next_grad, all_neuron_states.input_residuals, all_neuron_states.output_vector)
     weight_grad, th_grad, weight_res, bias_grad = MLP_back_prop(params, all_neuron_states, next_grad, layer_idx)
     weight_grad += 2 * params.w_reg * weights
 
@@ -326,8 +339,13 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                 outputs, iterations, all_neuron_states, buffer = (predict)(params, mpi_config, subkey, weights, neuron_states, layer_computation, batch_data=jnp.array(batch_x), 
                                                                            END_SIGNAL=END_SIGNAL, BUFFER_SIZE=BUFFER_SIZE)
                 all_activations, all_iterations, sparsity_L = sparsity_loss(params, all_neuron_states, iterations)
+                if _GRAD_DUMP and i == 0:
+                    os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+                    np.savez(os.path.join(_GRAD_DUMP_DIR, "input.npz"),
+                             batch_x=np.asarray(batch_x), batch_y=np.asarray(batch_y))
+                    comm.Barrier(); sys.exit(0)
             else:
-                if mpi_config.is_last_layer: 
+                if mpi_config.is_last_layer:
                     # Receive the labels from the input layer
                     y = mpi_config.recv_labels()
                     y_encoded = jnp.array(one_hot_encode(y, num_classes=params.layer_sizes[-1]))
@@ -377,6 +395,17 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                         else:
                             new_thresholds = optax.apply_updates(empty_neuron_states.thresholds, th_updates)
                         empty_neuron_states = empty_neuron_states.replace(thresholds=new_thresholds)
+                if _GRAD_DUMP and i == 0:
+                    os.makedirs(_GRAD_DUMP_DIR, exist_ok=True)
+                    _d = {"layer_idx": np.asarray(layer_idx),
+                          "weights": np.asarray(weights),
+                          "weight_grad": np.asarray(weight_grad)}
+                    if mpi_config.is_last_layer:
+                        _d["logits"] = np.asarray(outputs)
+                        _d["targets"] = np.asarray(y)
+                    np.savez(os.path.join(_GRAD_DUMP_DIR, f"layer{int(layer_idx)}.npz"), **_d)
+                    comm.Barrier(); sys.exit(0)
+
                 # Update weights
                 if solver is not None:
                     # Optax optimizer
@@ -438,7 +467,7 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             all_loss,
                             thresholds_dict,
                             opti,
-                            "MLP_temp",
+                            f"MLP_temp/{_RUN_TAG}" if _RUN_TAG else "MLP_temp",
                             all_history,
                             total_batches[0],
                             extra_fields=result_extra_fields_global)
@@ -500,11 +529,11 @@ def train(params: Params, key, total_batches, weights, empty_neuron_states, opti
                             all_loss,
                             thresholds_dict,
                             opti,
-                            "MLP",
+                            f"MLP/{_RUN_TAG}" if _RUN_TAG else "MLP",
                             all_history,
                             total_batches[0],
                             extra_fields=result_extra_fields_global)
-        
+
         encoded = np.frombuffer(result_path_str.encode("utf-8"), dtype=np.uint8)
         if encoded.size > MAX_LEN:
             raise ValueError("result_path too long")
@@ -843,7 +872,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     downsample = True
                 loader = partial(mnist_loader_manual, sequential=sequential, permuted=permuted)
             case "shd":
-                loader = torch_SHD_loader
+                loader = partial(torch_SHD_loader, augment=config.get('augment', False))
             case "nmnist":
                 loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
             case "dvs":
@@ -891,7 +920,6 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         restrict=config['restrict'],
         firing_nb=config['firing_nb'] if isinstance(config['firing_nb'], int) else tuple(config['firing_nb']),
         sync_rate=config['sync_rate'] if isinstance(config['sync_rate'], int) else tuple(config['sync_rate']),
-        global_sync=config.get('global_sync', False),
         max_nonzero=max_nonzero,
         shuffle_input=config['shuffle_input'],
         threshold_lr=config['threshold_lr'],

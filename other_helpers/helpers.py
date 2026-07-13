@@ -228,7 +228,6 @@ class BaseParams:
     use_best: bool = False       # Use best-validation checkpoint for test inference and saving
     dropout: tuple[float, ...] | None = None  # Per-layer per-sample neuron dropout rate (None = off)
     dropout_invert_scaling: bool = False      # Scale surviving activations by 1/(1-p) (inverted dropout)
-    global_sync: bool = False    # Sync-rate scope: False = per-neuron gate, True = global per-layer gate
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
