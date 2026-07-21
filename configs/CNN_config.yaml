@@ -197,10 +197,10 @@ layer_sizes:
 batch_size: 64              # Number of samples per batch
 num_epochs: 5              # Number of training epochs
 train_subset_batches: 40   # Limit training to N batches per epoch for quick debugging (null = use all)
-augment: true        # CIFAR-10 only: random flip + pad-4/crop augmentation per batch
+augment: false        # CIFAR-10 only: random flip + pad-4/crop augmentation per batch
 
 # learning_rate: 0.0005       # Learning rate for optimizer
-learning_rate: 0.001       # Learning rate for optimizer
+learning_rate: 0.0005       # Learning rate for optimizer
 optimizer: adam             # Choice of optimizer (adam, sgd, adamw, rmsprop)
 # optimizer: adagrad
 

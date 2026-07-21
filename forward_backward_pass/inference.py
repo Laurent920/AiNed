@@ -1,3 +1,5 @@
+import os
+
 import jax
 import jax.numpy as jnp
 from jax import jit
@@ -5,6 +7,21 @@ from functools import partial
 
 import mpi4jax
 from mpi4jax import send, recv, bcast
+
+# Per-sample barrier in loop_over_batches. It exists to stop events bleeding across sample
+# boundaries when a receiver's ANY_SOURCE recv has MULTIPLE possible senders (model
+# parallelism / residual connections): MPI only guarantees non-overtaking per
+# (source, dest, tag) triple, so two senders can interleave across a sample boundary.
+#
+# With ONE sender per receiver (pure data parallelism, no residuals) that guarantee already
+# orders events within a sample, so the barrier is pure overhead -- and worse, it is a
+# COLLECTIVE on COMM_WORLD, forcing every DP replica into lockstep at every single sample.
+#
+# Set AINED_NO_SAMPLE_BARRIER=1 to skip it. Read from the env so the value is IDENTICAL on
+# every rank: the barrier is collective, so a per-rank decision would DEADLOCK.
+# ONLY safe for pure-DP configs (processes_per_layer/split_dims unset, no residuals) --
+# verified for those by checking every rank has <=1 sender.
+_NO_SAMPLE_BARRIER = os.environ.get("AINED_NO_SAMPLE_BARRIER", "0") == "1"
 
 from other_helpers.helpers import activation_func, keep_top_k
 from other_helpers.helpers import update_history
@@ -638,7 +655,9 @@ def predict(params,
             layer_input, new_neuron_states, iterations, buffer = other_layers(neuron_states)
         # Barrier between samples prevents events from bleeding across sample boundaries
         # when a layer has multiple senders and the receiver uses MPI.ANY_SOURCE.
-        mpi4jax.barrier(comm=mpi_config.comm)
+        # Redundant with a single sender per receiver -- see _NO_SAMPLE_BARRIER at top.
+        if not _NO_SAMPLE_BARRIER:
+            mpi4jax.barrier(comm=mpi_config.comm)
         return carry_key, (new_neuron_states.values, iterations, new_neuron_states, buffer)
 
     _, (all_outputs, all_iterations, all_neuron_states, buffer) = jax.lax.scan(loop_over_batches, key, batch_data)
@@ -797,21 +816,25 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         values_padded = jax.lax.dynamic_update_slice(values_padded, remaining_value, start_indices)
         new_values = values_padded
 
-        # Step 10: Apply pooling and compute output events
-        nb_valid_elements, out_events, unpooled_coords, unpooled_vals = output_to_event_array_with_pooling(activated_output,
-                                                                       start_indices,
-                                                                       (out_ch, H, W),
-                                                                       (event_pad_h, event_pad_w),
-                                                                       neuron_states.pooling,
-                                                                       neuron_states.pool_size,
-                                                                       neuron_states.pool_stride,
-                                                                       mpi_config.rank)
-
-        # Sync layer (sr==10000) never emits per-event (the sync gate above zeros everything
-        # until the END_SIGNAL burst in last_input). Pad this per-event buffer up to the
-        # full-layer event_array_size so all jax.lax.cond branches share one static shape.
+        # Step 10: Apply pooling and compute output events.
+        # Sync layer (sr==10000) never emits per-event: the sync gate above zeros every
+        # activation until the END_SIGNAL burst in last_input, so activated_output is
+        # identically zero here and pooling can only ever return an empty buffer. sr is a
+        # Python int at trace time, so skip the whole pooling/event-array construction
+        # statically rather than paying sparse_pool (segment_max/argsort over the full
+        # pooled layer) once per event to produce nothing.
         if sr == 10000:
-            out_events = jnp.pad(out_events, ((0, event_array_size - out_events.shape[0]), (0, 0)), constant_values=-2.0)
+            nb_valid_elements = jnp.array(0)
+            out_events = jnp.zeros((event_array_size, 4))
+        else:
+            nb_valid_elements, out_events, unpooled_coords, unpooled_vals = output_to_event_array_with_pooling(activated_output,
+                                                                           start_indices,
+                                                                           (out_ch, H, W),
+                                                                           (event_pad_h, event_pad_w),
+                                                                           neuron_states.pooling,
+                                                                           neuron_states.pool_size,
+                                                                           neuron_states.pool_stride,
+                                                                           mpi_config.rank)
 
         # Bug Test 1: assert all fired output events have coords inside the owned region.
         if _DEBUG_LEVEL >= 1 and is_partitioned:
@@ -825,14 +848,28 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
                 nb_valid_elements, out_c_ok, out_x_ok, out_y_ok,
             )
 
-        if grad:
+        if grad and sr == 10000:
+            # Step 11 (sync layer): activated_output is identically zero above, so every
+            # pooling-derived update below reduces to a no-op (.add(0) / .max(0.0)), and
+            # last_input overwrites output_vector and input_activity wholesale at the
+            # END_SIGNAL. Only the input residuals genuinely accumulate per event.
+            new_input_residuals = neuron_states.input_residuals.at[tuple(neuron_idx)].add(layer_input)
+            new_input_activity = neuron_states.input_activity
+            new_layer_activity = neuron_states.layer_activity
+            new_output_vector = neuron_states.output_vector
+        elif grad:
             # Step 11: Update gradient tracking state
-            valid_els = jnp.where(unpooled_vals != 0, 1, 0)
-            new_weight_res = neuron_states.weight_res.at[   unpooled_coords[:, 0],
-                                                            c,
-                                                            unpooled_coords[:, 1]-x+event_pad_h,
-                                                            unpooled_coords[:, 2]-y+event_pad_w
-                                                        ].add(valid_els)
+            # weight_res is not read anywhere in the conv path — the only consumer,
+            # `weight_grad = weight_grad * weight_res`, is commented out in
+            # async_CNN_general.py / async_ResNet_general.py, and MLP_back_prop recomputes its
+            # own weight_res from output_vector instead. This scatter-add ran once per event
+            # to feed nothing.
+            # valid_els = jnp.where(unpooled_vals != 0, 1, 0)
+            # new_weight_res = neuron_states.weight_res.at[   unpooled_coords[:, 0],
+            #                                                 c,
+            #                                                 unpooled_coords[:, 1]-x+event_pad_h,
+            #                                                 unpooled_coords[:, 2]-y+event_pad_w
+            #                                             ].add(valid_els)
 
             new_layer_activity = neuron_states.layer_activity.at[   unpooled_coords[:, 0],
                                                                     unpooled_coords[:, 1],
@@ -854,17 +891,16 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             new_input_residuals = neuron_states.input_residuals
             new_input_activity = neuron_states.input_activity
             new_layer_activity = neuron_states.layer_activity
-            new_weight_res = neuron_states.weight_res
             new_output_vector = neuron_states.output_vector
 
+        # weight_res is deliberately not passed — see Step 11.
         new_neuron_states = neuron_states.replace(
             values=new_values,
             input_residuals=new_input_residuals,
             input_activity=new_input_activity,
             layer_activity=new_layer_activity,
             output_activity=new_output_activity,
-            output_vector=new_output_vector,
-            weight_res=new_weight_res,)
+            output_vector=new_output_vector,)
 
         return nb_valid_elements, out_events, new_neuron_states
 
@@ -898,21 +934,17 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
             )
             activated_output = jnp.where(region_mask, activated_output, 0.0)
 
-        # Apply firing number: at each spatial location, only the top-k feature maps
-        # above threshold fire. The regular event-driven path applies firing_nb per
-        # kernel window; in the synchronous full-layer fire the analogue is a per-pixel
-        # top-k across channels. Applied after the region mask so non-owned channels
-        # (already zeroed) cannot be selected, mirroring regular_input.
+        # Apply firing number: firing_nb counts EVENTS, matching the event-driven path
+        # (which flattens the whole (out_ch, k_h, k_w) window in keep_top_k) and the
+        # documented "top-k neurons that fire per layer per event". The END_SIGNAL is the
+        # single event for this layer, so k is the event budget for the whole (C, H, W)
+        # fire — NOT channels-per-pixel. Applied after the region mask so non-owned
+        # channels (already zeroed) cannot be selected, mirroring regular_input.
+        # NOTE: k is therefore an absolute event count here; sync layers need k on the
+        # order of C*H*W, not the small values used on event-driven layers.
         f_nb = params.firing_nb
         k = f_nb if isinstance(f_nb, int) else f_nb[mpi_config.layer_idx]
-        if k >= 0:
-            k_eff = min(k, activated_output.shape[0])  # out_ch (static)
-            chan_last = jnp.moveaxis(activated_output, 0, -1)  # (H, W, out_ch)
-            _, top_idx = jax.lax.top_k(chan_last, k_eff)       # (H, W, k_eff)
-            H_i = jnp.arange(chan_last.shape[0])[:, None, None]
-            W_i = jnp.arange(chan_last.shape[1])[None, :, None]
-            fire_mask = jnp.zeros_like(chan_last).at[H_i, W_i, top_idx].set(1.0)
-            activated_output = activated_output * jnp.moveaxis(fire_mask, -1, 0)
+        activated_output = keep_top_k(activated_output, k, max_kernel=params.max_kernel)
 
         # Compute remaining values and write them back into the pre-padded values array
         remaining_value = neuron_val - activated_output

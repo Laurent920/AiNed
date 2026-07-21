@@ -50,7 +50,7 @@ from forward_backward_pass.inference import predict, layer_computation as fc_lay
 jax.config.update("jax_debug_nans", True)
 
 TQDM_DISABLE = False
-STORE_EACH_EPOCH = False
+STORE_EACH_EPOCH = True
 BUFFER_SIZE = 0
 END_SIGNAL = jnp.array([-1.0, -1.0, -1.0, -1.0], dtype=jnp.float32)
 
@@ -1444,7 +1444,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     if layer_sizes[0][1] == 64:
                         downsample = True
                 case "ncars":
-                    loader = partial(torch_NCARS_loader)
+                    loader = partial(torch_NCARS_loader, dedup=config.get('dedup', False), augment=config.get('augment', False))
                     if tuple(layer_sizes[0][1:]) == (60, 50):
                         downsample = True
                 case "cifar10":

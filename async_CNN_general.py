@@ -50,7 +50,7 @@ from forward_backward_pass.inference import predict, layer_computation as fc_lay
 jax.config.update("jax_debug_nans", True)
 
 TQDM_DISABLE = False
-STORE_EACH_EPOCH = False
+STORE_EACH_EPOCH = True
 BUFFER_SIZE = 0
 # Diagnostic: dump init weights + per-layer grads + logits + input batch for batch 0, then exit.
 _GRAD_DUMP = os.environ.get("AED_GRAD_DUMP", "") == "1"
