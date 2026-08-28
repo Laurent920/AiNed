@@ -226,9 +226,64 @@ def download_mnist_csv(dataset_folder):
     print("MNIST dataset downloaded and converted to CSV successfully!")
     
 #region MANUAL LOADER
-def mnist_loader_manual(batch_size, 
-                        shuffle=False, 
-                        preprocess=True, 
+def _augment_mnist_translate(imgs, max_shift=2):
+    """Random integer translation up to +/-max_shift px (zero pad + crop) per image.
+    Translation only: MNIST digit identity is not flip- or large-rotation-invariant.
+    imgs: (B, H, W) float32 in [0, 1]. Background is 0, so shifting adds no spurious ink."""
+    B, H, W = imgs.shape
+    out = np.zeros_like(imgs)
+    for i in range(B):
+        dy = np.random.randint(-max_shift, max_shift + 1)
+        dx = np.random.randint(-max_shift, max_shift + 1)
+        ys, ye = max(0, dy), min(H, H + dy)
+        xs, xe = max(0, dx), min(W, W + dx)
+        sy, sey = max(0, -dy), min(H, H - dy)
+        sx, sex = max(0, -dx), min(W, W - dx)
+        out[i, ys:ye, xs:xe] = imgs[i, sy:sey, sx:sex]
+    return out
+
+
+class AugmentingCNNDataLoaderMNIST:
+    """Per-batch random translation + CNN event formatting for MNIST training, so each
+    epoch sees fresh augmentations without a preprocessing cache. Mirrors the CIFAR-10
+    AugmentingCNNDataLoader but uses translation only (no horizontal flip)."""
+
+    def __init__(self, flat_X, Y, batch_size, sample_indices, shuffle, max_nonzero,
+                 img_size=28, max_shift=2):
+        self.flat_X = flat_X
+        self.Y = Y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.indices = np.array(sample_indices)
+        self.max_nonzero = max_nonzero
+        self.img_size = img_size
+        self.max_shift = max_shift
+
+    def __iter__(self):
+        idx = self.indices.copy()
+        if self.shuffle:
+            np.random.shuffle(idx)
+        self._batches = [idx[i:i + self.batch_size] for i in range(0, len(idx), self.batch_size)]
+        self._cur = 0
+        return self
+
+    def __next__(self):
+        if self._cur >= len(self._batches):
+            raise StopIteration
+        idx = self._batches[self._cur]
+        self._cur += 1
+        imgs = self.flat_X[idx].reshape(len(idx), self.img_size, self.img_size)
+        imgs = _augment_mnist_translate(imgs, self.max_shift)
+        events = preprocess_dataset_CNN(imgs.reshape(len(idx), -1),
+                                        self.max_nonzero,
+                                        downsample=(self.img_size == 14))
+        return events, self.Y[idx]
+
+
+def mnist_loader_manual(batch_size,
+                        shuffle=False,
+                        augment=False,
+                        preprocess=True,
                         CNN_preprocess=False, 
                         downsample=False, 
                         sequential=False, 
@@ -242,7 +297,39 @@ def mnist_loader_manual(batch_size,
     cache_dir = os.path.join(data_dir, cache_dir)
 
     download_mnist_csv(dataset_folder)
-    
+
+    if augment and CNN_preprocess:
+        print("MNIST: augmentation enabled (random +/-2px translation) - bypassing event cache")
+        img_dim = 14 if downsample else 28
+        train_csv = pd.read_csv(dataset_folder + 'mnist_train.csv', header=None)
+        train_x = train_csv.iloc[:, 1:].values.astype('float32') / 255.0
+        train_y = train_csv.iloc[:, 0].values
+        test_csv = pd.read_csv(dataset_folder + 'mnist_test.csv', header=None)
+        test_x = test_csv.iloc[:, 1:].values.astype('float32') / 255.0
+        test_y = test_csv.iloc[:, 0].values
+        if downsample:
+            train_x = downsample_14x14(train_x)
+            test_x = downsample_14x14(test_x)
+
+        train_indices, val_indices = network_helper.train_validate_split(train_y, val_ratio=0.2, shuffle=shuffle)
+        test_indices, _ = network_helper.train_validate_split(test_y, val_ratio=0, shuffle=shuffle)
+
+        train_dataloader = AugmentingCNNDataLoaderMNIST(
+            train_x, train_y, batch_size, train_indices, shuffle=shuffle,
+            max_nonzero=max_nonzero, img_size=img_dim)
+        val_events  = preprocess_dataset_CNN(train_x[val_indices], max_nonzero, downsample)
+        test_events = preprocess_dataset_CNN(test_x[test_indices], max_nonzero, downsample)
+        val_dataloader  = network_helper.DataLoader(val_events,  train_y[val_indices], batch_size, list(range(len(val_indices))), shuffle=False)
+        test_dataloader = network_helper.DataLoader(test_events, test_y[test_indices], batch_size, list(range(len(test_indices))), shuffle=False)
+
+        total_train_batches = network_helper.get_total_batches(batch_size, train_indices)
+        total_val_batches   = network_helper.get_total_batches(batch_size, val_indices)
+        total_test_batches  = network_helper.get_total_batches(batch_size, test_indices)
+        return ((train_dataloader, total_train_batches),
+                (val_dataloader, total_val_batches),
+                (test_dataloader, total_test_batches),
+                max_nonzero)
+
     if not preprocess:
         pass
     else:

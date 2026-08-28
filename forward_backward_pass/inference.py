@@ -173,14 +173,24 @@ def layer_computation(params, mpi_config, key, neuron_idx, layer_input, weights,
                                                                         history_index=new_history_index,)
     
     def hidden_layer_case():
-        # APPLY THE SYNC RATE
-        # Global per-layer (per-shard) gate: the layer can fire at all only if
-        # sync_rate events have elapsed since its last firing (max over owned
-        # neurons of last_sent_iteration). All-or-nothing, so raising sync_rate
-        # to the split factor S cleanly divides each shard's firing rate by S.
-        layer_last = jnp.max(neuron_states.last_sent_iteration)
-        layer_eligible = (iteration - layer_last >= neuron_states.sync_rate_vector[0]).astype(jnp.int32)
-        sync_fire = jnp.full(neuron_states.last_sent_iteration.shape, layer_eligible, dtype=jnp.int32)
+        # FRAME MODE (first hidden layer only): true time frames replace the sync-rate gate.
+        # Events accumulate without firing; the layer fires its top-k only on a boundary
+        # signal — a frame marker [-3,-3] or the END_SIGNAL [-1,-1], both of which set
+        # invalid_idx (neuron_idx < 0). So the per-event gate is all-zeros here and the
+        # invalid_idx cond below opens it exactly at each frame boundary. Markers are never
+        # forwarded (only fired activations are), so deeper layers stay event-driven.
+        _frame_first_hidden = bool(getattr(params, "frame_size", 0)) and layer_idx == 1
+        if _frame_first_hidden:
+            sync_fire = jnp.zeros(neuron_states.last_sent_iteration.shape, dtype=jnp.int32)
+        else:
+            # APPLY THE SYNC RATE
+            # Global per-layer (per-shard) gate: the layer can fire at all only if
+            # sync_rate events have elapsed since its last firing (max over owned
+            # neurons of last_sent_iteration). All-or-nothing, so raising sync_rate
+            # to the split factor S cleanly divides each shard's firing rate by S.
+            layer_last = jnp.max(neuron_states.last_sent_iteration)
+            layer_eligible = (iteration - layer_last >= neuron_states.sync_rate_vector[0]).astype(jnp.int32)
+            sync_fire = jnp.full(neuron_states.last_sent_iteration.shape, layer_eligible, dtype=jnp.int32)
         sync_fire = jax.lax.cond(invalid_idx, lambda _: jnp.ones(sync_fire.shape, dtype=jnp.int32), lambda _: sync_fire, None)
         activated_output = activations * sync_fire
 
@@ -388,6 +398,13 @@ def predict(params,
         else:
             _next_k_h = _next_k_w = _next_event_pad_h = _next_event_pad_w = 0
 
+        # Weight-shared (projected) skips land on a kernel window around a REMAPPED coordinate,
+        # so the single-point owned-region test in residual_send would drop events wrongly.
+        # When any skip in the net is projected, broadcast residuals to every destination rank
+        # instead; the receiver masks to its own slice exactly like a regular event.
+        _res_proj_all = getattr(params, "residual_proj", None)
+        _res_broadcast = _res_proj_all is not None and any(p is not None for p in _res_proj_all)
+
         _sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[layer_idx]
 
         if _sr == 10000 and layer_idx == 1 and mpi_config.nb_previous == 1 and message_size == 2:
@@ -494,6 +511,7 @@ def predict(params,
                             out_val[0].astype(jnp.int32),
                             out_val[1].astype(jnp.int32),
                             out_val[2].astype(jnp.int32),
+                            broadcast=_res_broadcast,
                         )
                     return None
                 jax.lax.fori_loop(0, loop_iterations, send_act, None)
@@ -533,6 +551,7 @@ def predict(params,
                             out_val[0].astype(jnp.int32),
                             out_val[1].astype(jnp.int32),
                             out_val[2].astype(jnp.int32),
+                            broadcast=_res_broadcast,
                         )
                     return None
                 jax.lax.fori_loop(0, loop_iterations, send_activation, None)
@@ -711,6 +730,13 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         c_start, c_end = 0, out_ch - 1
         x_start, x_end = 0, H - 1
         y_start, y_end = 0, W - 1
+
+    # Skip-connection mode for this layer, static at trace time.
+    # None  -> identity skip (source shape already equals this layer's conv output frame).
+    # tuple -> (C_src, r_h, r_w): the source has a different shape, so the residual event is
+    #          projected through THIS layer's own filter instead of a new 1x1 kernel.
+    _res_proj = getattr(params, "residual_proj", None)
+    res_proj = _res_proj[mpi_config.layer_idx] if _res_proj is not None else None
 
     sr = params.sync_rate if isinstance(params.sync_rate, int) else params.sync_rate[mpi_config.layer_idx]
     if sr == 10000:
@@ -988,9 +1014,59 @@ def conv_layer_computation(params, mpi_config, key, neuron_idx, layer_input, wei
         # No new fired events — firing happens when a future regular event crosses threshold.
         return jnp.array(0), jnp.zeros((event_array_size, 4)), new_ns
 
+    def projected_residual_input(neuron_states):
+        """Weight-shared skip for a source whose shape differs from this layer's output frame.
+
+        The event is treated as an extra input to this convolution: it is multiplied by the
+        SAME filter a regular event would use (weights[:, c]), which maps the source's C_src
+        channels onto this layer's out_ch and needs no projection parameters of its own.
+        Spatial mismatch (a skip crossing a pooling layer) is absorbed by subsampling the
+        coordinates with the integer ratio (r_h, r_w) fixed at build time.
+
+        Like the identity skip it only accumulates into the pre-activation: no sync gate, no
+        threshold, no top-k, no restrict, and no emitted events. Firing still happens when a
+        later regular event pushes the cell over its threshold.
+        """
+        C_src, r_h, r_w = res_proj
+        c, x, y = neuron_idx
+        # Source coordinates -> this layer's input frame.
+        xs, ys = x // r_h, y // r_w
+
+        partial_activations = layer_input * jnp.flip(weights[:, c, :, :], axis=(1, 2))  # (out_ch, k_h, k_w)
+
+        # Owned-region masking, identical to regular_input: projected residuals are broadcast
+        # to every destination rank, so a model-parallel rank must drop what it does not own.
+        oc_indices = jnp.arange(out_ch)
+        c_mask = (oc_indices >= c_start) & (oc_indices <= c_end)
+        kernel_x_pos = xs + jnp.arange(k_h)
+        x_mask = (kernel_x_pos >= x_start + event_pad_h) & (kernel_x_pos <= x_end + event_pad_h)
+        kernel_y_pos = ys + jnp.arange(k_w)
+        y_mask = (kernel_y_pos >= y_start + event_pad_w) & (kernel_y_pos <= y_end + event_pad_w)
+        partial_activations = partial_activations * c_mask[:, None, None] * x_mask[None, :, None] * y_mask[None, None, :]
+
+        start_indices = (0, xs, ys)
+        current_values_sliced = jax.lax.dynamic_slice(neuron_states.values, start_indices, partial_activations.shape)
+        padding_mask = jnp.where(current_values_sliced == pad_value, 0.0, 1.0)
+        updated = jnp.where(padding_mask == 0, current_values_sliced, current_values_sliced + partial_activations)
+        new_values = jax.lax.dynamic_update_slice(neuron_states.values, updated, start_indices)
+
+        if grad:
+            # Accumulate into the SAME input_residuals buffer the regular path uses. The skip
+            # shares this layer's filter, so its contribution has to reach that filter's
+            # gradient — and grad_w in the backward pass reads exactly this buffer.
+            # layer_activity is deliberately NOT marked here (unlike the identity skip): it is
+            # a firing counter, and the projected skip fires nothing. Its gradient reaches the
+            # weights through input_residuals regardless.
+            new_input_residuals = neuron_states.input_residuals.at[c, xs, ys].add(layer_input)
+        else:
+            new_input_residuals = neuron_states.input_residuals
+
+        new_ns = neuron_states.replace(values=new_values, input_residuals=new_input_residuals)
+        return jnp.array(0), jnp.zeros((event_array_size, 4)), new_ns
+
     nb_valid_elements, out_events, neuron_states = jax.lax.cond(
         is_residual,
-        residual_input,
+        residual_input if res_proj is None else projected_residual_input,
         lambda ns: jax.lax.cond(jnp.any(neuron_idx < 0), last_input, regular_input, ns),
         neuron_states,
     )

@@ -963,8 +963,8 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         gc.collect()
         if epoch_accuracy >= 0.9999:
             break
-        if STORE_EACH_EPOCH: 
-            all_iteration_mean = gather_iteration_means_per_layer(all_mean_iterations)
+        if STORE_EACH_EPOCH:
+            all_iteration_mean, iteration_partitions = gather_iteration_means_per_layer(all_mean_iterations)
 
             result_path_str = store_training_data_distributed(
                 size,
@@ -982,6 +982,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
                 "CNN_temp",
                 all_history,
                 total_batches[0],
+                {**(extra_fields or {}), "iterations per partition": iteration_partitions},
             )
 
     # Inference on the test set
@@ -991,7 +992,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         print(f"Using best checkpoint from epoch {best_epoch} (val acc={best_val_acc:.4f})")
     test_accuracy, test_mean, _ = batch_predict(params, key, total_batches, network, final_weights, final_states, layer_computation, dataset="test", save=False, debug=False)
 
-    all_iteration_mean = gather_iteration_means_per_layer(all_mean_iterations)
+    all_iteration_mean, iteration_partitions = gather_iteration_means_per_layer(all_mean_iterations)
 
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
@@ -1017,7 +1018,7 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
         f"CNN/{_RUN_TAG}" if _RUN_TAG else "CNN",
         all_history,
         total_batches[0],
-        extra_fields=extra_fields,
+        extra_fields={**(extra_fields or {}), "iterations per partition": iteration_partitions},
     )
 
     return result_path
@@ -1092,8 +1093,13 @@ def _finalize_result_json(result_path):
 def gather_iteration_means_per_layer(mean_iterations):
     """
     Each layer's leader rank sends its per-epoch mean-iteration list to the
-    save_root. Returns a list-of-lists [layer_1_means, ..., layer_last_means]
-    on the save_root, and an empty list on every other rank.
+    save_root. Returns (totals, per_partition) on the save_root and ([], []) on
+    every other rank, both indexed [layer_1, ..., layer_last].
+
+    A rank only counts the events its OWN model partition receives, so on a
+    model-split layer the leader's value is a single partition, not the layer.
+    The layer total is the sum over the layer's model partitions; per_partition
+    keeps the individual values (ascending rank) so imbalance stays visible.
 
     Layer 0 is excluded (input layer has no meaningful iteration metric).
     """
@@ -1101,17 +1107,33 @@ def gather_iteration_means_per_layer(mean_iterations):
     leader_ranks = mpi_config.all_leader_ranks
     payload = list(mean_iterations)
 
+    # current_layer holds this rank's layer restricted to its batch partition,
+    # i.e. exactly the model partitions to sum over.
+    group_leader = mpi_config.get_current_group_leader
+    partitions = [payload]
+    if len(mpi_config.current_layer) > 1:
+        if rank == group_leader:
+            for r, _ in mpi_config.current_layer:
+                if r == rank:
+                    continue
+                partitions.append(comm.recv(source=r, tag=52))
+        else:
+            comm.send(payload, dest=group_leader, tag=52)
+    payload = [float(sum(per_epoch)) for per_epoch in zip(*partitions)]
+
     if rank == save_root:
-        collected = {mpi_config.layer_idx: payload}
+        collected = {mpi_config.layer_idx: (payload, partitions)}
         for layer, leader in enumerate(leader_ranks):
             if leader == rank:
                 continue
             collected[layer] = comm.recv(source=leader, tag=51)
-        return [collected[layer] for layer in range(1, last_layer_idx + 1)]
+        layers = range(1, last_layer_idx + 1)
+        return ([collected[layer][0] for layer in layers],
+                [collected[layer][1] for layer in layers])
 
     if rank in leader_ranks:
-        comm.send(payload, dest=save_root, tag=51)
-    return []
+        comm.send((payload, partitions), dest=save_root, tag=51)
+    return [], []
 
 
 def store_training_data_distributed(size, network, mode, all_epoch_accuracies, all_validation_accuracies, test_accuracy, execution_time, all_iteration_mean, weights, thresholds, all_loss, optiname, network_type, all_history=None, total_batches=None, extra_fields=None):
@@ -1339,7 +1361,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
         if debug:
             jax.debug.print("Epoch Accuracy: {:.2f}%", epoch_accuracy * 100)
             jax.debug.print("----------------------------\n")
-    all_iteration_mean = gather_iteration_means_per_layer([float(mean)])
+    all_iteration_mean, iteration_partitions = gather_iteration_means_per_layer([float(mean)])
 
     # Synchronize all MPI processes again
     mpi4jax.barrier(comm=comm)
@@ -1367,10 +1389,10 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             empty_neuron_states.thresholds,
             [],
             None,
-            "CNN",
+            f"CNN/{_RUN_TAG}" if _RUN_TAG else "CNN",
             all_history,
             total_batches,
-            extra_fields,
+            {**(extra_fields or {}), "iterations per partition": iteration_partitions},
         )
     return epoch_accuracy, mean, end_time - start_time
 
@@ -1469,7 +1491,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             # Load the data 
             match dataset:
                 case "mnist":
-                    loader = partial(mnist_loader_manual)
+                    loader = partial(mnist_loader_manual, augment=config.get('augment', False))
                     if layer_sizes[0][1] == 14:
                         downsample = True
                 case "shd":

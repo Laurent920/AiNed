@@ -785,9 +785,9 @@ def get_layer_idx(batch_size, layer_sizes, processes_per_layer=None, trial=None)
         mpi_config = model_split_custom(rank, comm, size, batch_size, layer_sizes, tuple(processes_per_layer))
         processes_per_layer_global = list(processes_per_layer)
     else:
-        mpi_config = model_split(rank, comm, size, batch_size, layer_sizes)
+        # mpi_config = model_split(rank, comm, size, batch_size, layer_sizes)
         processes_per_layer_global = None
-        # mpi_config = data_split(rank, comm, size, batch_size, layer_sizes)
+        mpi_config = data_split(rank, comm, size, batch_size, layer_sizes)
 
     layer_idx = mpi_config.layer_idx
     last_layer = mpi_config.last_layer_idx
@@ -846,6 +846,17 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
             print(f"Error: MPI size ({size}) must be a multiple of number of layers ({len(layer_sizes)}). Use processes_per_layer in config for custom distribution.")
             sys.exit(1)
 
+    frame_size = config.get('frame_size', 0)
+    if frame_size:
+        # Time frames need timestamps (only the shd loader inserts markers) and the input
+        # stream sent in order (shuffling would break frame boundaries).
+        if dataset != 'shd':
+            print(f"Error: frame_size is only supported for the 'shd' dataset, got '{dataset}'")
+            sys.exit(1)
+        if config.get('shuffle_input', False):
+            print("Error: frame_size requires shuffle_input=False (frame order must be preserved)")
+            sys.exit(1)
+
     get_layer_idx(batch_size, layer_sizes, processes_per_layer, trial)
 
     # Fields persisted into the result JSON alongside the Params (set once, after
@@ -872,7 +883,8 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
                     downsample = True
                 loader = partial(mnist_loader_manual, sequential=sequential, permuted=permuted)
             case "shd":
-                loader = partial(torch_SHD_loader, augment=config.get('augment', False))
+                loader = partial(torch_SHD_loader, augment=config.get('augment', False),
+                                 frame_size=config.get('frame_size', 0))
             case "nmnist":
                 loader = partial(torch_nmnist_loader, first_saccade_only=config['first_saccade_only'])
             case "dvs":
@@ -934,6 +946,7 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         dedup=config.get('dedup', False),
         dropout=tuple(config['dropout']) if config.get('dropout') is not None else None,
         dropout_invert_scaling=config.get('dropout_invert_scaling', False),
+        frame_size=config.get('frame_size', 0),
     )
 
     if trial is not None:

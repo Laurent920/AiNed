@@ -228,6 +228,9 @@ class BaseParams:
     use_best: bool = False       # Use best-validation checkpoint for test inference and saving
     dropout: tuple[float, ...] | None = None  # Per-layer per-sample neuron dropout rate (None = off)
     dropout_invert_scaling: bool = False      # Scale surviving activations by 1/(1-p) (inverted dropout)
+    frame_size: int = 0          # Event datasets: time-frame length. >0 makes the first hidden layer
+                                 # accumulate events and fire its top-k only at each [-3,-3] frame
+                                 # marker (true time frames), instead of using its sync_rate. 0 = off.
 
 # Backwards-compatible alias: files that haven't switched yet can still import
 # `Params` and get a class that already has all the old optional fields.
@@ -581,6 +584,7 @@ def prepare_result_payload(size, network, mode, all_epoch_accuracies, all_valida
         "processes": size,
         "firing number": params.firing_nb,
         "synchronization rate": params.sync_rate,
+        "frame_size": getattr(params, "frame_size", 0),
         "top weights": params.top_weights,
         "output_decay": params.output_decay,
         "restrict": params.restrict,
@@ -919,6 +923,8 @@ def load_config_with_defaults(config_path: Optional[str] = None, is_cnn: bool = 
         'shuffle_input': False,  # Shuffle input values
         'firing_nb': 10000,  # Max number of top values allowed to fire per layer
         'sync_rate': 1,  # Number of input values needed before firing
+        'frame_size': 0,  # Event datasets (shd): time-frame length in timestamp units. >0 enables
+                          # true time frames on the first hidden layer (see BaseParams.frame_size).
         
         # Learning and regularization
         'threshold_lr': 0.0,  # Threshold learning rate

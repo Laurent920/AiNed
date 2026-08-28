@@ -317,17 +317,22 @@ class MPIConfig:
 
             jax.lax.cond(affected, _do_send, lambda _: None, operand=None)
 
-    def residual_send(self, data, event_c, event_x, event_y, it=0):
+    def residual_send(self, data, event_c, event_x, event_y, it=0, broadcast=False):
         """Send event as a residual (identity skip) to every layer in self.res_connect_next.
         The channel index is negated to mark the event as residual at the receiver:
         out[0] = -event_c - 1.   Spatial coords (x, y) and value are unchanged.
         For identity skip there is no kernel window — overlap test is a single-point check.
+
+        broadcast=True disables that test and sends to every destination rank. Required for
+        weight-shared (projected) skips, where the event is remapped into the destination’s
+        input frame and spread over a kernel window, so its source coordinates say nothing
+        about which destination rank is affected. The receiver masks to its own slice.
         """
         neg_c = (-event_c - 1).astype(data.dtype)
         payload = data.at[0].set(neg_c)
 
         for process, _src_part, dst_partition in self.res_connect_next:
-            if not isinstance(dst_partition, CNN_layer_Partition):
+            if broadcast or not isinstance(dst_partition, CNN_layer_Partition):
                 send(payload, dest=process, tag=0, comm=self.comm)
                 continue
 
@@ -818,6 +823,7 @@ class MPIProcessDistribution:
             return cached_shapes
 
         cnn_layer_shapes = []
+        flat_layer_shapes = []   # layer outputs, i.e. after pooling
         previous_layer = None
         for layer_idx, raw_layer in enumerate(self.layer_sizes):
             layer = tuple(raw_layer)
@@ -825,11 +831,13 @@ class MPIProcessDistribution:
             if len(layer) == 1:
                 previous_layer = int(layer[0])
                 cnn_layer_shapes.append(previous_layer)
+                flat_layer_shapes.append(previous_layer)
                 continue
 
             if layer_idx == 0:
                 previous_layer = tuple(int(dim) for dim in layer[:3])
                 cnn_layer_shapes.append(previous_layer)
+                flat_layer_shapes.append(previous_layer)
                 continue
 
             if not isinstance(previous_layer, tuple) or len(previous_layer) != 3:
@@ -859,9 +867,17 @@ class MPIProcessDistribution:
                 h_out = pool_output_size(h_out, pool_size[0], pool_stride[0])
                 w_out = pool_output_size(w_out, pool_size[1], pool_stride[1])
             previous_layer = (out_chan, h_out, w_out)
+            flat_layer_shapes.append(previous_layer)
 
         self._cnn_layer_shapes = tuple(cnn_layer_shapes)
+        self._cnn_flat_layer_shapes = tuple(flat_layer_shapes)
         return self._cnn_layer_shapes
+
+    def _get_cnn_flat_layer_shapes(self):
+        """Layer output shapes (post-pool). _get_cnn_layer_shapes returns pre-pool shapes;
+        the two differ exactly on layers that pool."""
+        self._get_cnn_layer_shapes()   # populates both caches
+        return self._cnn_flat_layer_shapes
 
     def _get_cnn_assignment(self, layer_idx: int):
         layer_shape = self._get_cnn_layer_shapes()[layer_idx]
@@ -873,8 +889,9 @@ class MPIProcessDistribution:
             )
         return (0, layer_shape - 1)
 
-    def _build_cnn_partition(self, layer_idx: int, model_parts):
-        layer_shape = self._get_cnn_layer_shapes()[layer_idx]
+    def _build_cnn_partition(self, layer_idx: int, model_parts, flat=False):
+        shapes = self._get_cnn_flat_layer_shapes() if flat else self._get_cnn_layer_shapes()
+        layer_shape = shapes[layer_idx]
         if isinstance(layer_shape, tuple):
             (c_start, c_end), (x_start, x_end), (y_start, y_end) = model_parts
             return CNN_layer_Partition(
@@ -893,7 +910,31 @@ class MPIProcessDistribution:
             end_idx=model_parts[1],
             total_size=layer_shape,
         )
-    
+
+    def _build_residual_src_partition(self, src_idx: int, model_parts):
+        """Partition of a residual source layer, in the space the residual actually travels in.
+
+        A residual carries the src layer's OUTPUT (post-pool), so both the forward identity
+        add and the backward gradient live in flat space. model_parts, however, is indexed in
+        pre-pool space. The two coincide only when src does not pool -- which is why the only
+        previously-run residual ([1,2], layer 1 unpooled) worked and a pooled src crashed.
+        """
+        conv_shape = self._get_cnn_layer_shapes()[src_idx]
+        flat_shape = self._get_cnn_flat_layer_shapes()[src_idx]
+        if not isinstance(flat_shape, tuple) or conv_shape == flat_shape:
+            return self._build_cnn_partition(src_idx, model_parts)
+
+        # src pools: a pre-pool shard cannot be mapped onto the pooled output in general,
+        # so only a rank owning the whole layer (data-parallel only) can be re-expressed.
+        if tuple(model_parts) != tuple(self._get_cnn_assignment(src_idx)):
+            raise ValueError(
+                f"Residual source layer {src_idx} both pools and is model-split "
+                f"(model_parts={model_parts}); mapping a pre-pool shard onto the pooled "
+                f"output is not supported. Use split_dims=null for this layer."
+            )
+        flat_parts = ((0, flat_shape[0] - 1), (0, flat_shape[1] - 1), (0, flat_shape[2] - 1))
+        return self._build_cnn_partition(src_idx, flat_parts, flat=True)
+
     # region CNN data uniform
     def CNN_data_split_uniform(self):
         """
@@ -1236,7 +1277,7 @@ class MPIProcessDistribution:
                         continue
                     if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
                         continue
-                    src_part = self._build_cnn_partition(src_idx, m_other)
+                    src_part = self._build_residual_src_partition(src_idx, m_other)
                     dst_part = self._build_cnn_partition(dst_idx, model_parts)
                     res_prev_list.append((r_other, src_part, dst_part))
 
@@ -1247,7 +1288,7 @@ class MPIProcessDistribution:
                         continue
                     if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
                         continue
-                    src_part = self._build_cnn_partition(src_idx, model_parts)
+                    src_part = self._build_residual_src_partition(src_idx, model_parts)
                     dst_part = self._build_cnn_partition(dst_idx, m_other)
                     res_next_list.append((r_other, src_part, dst_part))
 
@@ -1337,7 +1378,7 @@ class MPIProcessDistribution:
                         continue
                     if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
                         continue
-                    src_part = self._build_cnn_partition(src_idx, m_other)
+                    src_part = self._build_residual_src_partition(src_idx, m_other)
                     dst_part = self._build_cnn_partition(dst_idx, model_parts)
                     res_prev_list.append((r_other, src_part, dst_part))
 
@@ -1348,7 +1389,7 @@ class MPIProcessDistribution:
                         continue
                     if not (b_other[0] == batch_part.start_idx and b_other[1] == batch_part.end_idx):
                         continue
-                    src_part = self._build_cnn_partition(src_idx, model_parts)
+                    src_part = self._build_residual_src_partition(src_idx, model_parts)
                     dst_part = self._build_cnn_partition(dst_idx, m_other)
                     res_next_list.append((r_other, src_part, dst_part))
 

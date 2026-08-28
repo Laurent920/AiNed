@@ -13,7 +13,7 @@ import os
 
 N_CHANNELS = 700  # SHD cochlea channels (tonotopic, frequency-ordered)
 
-def torch_SHD_loader(batch_size, shuffle=False, downsample=False, CNN_preprocess=False, data_dir="", augment=False):
+def torch_SHD_loader(batch_size, shuffle=False, downsample=False, CNN_preprocess=False, data_dir="", augment=False, frame_size=0):
     """
     Load SHD (Spiking Heidelberg Digits) dataset.
 
@@ -22,6 +22,10 @@ def torch_SHD_loader(batch_size, shuffle=False, downsample=False, CNN_preprocess
         shuffle: Whether to shuffle the data
         downsample: Downsampling option (currently unused for SHD)
         data_dir: Root directory for data storage. If empty, uses current directory.
+        frame_size: If > 0, insert a [-3, -3] frame marker into each sample's event stream
+            whenever the time-frame index (t // frame_size) increases. The network's first
+            hidden layer then accumulates events and fires its top-k only at each marker
+            (true time frames), instead of using its sync_rate. 0 disables framing.
 
     Returns:
         Tuple of (train_data, val_data, test_data, max_nonzero)
@@ -49,9 +53,15 @@ def torch_SHD_loader(batch_size, shuffle=False, downsample=False, CNN_preprocess
     train_subset, val_subset = random_split(cached_trainset, [train_len, val_len])
 
     max_data_length = 16257
-    collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length)
+    if frame_size and frame_size > 0:
+        # Framing inserts markers, so the padded length must fit events + markers.
+        # Scan once (rank 0 only path) to get the exact bound across train+test.
+        max_data_length = _scan_max_framed_len([cached_trainset, cached_testset], frame_size)
+        print(f"SHD frame_size={frame_size}: framed max length = {max_data_length}")
+
+    collate_fn = lambda batch: custom_event_pad_collate(batch, max_data_length, frame_size)
     if augment:
-        train_collate_fn = lambda batch: augmenting_event_pad_collate(batch, max_data_length)
+        train_collate_fn = lambda batch: augmenting_event_pad_collate(batch, max_data_length, frame_size)
     else:
         train_collate_fn = collate_fn
 
@@ -69,25 +79,73 @@ def basic_event_collate(batch):
     events, labels = zip(*batch)  # unzip list of tuples
     return list(events), np.array(labels)
 
-def custom_event_pad_collate(batch, max_len):
+def _frame_events(d, frame_size):
+    """Convert one SHD sample into a (M, 2) int32 array of [channel, 1] events with
+    [-3, -3] frame-boundary markers.
+
+    A marker is inserted whenever the time-frame index (t // frame_size) increases
+    between consecutive (time-ordered) events, so each frame's events are followed by a
+    marker before the next frame begins. Runs of empty frames collapse to a single marker
+    (one per boundary crossing). No trailing marker is added: the input layer's END_SIGNAL
+    flushes the final frame. Timestamps are otherwise discarded, exactly like the
+    non-framed path (only the channel index and a value of 1 survive)."""
+    x = d['x'].astype(np.int32)
+    n = x.shape[0]
+    if n == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    frame = d['t'].astype(np.int64) // frame_size
+    new_frame = np.zeros(n, dtype=bool)
+    new_frame[1:] = frame[1:] != frame[:-1]          # True on the first event of each new frame
+    out = np.full((n + int(new_frame.sum()), 2), -3, dtype=np.int32)  # marker rows pre-filled
+    ev_pos = np.arange(n) + np.cumsum(new_frame)     # each event shifts right by #markers before it
+    out[ev_pos, 0] = x
+    out[ev_pos, 1] = 1
+    return out
+
+def _framed_len(d, frame_size):
+    n = len(d)
+    if n == 0:
+        return 0
+    frame = d['t'].astype(np.int64) // frame_size
+    return n + int(np.count_nonzero(frame[1:] != frame[:-1]))
+
+def _scan_max_framed_len(datasets, frame_size):
+    """Longest event+marker stream over the given datasets, used as the padded buffer size
+    (max_nonzero). Augmentation only drops events, so the un-augmented scan is a valid bound."""
+    max_len = 0
+    for ds in datasets:
+        for d, _ in ds:
+            max_len = max(max_len, _framed_len(d, frame_size))
+    return max_len
+
+def custom_event_pad_collate(batch, max_len, frame_size=0):
     data, labels = zip(*batch)  # each d is a np structured array with dtype [('t'), ('x'), ('p=1')]
     padded_data = []
 
     for d in data:
-        num_events = len(d)
-        if num_events <= max_len:
-            pad_len = max_len - num_events
-
-            # Pre-allocate the output array directly
+        if frame_size and frame_size > 0:
+            arr = _frame_events(d, frame_size)  # (M, 2) events with [-3,-3] markers
+            num_events = arr.shape[0]
+            if num_events > max_len:
+                print(f"framed data size exceeds the max len: {num_events} {max_len}")
+                raise NotImplementedError
             d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
-            
-            # Fill in the actual data (no need to create intermediate structured array)
-            d_padded_2d[:num_events, 0] = d['x'].astype(np.int32)  # p values
-            d_padded_2d[:num_events, 1] = 1  # ones for actual events
-            # Padding (-2) is already filled by np.full
+            d_padded_2d[:num_events] = arr
         else:
-            print(f"data size exceeds the max len: {num_events} {max_len}")
-            raise NotImplementedError
+            num_events = len(d)
+            if num_events <= max_len:
+                pad_len = max_len - num_events
+
+                # Pre-allocate the output array directly
+                d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
+
+                # Fill in the actual data (no need to create intermediate structured array)
+                d_padded_2d[:num_events, 0] = d['x'].astype(np.int32)  # p values
+                d_padded_2d[:num_events, 1] = 1  # ones for actual events
+                # Padding (-2) is already filled by np.full
+            else:
+                print(f"data size exceeds the max len: {num_events} {max_len}")
+                raise NotImplementedError
 
         padded_data.append(d_padded_2d)
 
@@ -122,19 +180,25 @@ def _augment_shd_events(events, channel_shift=16, channel_jitter=3.0, drop_p=0.1
     out['x'] = x[keep]
     return out
 
-def augmenting_event_pad_collate(batch, max_len):
+def augmenting_event_pad_collate(batch, max_len, frame_size=0):
     """Train-only collate: augment each sample in channel space, then pad like
     custom_event_pad_collate. Augmentation only drops events, so num_events never
-    exceeds max_len."""
+    exceeds max_len. When frame_size > 0, markers are inserted after augmentation."""
     data, labels = zip(*batch)
     padded_data = []
 
     for d in data:
         d = _augment_shd_events(d)
-        num_events = len(d)
-        d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
-        d_padded_2d[:num_events, 0] = d['x'].astype(np.int32)
-        d_padded_2d[:num_events, 1] = 1
+        if frame_size and frame_size > 0:
+            arr = _frame_events(d, frame_size)
+            num_events = arr.shape[0]
+            d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
+            d_padded_2d[:num_events] = arr
+        else:
+            num_events = len(d)
+            d_padded_2d = np.full((max_len, 2), -2, dtype=np.int32)
+            d_padded_2d[:num_events, 0] = d['x'].astype(np.int32)
+            d_padded_2d[:num_events, 1] = 1
         padded_data.append(d_padded_2d)
 
     batch_array = jnp.array(padded_data, dtype=jnp.int32)

@@ -73,6 +73,10 @@ test_generator = None
 class Params(BaseParams):
     max_kernel: int | None = None
     flat_layer_sizes: tuple[int, ...] | None = None
+    # Per-layer skip mode, indexed by destination layer. None = identity skip (or no skip);
+    # (C_src, r_h, r_w) = weight-shared projection through that layer's own filter.
+    # Built by build_residual_projections().
+    residual_proj: tuple | None = None
 
 #region ConvNeuronStates
 @jax.tree_util.register_pytree_node_class
@@ -163,6 +167,75 @@ class ConvNeuronStates():
             pooling=own_updates.get("pooling", self.pooling),
             pool_size=own_updates.get("pool_size", self.pool_size),
             pool_stride=own_updates.get("pool_stride", self.pool_stride),)
+
+def build_residual_projections(residual_connections, flat_layer_sizes, conv_layer_sizes, layer_sizes, verbose=False):
+    """Validate every skip connection and resolve how its destination layer absorbs it.
+
+    Two modes, decided per destination:
+      identity  — flat[src] == conv[dst]. The event is added straight into the destination's
+                  pre-activation. Unchanged legacy behaviour, recorded as None.
+      projected — the shapes differ, so the event is routed through the destination's OWN
+                  filter rather than a newly allocated 1x1 projection. That requires the
+                  source to be usable as an input to that conv: at most as many channels as
+                  the conv expects, and a spatial size that is an integer multiple of the
+                  conv's input frame (the ratio absorbs any pooling the skip crosses).
+                  Recorded as (C_src, r_h, r_w).
+
+    A destination cannot mix the two, nor host two different projections: residual events
+    carry no sender id, so the receiver resolves its mode statically from its layer index.
+
+    Returns a tuple indexed by layer, suitable for Params.residual_proj.
+    """
+    proj = [None] * len(flat_layer_sizes)
+    resolved = {}
+
+    for src, dst in residual_connections:
+        if src == 0:
+            raise ValueError("Residual source cannot be the input layer (0)")
+        if src >= dst:
+            raise ValueError(f"Residual {src}->{dst} must point forward (src < dst)")
+        if len(layer_sizes[dst]) == 1:
+            raise ValueError(f"Residual dst {dst} is FC; only conv dst supported")
+
+        src_shape = tuple(flat_layer_sizes[src])
+
+        if src_shape == tuple(conv_layer_sizes[dst]):
+            entry = None  # identity skip
+        else:
+            in_shape = tuple(flat_layer_sizes[dst - 1])  # what dst's conv takes as input
+            if len(src_shape) != 3 or len(in_shape) != 3:
+                raise ValueError(
+                    f"Residual {src}->{dst}: weight-shared projection needs conv-shaped "
+                    f"source and destination input, got flat[{src}]={src_shape} and "
+                    f"flat[{dst-1}]={in_shape}"
+                )
+            if src_shape[0] > in_shape[0]:
+                raise ValueError(
+                    f"Residual {src}->{dst}: source has {src_shape[0]} channels but layer "
+                    f"{dst}'s filter only accepts {in_shape[0]} input channels, so its "
+                    f"weights cannot project the skip"
+                )
+            if src_shape[1] % in_shape[1] or src_shape[2] % in_shape[2]:
+                raise ValueError(
+                    f"Residual {src}->{dst}: source spatial size {src_shape[1:]} is not an "
+                    f"integer multiple of layer {dst}'s input frame {in_shape[1:]}"
+                )
+            entry = (src_shape[0], src_shape[1] // in_shape[1], src_shape[2] // in_shape[2])
+            if verbose and dst == src + 1:
+                print(f"WARNING: residual {src}->{dst} is adjacent, so projecting it through "
+                      f"layer {dst}'s filter duplicates the regular forward path rather than "
+                      f"adding a skip. Span two or more layers for a real shortcut.")
+
+        if dst in resolved and resolved[dst] != entry:
+            raise ValueError(
+                f"Layer {dst} receives skips needing different handling ({resolved[dst]} vs "
+                f"{entry}); residual events carry no sender id, so one destination supports "
+                f"only one mode"
+            )
+        resolved[dst] = entry
+        proj[dst] = entry
+
+    return tuple(proj)
 
 #region Initialization
 @jax.tree_util.register_pytree_node_class
@@ -585,26 +658,44 @@ def conv_predict_bwd(params, key, conv_layer_sizes, weights, empty_neuron_states
             thresholds = thresholds[:, ep_h:thresholds.shape[1]-ep_h, ep_w:thresholds.shape[2]-ep_w]
         th_grad = th_grad * thresholds * (thresholds - 1)
 
+    # Gradient w.r.t. this layer's input. Needed by the previous layer, and also by any
+    # weight-shared skip: that skip entered through this filter, so its gradient leaves
+    # through the same conv-transpose. Computed once and reused by both.
+    res_proj = params.residual_proj[layer_idx] if params.residual_proj is not None else None
+    grad_wrt_input = grad_x(next_grad, weights) if (res_proj is not None or layer_idx > 1) else None
+
     # Residual backward: send ∂L/∂(values_pre_act) (== activity_mask * next_grad, available
     # as `next_grad` after line 568) to every src layer that sent us a residual.
-    # Shape matches src.flat_layer_sizes (= conv_layer_sizes[dst]) per the build-time validator.
+    # Identity skip: shape matches src.flat_layer_sizes (= conv_layer_sizes[dst]) per the
+    # build-time validator. Projected skip: take the channels the source supplied and undo the
+    # coordinate subsampling (repeat = the transpose of the forward's integer stride), which
+    # lands back on src.flat_layer_sizes exactly.
     for _src_rank, _src_part, _dst_part in mpi_config.res_connect_prev:
         from other_helpers.general_MPI_helper import CNN_layer_Partition
+        if res_proj is None:
+            grad_full = next_grad
+        else:
+            C_src, r_h, r_w = res_proj
+            grad_full = grad_wrt_input[:, :C_src]
+            if r_h > 1:
+                grad_full = jnp.repeat(grad_full, r_h, axis=2)
+            if r_w > 1:
+                grad_full = jnp.repeat(grad_full, r_w, axis=3)
         if isinstance(_src_part, CNN_layer_Partition):
             c_s, c_e = _src_part.c_start_idx, _src_part.c_end_idx + 1
             x_s, x_e = _src_part.x_start_idx, _src_part.x_end_idx + 1
             y_s, y_e = _src_part.y_start_idx, _src_part.y_end_idx + 1
-            grad_slice = next_grad[:, c_s:c_e, x_s:x_e, y_s:y_e]
+            grad_slice = grad_full[:, c_s:c_e, x_s:x_e, y_s:y_e]
         else:
-            grad_slice = next_grad
+            grad_slice = grad_full
         send(grad_slice, dest=_src_rank, tag=2, comm=comm)
 
     if layer_idx > 1:
-        # Compute gradient w.r.t. previous layer's activations and send to all previous-layer ranks.
+        # Send gradient w.r.t. previous layer's activations to all previous-layer ranks.
         # With model parallelism, each model-parallel rank in this layer sends its partial grad_x
         # contribution (from its owned output channels/rows/cols) to the previous layer. The previous
         # layer sums contributions from all senders in next_grad accumulation above.
-        send_grad = (grad_x)(next_grad, weights)
+        send_grad = grad_wrt_input
         for _prev_rank, _ in mpi_config.previous_layer:
             send(send_grad, dest=_prev_rank, tag=2, comm=comm)
 
@@ -752,21 +843,31 @@ def train(params: Params, key, total_batches, network, weights, empty_neuron_sta
     all_mean_iterations = []
     
     # Initialize the optimizer
+    # LR schedule: constant by default (legacy). AINED_COSINE_LR=1 enables cosine decay to
+    # 0.1*lr over the whole run; AINED_GRAD_CLIP=1 adds global-norm(1.0) gradient clipping
+    # (the more direct remedy for the exploding-loss divergence seen on deep nets).
+    lr = params.learning_rate
+    if os.environ.get("AINED_COSINE_LR", "0") == "1":
+        total_steps = max(1, params.num_epochs * int(total_batches[0]))
+        lr = optax.cosine_decay_schedule(params.learning_rate, decay_steps=total_steps, alpha=0.1)
+        if rank == 0:
+            print(f"cosine LR decay ON (base={params.learning_rate}, total_steps={total_steps}, alpha=0.1)")
+    _clip = optax.clip_by_global_norm(1.0) if os.environ.get("AINED_GRAD_CLIP", "0") == "1" else optax.identity()
     if rank == 0:
-        print(f"{opti} optimizer selected")
+        print(f"{opti} optimizer selected | cosine={os.environ.get('AINED_COSINE_LR','0')=='1'} grad_clip={os.environ.get('AINED_GRAD_CLIP','0')=='1'}")
     if opti == "adam":
-        solver = optax.adam(learning_rate=params.learning_rate)
-    elif opti == "adamw":        
-        solver = optax.adam(learning_rate=params.learning_rate)
+        solver = optax.chain(_clip, optax.adam(learning_rate=lr))
+    elif opti == "adamw":
+        solver = optax.chain(_clip, optax.adam(learning_rate=lr))
     elif opti == "sgd":
-        solver = optax.sgd(learning_rate=params.learning_rate)
+        solver = optax.chain(_clip, optax.sgd(learning_rate=lr))
     elif opti == "rmsprop":
-        solver = optax.rmsprop(learning_rate=params.learning_rate, decay=0.9, eps=1e-8)
+        solver = optax.chain(_clip, optax.rmsprop(learning_rate=lr, decay=0.9, eps=1e-8))
         print("amsgrad optimizer selected")
-        solver = optax.amsgrad(learning_rate=params.learning_rate)
+        solver = optax.chain(_clip, optax.amsgrad(learning_rate=lr))
     elif opti == "lion":
-        solver = optax.lion(learning_rate=params.learning_rate)
-    else: 
+        solver = optax.chain(_clip, optax.lion(learning_rate=lr))
+    else:
         solver = None
     if solver is not None:
         opt_state = solver.init(weights)
@@ -1148,7 +1249,7 @@ def store_training_data_distributed(size, network, mode, all_epoch_accuracies, a
 
 
 # region Inference loop
-def batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True, readInputJson=False):    
+def batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, dataset:str="train", save=True, debug=True, readInputJson=False, extra_fields=None):
     global training_generator
     global validation_generator
     global test_generator    
@@ -1323,6 +1424,7 @@ def batch_predict(params, key, total_batches, network, weights, empty_neuron_sta
             "CNN/ResNet",
             all_history,
             total_batches,
+            extra_fields=extra_fields,
         )
     return epoch_accuracy, mean, end_time - start_time
 
@@ -1531,21 +1633,16 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         if layer_idx != 0 and not empty_neuron_states.is_conv:
             weights, empty_neuron_states = mpi_config.MPI_partition(weights, empty_neuron_states)
 
-        params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes)
-        network = dataclasses.replace(network, params=params)
+        # Validate residual connections and resolve each destination's skip mode. Runs on
+        # every rank, not just rank 0: the result is part of params, and a rank-0-only raise
+        # would leave the other ranks hanging in MPI.
+        residual_proj = build_residual_projections(residual_connections, network.flat_layer_sizes,
+                                                   network.conv_layer_sizes, params.layer_sizes,
+                                                   verbose=(rank == 0))
 
-        # Validate residual connections
-        if rank == 0:
-            for src, dst in residual_connections:
-                if src == 0:
-                    raise ValueError("Residual source cannot be the input layer (0)")
-                if len(params.layer_sizes[dst]) == 1:
-                    raise ValueError(f"Residual dst {dst} is FC; only conv dst supported")
-                if tuple(network.flat_layer_sizes[src]) != tuple(network.conv_layer_sizes[dst]):
-                    raise ValueError(
-                        f"Residual {src}->{dst} shape mismatch: "
-                        f"flat[{src}]={network.flat_layer_sizes[src]} vs conv[{dst}]={network.conv_layer_sizes[dst]}"
-                    )
+        params = dataclasses.replace(params, flat_layer_sizes=network.flat_layer_sizes,
+                                     residual_proj=residual_proj)
+        network = dataclasses.replace(network, params=params)
 
         if rank == 0:
             print(f"Number of training batches: {total_train_batches}, validation batches: {total_val_batches}, test batches: {total_test_batches}")
@@ -1558,17 +1655,20 @@ def main(random_seed, key, rank_, size_, comm_, trial=None, trial_params=None, c
         
         total_batches = (total_train_batches, total_val_batches, total_test_batches)
 
+        # Same provenance fields are saved in both modes so an inference run records the
+        # residual topology it ran (previously only training stored residual_connections).
+        extra_fields = {"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
+                        "split_dims": list(split_dims) if split_dims else None,
+                        "residual_connections": [list(rc) for rc in residual_connections]}
+        if dataset == "nmnist":
+            extra_fields["first_saccade_only"] = config['first_saccade_only']
+
         mode = config['mode']
         if mode == 'inference':
             # To only run inference
-            batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True)
+            batch_predict(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, 'test', save=True, debug=True, extra_fields=extra_fields)
         elif mode == 'training':
             # To run the full training pipeline
-            extra_fields = {"processes_per_layer": list(processes_per_layer) if processes_per_layer else None,
-                            "split_dims": list(split_dims) if split_dims else None,
-                            "residual_connections": [list(rc) for rc in residual_connections]}
-            if dataset == "nmnist":
-                extra_fields["first_saccade_only"] = config['first_saccade_only']
             result_path = train(params, key, total_batches, network, weights, empty_neuron_states, layer_computation, "adam",
                                extra_fields=extra_fields)
         else:
